@@ -22,9 +22,9 @@ const mentions = (text: string): boolean => word.test(text) || word.test(decoded
 const mentionsInQuery = (value: string): boolean => mentions(asQueryWrites(value))
 
 // Two Basic headers arrive joined by a comma, which Buffer skips, and Buffer stops at the first `=`, so a credential
-// that is not one base64 blob is also seen piece by piece: fields between commas or scheme words, without whitespace,
-// split where padding is followed by base64. A piece under 8 characters cannot hold the word, and a credential of
-// more than 16 pieces is refused unread.
+// that is not one base64 blob is also seen piece by piece: fields between commas or `Basic` words, without whitespace,
+// split after each run of `=`. A piece under 8 characters cannot hold the word, and a credential of more than 16
+// pieces is refused unread. Every pattern here is linear in a run of one character.
 const notOneBlob = /[^A-Za-z0-9+/=_-]|=[A-Za-z0-9+/_-]/
 const decodedBase64 = (text: string): string => Buffer.from(text, 'base64').toString()
 
@@ -38,13 +38,13 @@ function valueInAuthorization(header: string): Value {
       return { mentions: mentions(header), credential }
     case 'basic': {
       const blob = credential.replaceAll(/\s+/g, '')
-      const oneBlob = !notOneBlob.test(blob)
+      const oneBlob = !notOneBlob.test(blob) && !/\sbasic\s/i.test(credential)
       const userAndPassword = decodedBase64(blob)
       const pieces: string[] = []
       if (!oneBlob) {
-        for (const field of credential.split(/,|\s+basic\s+/i, 17)) {
+        for (const field of credential.split(/,(?:\sbasic\s)?|\sbasic\s/i, 17)) {
           const bare = field.replace(/^\s*basic\s+/i, '').replaceAll(/\s+/g, '')
-          pieces.push(...bare.split(/=+(?=[A-Za-z0-9+/_-])/, 17))
+          pieces.push(...bare.split(/(?<==)(?!=|$)/, 17))
         }
       }
       const [user = '', ...password] = userAndPassword.split(':')

@@ -624,6 +624,23 @@ function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
       'refused',
     ],
     [
+      'two Basic credentials joined by a space, the first unpadded',
+      `Basic ${b64('abcdef')} ${basic('x', selector)}`,
+      'refused',
+    ],
+    [
+      'a selector behind padding and a stray character',
+      `Basic ${b64('x:placeholder').replace(/=+$/, '')}=.${b64(`x:${selector}`)}`,
+      'refused',
+    ],
+    [
+      'sixteen Basic credentials are read',
+      Array.from({ length: 16 }, () => basic('x', 'placeholder')).join(', '),
+      'default',
+    ],
+    ['a long run of padding after a stray character', `Basic !${'='.repeat(8192)}`, 'default'],
+    ['a long run of spaces after a stray character', `Basic !${' '.repeat(8192)}x`, 'default'],
+    [
       'a Basic selector joined after a bearer value is not seen',
       `Bearer placeholder, ${basic('x', selector)}`,
       'default',
