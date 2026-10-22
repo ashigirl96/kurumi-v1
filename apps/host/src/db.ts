@@ -8,23 +8,39 @@ export type KurumiDb = BunSQLiteDatabase & { $client: Database }
 export type MigrationSource = { folder: string; table: string }
 
 /**
- * The host is the only process that opens kurumi.db. EXCLUSIVE comes before WAL so the WAL index lives on the
- * heap, and a second host fails at its first query with SQLITE_BUSY. There is no busy_timeout, so it fails at
- * once instead of waiting.
+ * EXCLUSIVE must precede WAL so SQLite keeps the WAL index on the heap and a second process gets SQLITE_BUSY
+ * while opening. There is no busy_timeout because a second host has to fail at once, not wait.
  */
 export function openKurumiDb(path: string): KurumiDb {
   const sqlite = new Database(path)
   sqlite.run('PRAGMA locking_mode = EXCLUSIVE')
-  sqlite.run('PRAGMA journal_mode = WAL')
+  const journal = sqlite.query<{ journal_mode: string }, []>('PRAGMA journal_mode = WAL').get()
+  if (journal?.journal_mode !== 'wal') {
+    sqlite.close()
+    throw new Error(`kurumi.db could not enter WAL mode (journal_mode is ${journal?.journal_mode})`)
+  }
   sqlite.run('PRAGMA foreign_keys = ON')
   return drizzle(sqlite)
 }
 
+type Violation = { table: string; rowid: number | null; parent: string }
+
+function assertNoViolations(sqlite: Database, moment: string) {
+  const violations = sqlite.query<Violation, []>('PRAGMA foreign_key_check').all()
+  if (violations.length === 0) return
+  const shown = violations
+    .slice(0, 5)
+    .map(({ table, rowid, parent }) => `${table} row ${rowid} has no parent in ${parent}`)
+  const more =
+    violations.length > shown.length ? `, and ${violations.length - shown.length} more` : ''
+  throw new Error(`foreign key violations ${moment}: ${shown.join('; ')}${more}`)
+}
+
 /**
- * Applies each package's migrations in order with foreign keys off. SQLite ignores that pragma inside a
- * transaction and drizzle runs every migration in one, so a generated table rebuild would delete the rows that
- * cascade from the dropped table. Setting it here, outside, keeps those rows; the check afterwards then names any
- * row left without a parent.
+ * SQLite ignores foreign_keys inside the transaction drizzle wraps each package's migrations in, so a generated
+ * table rebuild would cascade-delete rows unless the pragma is turned off here. drizzle issues its own BEGIN,
+ * so the packages commit one by one. The check before the first one keeps a database that is already broken from
+ * being migrated further.
  */
 export function migrateAll(db: KurumiDb, migrations: readonly MigrationSource[]): void {
   const sqlite = db.$client
@@ -32,18 +48,11 @@ export function migrateAll(db: KurumiDb, migrations: readonly MigrationSource[])
 
   sqlite.run('PRAGMA foreign_keys = OFF')
   try {
+    assertNoViolations(sqlite, 'before migrating')
     for (const { folder, table } of migrations) {
       migrate(db, { migrationsFolder: folder, migrationsTable: table })
     }
-    const violations = sqlite
-      .query<{ table: string; rowid: number | null; parent: string }, []>(
-        'PRAGMA foreign_key_check',
-      )
-      .all()
-    if (violations.length > 0) {
-      const tables = [...new Set(violations.map(({ table }) => table))].join(', ')
-      throw new Error(`foreign key violations after migrating, in: ${tables}`)
-    }
+    assertNoViolations(sqlite, 'after migrating')
   } finally {
     sqlite.run('PRAGMA foreign_keys = ON')
   }
