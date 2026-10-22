@@ -314,6 +314,12 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 - P02 `tsconfig.json`: `include` に `packages/*/scripts` を足した。足す前は `bun run check` が `packages/account/scripts/google-consent.ts` の型を見なかった（oxlint は見た）。今は `tsc` がこの script を検査する。script は P14 で消える。
 - P02 `fixtures/google/`: JSON でなく `.ts` にした。unsigned の JWT を文字列で commit すると、CI の gitleaks の `jwt` rule が検知するため。`id_token` は読み込むときに claims から組み立てる。
 - P02 `google-consent.ts` の `--revoke`: 同じ実行で得た最初の refresh token を 1 本だけ取り消し、その run の refresh token すべてについて、refresh が `invalid_grant` になることを確かめる。Google は 1 本の revoke でそのアカウントと client の grant 全体を終わらせ、同じ grant の別の refresh token の revoke は 400 になるため、2 本目以降は revoke せず refresh で確かめる。token は file にも画面にも出さないので、別の実行へ渡せない。計画の lane 10 の「8 日後の確認に使う 1 本」は、この script では残せない。
+- P03 `account/server.ts`: `candidates(agentGroupId, service)` は第 1 引数の `tx` を持たない。1 本の prepared statement は接続に結びつき、`tx` を渡しても使われないため。gateway の `credentialFor` も transaction の外で live に引く。`createAccountLedger` が受けるのは `{ db }` だけで、`vaultKey` などは P11 以降で足す。
+- P03 `account/server.ts`: `grant` と `setDefault` は throw せず `{ ok: true }` か `{ ok: false, refusal }`（`account_not_found`、`service_not_covered`、`grant_not_found`）を返す。拒否は caller が RPC の error に写す普通の結果で、throw にすると caller の transaction まで rollback するため。`grant`、`revoke`、`setDefault` はどれも 2 回呼んでも同じ状態になる。`candidates` は label の順に返す。
+- P03 `account/package.json`: `./testing` も export する。`.oxlintrc.json` の entry の一覧に `testing` があり、`scripts/oxlint/entry-boundaries.test.ts` が export の無い `testing.ts` を内側の module と数えるため。使えるのは `testing-entry` の rule が許す test と `testing.ts` だけ。
+- P03 `agent/src/server.ts`: `migrations` の re-export 1 行だけを置く。host が package の migration を引く道は、lint が許す entry の `server` だけだから。残りは P07 が足す。`migrations/index.ts` は sketch の `latest` を持たない。使う側が無い。
+- P03 `apps/host/src/db.ts`: `openKurumiDb` に `busy_timeout` を置かない。2 つ目の host は待たずに最初の query で `SQLITE_BUSY` になるべきで、test が別 process で確かめる。`migrateAll` は package ごとに drizzle の `migrate` を呼び、最後に 1 度だけ `foreign_key_check` を見る。違反が見つかっても、それまでの migration は commit 済みで、DB は違反を持ったまま host を止める。transaction の中で呼ばれると `foreign_keys = OFF` が無効になるので throw する。
+- P03 `scripts/oxlint/kurumi.js`: `sync-transaction` は `.transaction(...)` だけを見る（monica の task の reservation の method は kurumi に無い）。`cross-domain-write` は monica の `packages/*/src/**` に加えて `apps/host/src/**` にも当てる。host は composition root で、どの domain の table にも直接書かないため。test の fixture が他の domain の table に書くときは、`testing.ts` の中で SQL を直に流す。
 
 ## ユーザーが決めたこと（2026-10-22）
 
