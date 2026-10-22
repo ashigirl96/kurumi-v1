@@ -1,15 +1,11 @@
-// The only list of vendors and services kurumi knows. A vendor issues identities (Google, Notion, Anthropic);
-// a service is one API such an identity can call (Gmail, Calendar). Adding a service is one entry here.
-
 export type CredentialSlot =
-  | { kind: 'bearer' } // `Authorization: Bearer <secret>`
-  | { kind: 'header'; header: string } // `x-api-key: <secret>`
-  | { kind: 'basic' } // `Authorization: Basic base64(user:<secret>)` (git over https)
-  | { kind: 'query'; param: string } // `?key=<secret>`
+  | { kind: 'bearer' }
+  | { kind: 'header'; header: string }
+  | { kind: 'basic' }
+  | { kind: 'query'; param: string }
 
 export type HostRule = {
   host: string
-  /** Separates services that share a host (www.googleapis.com/gmail/… vs /calendar/…). */
   pathPrefix?: string
 }
 
@@ -17,28 +13,21 @@ export type ServiceSpec = {
   displayName: string
   hosts: readonly HostRule[]
   slot: CredentialSlot
-  /** OAuth scopes this service needs. One consent may request the union over several services. */
   scopes: readonly string[]
-  /** Env placeholders the container gets when its group holds this service (value = the selector). */
   containerEnv?: (selector: string) => Readonly<Record<string, string>>
 }
 
 export type OAuthSpec = {
   authorizeUrl: string
   tokenUrl: string
-  /**
-   * Google: access_type=offline + prompt=consent (Google returns a refresh token only on the first authorization
-   * otherwise). With `include_granted_scopes=true` the refresh token represents the combined authorization, so
-   * adding a service keeps the earlier scopes.
-   */
   authorizeParams?: Readonly<Record<string, string>>
   pkce: boolean
 }
 
 /**
- * How the agent writes an Account Handle into the credential slot. A vendor whose SDK validates the credential's
- * shape before sending (a `sk-ant-` prefix check) overrides the default. `parse` returns the handle, or null when
- * the slot holds no selector (the SDK's own placeholder).
+ * `parse` returns null for a slot value that carries no selector (the SDK's own placeholder). A value that carries
+ * the vendor's prefix but is malformed is returned whole: it names no granted account, so the caller refuses it
+ * instead of falling back to the default.
  */
 export type SelectorShape = {
   format: (handle: string) => string
@@ -53,23 +42,23 @@ const decodeIfEncoded = (value: string): string => {
   }
 }
 
-const defaultPrefix = 'kurumi:'
+const defaultPrefix = /^kurumi:/i
 
-/** The label is percent-encoded because an HTTP header value cannot carry non-Latin1 characters. */
+/**
+ * Percent-encoded because an HTTP header value cannot carry non-Latin1 characters and a query value cannot carry
+ * `&`, `#` or `+`. `/`, `@` and `:` stay readable.
+ */
 export const defaultSelectorShape: SelectorShape = {
-  format: (handle) => `${defaultPrefix}${encodeURI(handle)}`,
+  format: (handle) =>
+    `kurumi:${encodeURIComponent(handle.toWellFormed()).replaceAll('%2F', '/').replaceAll('%40', '@').replaceAll('%3A', ':')}`,
   parse: (slotValue) =>
-    slotValue.startsWith(defaultPrefix)
-      ? decodeIfEncoded(slotValue.slice(defaultPrefix.length))
-      : null,
+    defaultPrefix.test(slotValue) ? decodeIfEncoded(slotValue.slice('kurumi:'.length)) : null,
 }
 
 const anthropicPrefix = 'sk-ant-kurumi-'
-const base64url = /^[A-Za-z0-9_-]+$/
 
 export type VendorSpec = {
   displayName: string
-  /** `key` vendors are added by a human via CLI/Console only. */
   connect: { kind: 'oauth'; oauth: OAuthSpec } | { kind: 'key' }
   services: Readonly<Record<string, ServiceSpec>>
   selectorShape?: SelectorShape
@@ -79,14 +68,15 @@ export const catalog = {
   anthropic: {
     displayName: 'Anthropic',
     connect: { kind: 'key' },
-    // Whether the Agent SDK / Claude Code rejects a key without the `sk-ant-` prefix is unverified.
     selectorShape: {
       format: (handle) => `${anthropicPrefix}${Buffer.from(handle).toString('base64url')}`,
       parse: (value) => {
+        if (!value.startsWith(anthropicPrefix)) return null
         const payload = value.slice(anthropicPrefix.length)
-        return value.startsWith(anthropicPrefix) && base64url.test(payload)
-          ? Buffer.from(payload, 'base64url').toString()
-          : null
+        const decoded = Buffer.from(payload, 'base64url').toString()
+        return decoded !== '' && Buffer.from(decoded).toString('base64url') === payload
+          ? decoded
+          : value
       },
     },
     services: {
@@ -106,6 +96,7 @@ export const catalog = {
       oauth: {
         authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
         tokenUrl: 'https://oauth2.googleapis.com/token',
+        // Google issues a refresh token only on first consent unless prompt=consent.
         authorizeParams: {
           access_type: 'offline',
           prompt: 'consent',
@@ -121,6 +112,7 @@ export const catalog = {
           { host: 'gmail.googleapis.com' },
           { host: 'www.googleapis.com', pathPrefix: '/gmail/' },
           { host: 'www.googleapis.com', pathPrefix: '/upload/gmail/' },
+          { host: 'www.googleapis.com', pathPrefix: '/resumable/upload/gmail/' },
           { host: 'www.googleapis.com', pathPrefix: '/batch/gmail/' },
         ],
         slot: { kind: 'bearer' },
@@ -205,45 +197,34 @@ export function serviceSpec(service: ServiceId): ServiceSpec {
 }
 
 export function selectorShapeOf(vendor: VendorId): SelectorShape {
-  return (catalog[vendor] as VendorSpec).selectorShape ?? defaultSelectorShape
+  const spec: VendorSpec = catalog[vendor]
+  return spec.selectorShape ?? defaultSelectorShape
 }
 
 const unreserved = /[A-Za-z0-9\-._~]/
 
-function resolveDotSegments(path: string): string {
-  const kept: string[] = []
-  const segments = path.split('/').slice(1)
-  segments.forEach((segment, i) => {
-    if (segment !== '.' && segment !== '..') {
-      kept.push(segment)
-      return
-    }
-    if (segment === '..') kept.pop()
-    if (i === segments.length - 1) kept.push('')
-  })
-  return `/${kept.join('/')}`
-}
-
 /**
- * The path the upstream will route: Google resolves dot segments and percent-escaped unreserved characters, so
- * `/gmail/../calendar/` must not be taken for Gmail. An escape that is not unreserved (`%2F`) stays as it is and
- * matches no prefix.
+ * The path as the upstream would route it, or null when that is in doubt. Google decodes unreserved `%XX` escapes
+ * and answers a dot segment with a redirect, so a path that still has one (or an escaped slash, a backslash or a
+ * `;`) could name a different service than its prefix suggests.
  */
-function routedPath(rawPath: string): string {
+function routablePath(rawPath: string): string | null {
   const end = rawPath.search(/[?#]/)
   const path = end === -1 ? rawPath : rawPath.slice(0, end)
   const rooted = path.startsWith('/') ? path : `/${path}`
-  if (!rooted.includes('%') && !rooted.includes('/.')) return rooted
+  if (/[\\;]|%2f|%5c/i.test(rooted)) return null
   const decoded = rooted.replace(/%([0-9A-Fa-f]{2})/g, (escape, hex: string) => {
     const char = String.fromCharCode(Number.parseInt(hex, 16))
     return unreserved.test(char) ? char : escape
   })
-  return resolveDotSegments(decoded)
+  return /\/\.{1,2}(?:\/|$)/.test(decoded) ? null : decoded
 }
+
+/** Hostnames are compared lowercase without the trailing dot. A port is not part of a hostname. */
+export const normalizeHost = (host: string): string => host.toLowerCase().replace(/\.$/, '')
 
 type Located<V extends string, S extends string> = Readonly<{ vendor: V; service: S }>
 
-/** Builds the lookup behind `serviceFor`: longest pathPrefix first within a host. */
 export function createServiceFinder<V extends string, S extends string>(
   entries: readonly { vendor: V; service: S; hosts: readonly HostRule[] }[],
 ): (host: string, path: string) => Located<V, S> | null {
@@ -258,17 +239,14 @@ export function createServiceFinder<V extends string, S extends string>(
   for (const rules of rulesByHost.values()) rules.sort((a, b) => b.prefix.length - a.prefix.length)
 
   return (host, path) => {
-    const rules = rulesByHost.get(host.toLowerCase().replace(/\.$/, ''))
+    const rules = rulesByHost.get(normalizeHost(host))
     if (!rules) return null
-    const routed = routedPath(path)
+    const routed = routablePath(path)
+    if (routed === null) return null
     return rules.find(({ prefix }) => routed.startsWith(prefix))?.located ?? null
   }
 }
 
-/**
- * Host + path → the one service whose rule matches. Services sharing a host are always separated by pathPrefix
- * (checked by a test over `catalog`), so the answer is never ambiguous.
- */
 export const serviceFor: (host: string, path: string) => Located<VendorId, ServiceId> | null =
   createServiceFinder(
     serviceRows.map(({ vendor, service, spec }) => ({ vendor, service, hosts: spec.hosts })),
@@ -283,12 +261,12 @@ export function interceptedHosts(): ReadonlySet<string> {
   return intercepted
 }
 
-/** Union of scopes for one consent over several services of one vendor. */
+export const isInterceptedHost = (host: string): boolean => intercepted.has(normalizeHost(host))
+
 export function scopesFor(services: readonly ServiceId[]): string[] {
   return [...new Set(services.flatMap((service) => serviceSpec(service).scopes))]
 }
 
-/** Services of `vendor` whose scopes are all inside `grantedScopes`. Becomes `account.services`. */
 export function servicesCovered(vendor: VendorId, grantedScopes: readonly string[]): ServiceId[] {
   const granted = new Set(grantedScopes)
   return serviceRows
@@ -296,14 +274,13 @@ export function servicesCovered(vendor: VendorId, grantedScopes: readonly string
     .map(({ service }) => service)
 }
 
-/** `service IN (…)` per vendor, generated from the catalog for account_grant's CHECK. Never written by hand. */
+/** `service IN (…)` per vendor for account_grant's CHECK, generated so it is never written by hand. */
 export function serviceBelongsToVendorSql(serviceColumn: string, vendorColumn: string): string {
-  return Object.entries(vendors)
-    .map(([vendor, spec]) => {
-      const services = Object.keys(spec.services)
-        .map((s) => `'${s}'`)
-        .join(',')
-      return `(${vendorColumn} = '${vendor}' AND ${serviceColumn} IN (${services}))`
-    })
-    .join(' OR ')
+  const perVendor = Object.entries(vendors).map(([vendor, spec]) => {
+    const services = Object.keys(spec.services)
+      .map((s) => `'${s}'`)
+      .join(',')
+    return `(${vendorColumn} = '${vendor}' AND ${serviceColumn} IN (${services}))`
+  })
+  return `(${perVendor.join(' OR ')})`
 }

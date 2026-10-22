@@ -6,6 +6,7 @@ import {
   createServiceFinder,
   defaultSelectorShape,
   interceptedHosts,
+  isInterceptedHost,
   scopesFor,
   selectorShapeOf,
   serviceBelongsToVendorSql,
@@ -86,6 +87,7 @@ describe('serviceFor', () => {
     ['gmail.googleapis.com', '/batch', 'google', 'gmail'],
     ['www.googleapis.com', '/gmail/v1/users/me/messages', 'google', 'gmail'],
     ['www.googleapis.com', '/upload/gmail/v1/users/me/messages/send', 'google', 'gmail'],
+    ['www.googleapis.com', '/resumable/upload/gmail/v1/users/me/messages/send', 'google', 'gmail'],
     ['www.googleapis.com', '/batch/gmail/v1', 'google', 'gmail'],
     ['www.googleapis.com', '/calendar/v3/calendars/primary/events', 'google', 'google-calendar'],
     ['www.googleapis.com', '/batch/calendar/v3', 'google', 'google-calendar'],
@@ -125,25 +127,52 @@ describe('serviceFor', () => {
     )
   })
 
-  test.each([
-    ['/gmail/../calendar/v3/calendars/primary', 'google-calendar'],
-    ['/calendar/../gmail/v1/users/me', 'gmail'],
-    ['/gmail/./v1/users/me', 'gmail'],
-    ['/%63alendar/v3/calendars/primary', 'google-calendar'],
-    ['/gmail/%2e%2e/calendar/v3/x', 'google-calendar'],
-    ['/gmail/v1/../../calendar/v3/x?next=/gmail/', 'google-calendar'],
-  ])('%s resolves to the service Google would route it to: %s', (path, service) => {
-    expect(serviceFor('www.googleapis.com', path)?.service).toBe(service as never)
+  test('an unreserved character written as a %XX escape is read as the character', () => {
+    expect(serviceFor('www.googleapis.com', '/%63alendar/v3/calendars/primary')?.service).toBe(
+      'google-calendar',
+    )
+    expect(
+      serviceFor('www.googleapis.com', '/calendar/v3/calendars/a%40b.example/events')?.service,
+    ).toBe('google-calendar')
   })
 
   test.each([
-    '/gmail/../drive/v3/files',
-    '/gmail/../../etc',
+    '/gmail/../calendar/v3/calendars/primary',
+    '/calendar/../gmail/v1/users/me',
+    '/gmail/./v1/users/me',
+    '/gmail/..',
+    '/gmail/%2e%2e/calendar/v3/x',
+    '/gmail/.%2E/calendar/v3/x',
+    '/calendar/v3/..;/../gmail/v1/users/me',
+    '/gmail/..%2Fcalendar/v3/x',
+    '/gmail/..%5Ccalendar/v3/x',
+    '/gmail/..\\calendar/v3/x',
+    '/gmail/%2fv1/x',
     '/%2fgmail/v1',
-    '//calendar/v3',
     '/gmail%2Fv1/x',
-  ])('%s matches no service', (path) => {
+    '/gmail/v1;x=1/users',
+  ])('%s is in doubt, so it belongs to no service', (path) => {
     expect(serviceFor('www.googleapis.com', path)).toBeNull()
+  })
+
+  test.each(['//calendar/v3', '//gmail/v1/users/me', '/gmail'])(
+    '%s does not match a prefix and belongs to no service',
+    (path) => {
+      expect(serviceFor('www.googleapis.com', path)).toBeNull()
+    },
+  )
+
+  test('a dot segment or an escape inside the query does not matter', () => {
+    expect(
+      serviceFor('www.googleapis.com', '/gmail/v1/users/me?next=/../../calendar/v3%2f')?.service,
+    ).toBe('gmail')
+    expect(serviceFor('www.googleapis.com', '/calendar/v3/x#/../gmail/')?.service).toBe(
+      'google-calendar',
+    )
+  })
+
+  test('a host with a port is not a hostname and belongs to no service', () => {
+    expect(serviceFor('www.googleapis.com:443', '/gmail/v1/x')).toBeNull()
   })
 
   describe('createServiceFinder', () => {
@@ -173,6 +202,16 @@ describe('interceptedHosts', () => {
     expect([...interceptedHosts()].toSorted()).toEqual([...new Set(expected)].toSorted())
     expect(interceptedHosts().has('www.googleapis.com')).toBe(true)
     expect(interceptedHosts().has('example.com')).toBe(false)
+  })
+
+  test('isInterceptedHost compares a hostname the way serviceFor does', () => {
+    expect(isInterceptedHost('WWW.googleapis.com.')).toBe(true)
+    expect(isInterceptedHost('api.github.com')).toBe(true)
+    expect(isInterceptedHost('www.googleapis.com:443')).toBe(false)
+    expect(isInterceptedHost('example.com')).toBe(false)
+    for (const host of interceptedHosts()) {
+      expect(isInterceptedHost(host)).toBe(true)
+    }
   })
 })
 
@@ -236,6 +275,7 @@ describe('selectorShapeOf', () => {
     'github/%41',
     'google/😀@x.example',
     'github/a:b/c',
+    'notion/a&b#c=d?e',
   ]
 
   test.each(vendorIds)('%s selector shape round-trips awkward handles', (vendor) => {
@@ -261,7 +301,13 @@ describe('selectorShapeOf', () => {
     (vendor) => {
       const shape = selectorShapeOf(vendor)
 
-      for (const value of ['', 'sk-ant-api03-realkey', 'placeholder', 'Bearer kurumi:x/y']) {
+      for (const value of [
+        '',
+        'sk-ant-api03-realkey',
+        'placeholder',
+        'Bearer kurumi:x/y',
+        'ya29.token',
+      ]) {
         expect(shape.parse(value)).toBeNull()
       }
     },
@@ -276,8 +322,37 @@ describe('selectorShapeOf', () => {
     )
   })
 
-  test('the anthropic shape does not accept a mangled payload', () => {
-    expect(selectorShapeOf('anthropic').parse('sk-ant-kurumi-***')).toBeNull()
+  test('the default prefix is read without regard to case', () => {
+    expect(defaultSelectorShape.parse('Kurumi:google/alice@work.example')).toBe(
+      'google/alice@work.example',
+    )
+  })
+
+  test.each([
+    'sk-ant-kurumi-***',
+    'sk-ant-kurumi-',
+    'sk-ant-kurumi-A',
+    'sk-ant-kurumi-YQ==',
+    'sk-ant-kurumi-YR',
+    'sk-ant-kurumi-anthropic/team',
+  ])(
+    'a value %p with the anthropic prefix but a malformed payload is returned whole, never none',
+    (value) => {
+      expect(selectorShapeOf('anthropic').parse(value)).toBe(value)
+    },
+  )
+
+  test('format output stays readable for the characters a handle is made of', () => {
+    expect(defaultSelectorShape.format('google/alice@work.example')).toBe(
+      'kurumi:google/alice@work.example',
+    )
+    expect(defaultSelectorShape.format('github/a b&c#d+e=f')).toBe(
+      'kurumi:github/a%20b%26c%23d%2Be%3Df',
+    )
+  })
+
+  test('format survives a label with a lone surrogate', () => {
+    expect(() => defaultSelectorShape.format('notion/a\ud800b')).not.toThrow()
   })
 })
 
@@ -296,6 +371,20 @@ describe('serviceBelongsToVendorSql', () => {
     for (const { vendor, id } of allServices) {
       expect(() => db.run('INSERT INTO account_grant VALUES (?, ?)', [vendor, id])).not.toThrow()
     }
+  })
+
+  test('can be combined with another condition without changing its meaning', () => {
+    const db = new Database(':memory:')
+    db.run(
+      `CREATE TABLE t (flag INTEGER NOT NULL, vendor TEXT NOT NULL, service TEXT NOT NULL, CHECK (flag = 1 AND ${serviceBelongsToVendorSql('service', 'vendor')}))`,
+    )
+
+    expect(() => db.run('INSERT INTO t VALUES (1, ?, ?)', ['google', 'gmail'])).not.toThrow()
+    expect(() => db.run('INSERT INTO t VALUES (0, ?, ?)', ['google', 'gmail'])).toThrow(/CHECK/)
+  })
+
+  test('the ids it writes into SQL are plain words', () => {
+    for (const id of [...vendorIds, ...serviceIds]) expect(id).toMatch(/^[a-z][a-z0-9-]*$/)
   })
 
   test('rejects a service of another vendor and an unknown service', () => {

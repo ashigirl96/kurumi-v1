@@ -1,13 +1,11 @@
 import type { CredentialSlot, SelectorShape, ServiceId, VendorId } from './catalog.ts'
 
-/** `${vendor}/${label}`, e.g. `google/alice@work.example`. The only name an agent uses for an account. */
 export type AccountHandle = `${VendorId}/${string}` & { readonly __brand: 'AccountHandle' }
 
 export function accountHandle(vendor: VendorId, label: string): AccountHandle {
   return `${vendor}/${label}` as AccountHandle
 }
 
-/** One row of account_grant ⋈ account for the calling group and the service the request targets. */
 export type GrantedCandidate = {
   accountId: string
   handle: AccountHandle
@@ -15,7 +13,6 @@ export type GrantedCandidate = {
   status: 'active' | 'needs_reauth'
 }
 
-/** What the agent wrote into the slot, already parsed by `readSelector`. */
 export type Selector = { kind: 'handle'; handle: string } | { kind: 'none' }
 
 export type Selection =
@@ -23,17 +20,13 @@ export type Selection =
   | { ok: false; refusal: SelectionRefusal }
 
 /**
- * Every refusal names the next step for the agent. None of them lists accounts outside the caller's group:
- * an agent learns about other groups' accounts only through a human-facing Connect Card.
+ * Every refusal names the next step for the agent and none lists accounts outside the caller's group: an agent
+ * learns about other groups' accounts only through a human-facing Connect Card.
  */
 export type SelectionRefusal =
-  /** No grant of this service in the group. Next step: the `connect_account` tool. */
   | { code: 'account_not_connected'; service: ServiceId }
-  /** Several grants, no selector, no default. Next step: name one of `granted` in the slot. */
   | { code: 'account_ambiguous'; service: ServiceId; granted: AccountHandle[] }
-  /** The named handle is not granted to this group for this service. */
   | { code: 'account_not_granted'; service: ServiceId; named: string; granted: AccountHandle[] }
-  /** Granted, but its refresh token is dead. Next step: `connect_account` again (same login updates the row). */
   | { code: 'account_needs_reauth'; service: ServiceId; handle: AccountHandle }
 
 function use(
@@ -51,10 +44,8 @@ function use(
 }
 
 /**
- * Decides which granted account serves one request. A handle named in the slot wins; else the only grant; else the
- * group's Default Account for the service; else refuse with the list. Never "last match wins" or "first row wins".
- * The returned accountId is always one of `candidates`, which the caller has already filtered to the calling
- * group and the service, so an ungranted account cannot come out of here.
+ * `candidates` are the grants of the calling group for `service` and nothing else, so an ungranted account cannot
+ * come out of here. A named handle wins, then the only grant, then the one default; never the first row.
  */
 export function selectAccount(
   service: ServiceId,
@@ -83,8 +74,9 @@ export function selectAccount(
   if (!first) return { ok: false, refusal: { code: 'account_not_connected', service } }
   if (others.length === 0) return use(service, first, 'only')
 
-  const preferred = candidates.find(({ isDefault }) => isDefault)
-  if (preferred) return use(service, preferred, 'default')
+  const defaults = candidates.filter(({ isDefault }) => isDefault)
+  const [preferred] = defaults
+  if (preferred && defaults.length === 1) return use(service, preferred, 'default')
   return { ok: false, refusal: { code: 'account_ambiguous', service, granted: granted() } }
 }
 
@@ -119,27 +111,39 @@ function takeHeader(headers: Headers, name: string): string | null {
   return value?.trim() ?? null
 }
 
-function takeCredential(slot: CredentialSlot, headers: Headers, url: URL): string | null {
-  switch (slot.kind) {
+/** `Bearer` and `token` carry the secret itself, `Basic` carries it as the password. */
+function secretOfAuthorization(authorization: string | null): string | null {
+  const [, scheme = '', value = ''] = /^(\w+)\s+(.+)$/.exec(authorization ?? '') ?? []
+  switch (scheme.toLowerCase()) {
     case 'bearer':
-      return /^Bearer +(.+)$/i.exec(takeHeader(headers, 'authorization') ?? '')?.[1] ?? null
-    case 'header':
-      return takeHeader(headers, slot.header)
+    case 'token':
+      return value
     case 'basic': {
-      const encoded = /^Basic +(.+)$/i.exec(takeHeader(headers, 'authorization') ?? '')?.[1]
-      const userAndPassword = encoded ? Buffer.from(encoded, 'base64').toString() : ''
+      const userAndPassword = Buffer.from(value, 'base64').toString()
       const separator = userAndPassword.indexOf(':')
       return separator === -1 ? null : userAndPassword.slice(separator + 1)
     }
+    default:
+      return null
+  }
+}
+
+function takeCredential(slot: CredentialSlot, headers: Headers, url: URL): string | null {
+  switch (slot.kind) {
+    case 'bearer':
+    case 'basic':
+      return secretOfAuthorization(takeHeader(headers, 'authorization'))
+    case 'header':
+      return takeHeader(headers, slot.header)
     case 'query':
       return takeQueryParam(url, slot.param)
   }
 }
 
 /**
- * Reads the selector from the slot the real credential would occupy, using the vendor's selector shape, and
- * returns the request with that slot cleared whether or not it held a selector. A slot value the shape does not
- * recognize (the SDK's own placeholder) is `none`. One way to name an account: there is no side header.
+ * Reads the handle the agent wrote where the real credential would go, and returns the request with that slot
+ * emptied whether or not it held a selector. A value the shape does not recognize (the SDK's own placeholder)
+ * is `none`.
  */
 export function readSelector(
   shape: SelectorShape,

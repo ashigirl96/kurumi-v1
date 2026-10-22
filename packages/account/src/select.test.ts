@@ -34,7 +34,6 @@ const grant = (
 const none: Selector = { kind: 'none' }
 const named = (handle: string): Selector => ({ kind: 'handle', handle })
 
-// Group 1 holds Gmail of A (default), B and C. Group 2 holds Gmail of B and Calendar of A.
 const grantA = grant(handleA, { isDefault: true })
 const grantB = grant(handleB)
 const grantC = grant(handleC)
@@ -172,6 +171,31 @@ describe('selectAccount over the Group 1 and Group 2 grants', () => {
     )
   })
 
+  test('a handle that is a prefix or a suffix of a granted one is not granted', () => {
+    const candidates = [grant(handleA), grant(accountHandle('google', 'ab@work.example'))]
+
+    for (const named_ of [
+      'google/a',
+      'google/a@work.example ',
+      'google/@work.example',
+      'a@work.example',
+    ]) {
+      expect(selectAccount('gmail', candidates, named(named_))).toMatchObject({
+        ok: false,
+        refusal: { code: 'account_not_granted', named: named_ },
+      })
+    }
+  })
+
+  test('two defaults are ambiguous, never the first row', () => {
+    const candidates = [grant(handleA, { isDefault: true }), grant(handleB, { isDefault: true })]
+
+    expect(selectAccount('gmail', candidates, none)).toMatchObject({
+      ok: false,
+      refusal: { code: 'account_ambiguous' },
+    })
+  })
+
   test('a handle is matched exactly', () => {
     const selection = selectAccount('gmail', group1Gmail, named(handleA.toUpperCase()))
 
@@ -271,6 +295,44 @@ const request = (init: { headers?: Record<string, string>; url?: string }) => ({
 const basic = (user: string, password: string) =>
   `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`
 
+describe('a selector that is malformed but clearly meant', () => {
+  const anthropic = selectorShapeOf('anthropic')
+  const handle = accountHandle('anthropic', 'team')
+  const candidates = [
+    grant(accountHandle('anthropic', 'personal'), { isDefault: true }),
+    grant(handle),
+  ]
+
+  test.each(['sk-ant-kurumi-YW50aHJvcGljL3RlYW0=', 'sk-ant-kurumi-***'])(
+    'the value %s is refused instead of falling back to the default account',
+    (apiKey) => {
+      const { selector } = readSelector(
+        anthropic,
+        { kind: 'header', header: 'x-api-key' },
+        request({ headers: { 'x-api-key': apiKey } }),
+      )
+
+      expect(selectAccount('anthropic-api', candidates, selector)).toMatchObject({
+        ok: false,
+        refusal: { code: 'account_not_granted' },
+      })
+    },
+  )
+
+  test('the SDK placeholder still falls back to the default account', () => {
+    const { selector } = readSelector(
+      anthropic,
+      { kind: 'header', header: 'x-api-key' },
+      request({ headers: { 'x-api-key': 'sk-ant-api03-placeholder' } }),
+    )
+
+    expect(selectAccount('anthropic-api', candidates, selector)).toMatchObject({
+      ok: true,
+      how: 'default',
+    })
+  })
+})
+
 describe('readSelector', () => {
   const handle = 'google/alice@work.example'
 
@@ -316,11 +378,25 @@ describe('readSelector', () => {
       expect(stripped.headers.has('authorization')).toBe(false)
     })
 
-    test('another scheme in the slot is none and is removed', () => {
+    test.each([
+      ['token', `token kurumi:${handle}`],
+      ['Basic', basic('x', `kurumi:${handle}`)],
+    ])('the %s scheme names the account too', (_scheme, authorization) => {
       const { selector, stripped } = readSelector(
         defaultSelectorShape,
         slot,
-        request({ headers: { authorization: basic('x', `kurumi:${handle}`) } }),
+        request({ headers: { authorization } }),
+      )
+
+      expect(selector).toEqual(named(handle))
+      expect(stripped.headers.has('authorization')).toBe(false)
+    })
+
+    test('a scheme that carries no secret is none and is removed', () => {
+      const { selector, stripped } = readSelector(
+        defaultSelectorShape,
+        slot,
+        request({ headers: { authorization: 'Digest username="x"' } }),
       )
 
       expect(selector).toEqual(none)
@@ -372,6 +448,19 @@ describe('readSelector', () => {
       expect(stripped.headers.has('authorization')).toBe(false)
     })
 
+    test.each(['Bearer', 'token'])(
+      'the %s scheme of gh and Octokit names the account too',
+      (scheme) => {
+        const { selector } = readSelector(
+          defaultSelectorShape,
+          slot,
+          request({ headers: { authorization: `${scheme} kurumi:github/bot` } }),
+        )
+
+        expect(selector).toEqual(named('github/bot'))
+      },
+    )
+
     test('a password that holds a colon keeps everything after the first colon', () => {
       const { selector } = readSelector(
         defaultSelectorShape,
@@ -382,21 +471,19 @@ describe('readSelector', () => {
       expect(selector).toEqual(named('github/a:b'))
     })
 
-    test.each([
-      'Basic',
-      'Basic !!!',
-      `Basic ${Buffer.from('no-colon').toString('base64')}`,
-      'Bearer kurumi:github/bot',
-    ])('a malformed credential %p is none and is removed', (authorization) => {
-      const { selector, stripped } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({ headers: { authorization } }),
-      )
+    test.each(['Basic', 'Basic !!!', `Basic ${Buffer.from('no-colon').toString('base64')}`])(
+      'a malformed credential %p is none and is removed',
+      (authorization) => {
+        const { selector, stripped } = readSelector(
+          defaultSelectorShape,
+          slot,
+          request({ headers: { authorization } }),
+        )
 
-      expect(selector).toEqual(none)
-      expect(stripped.headers.has('authorization')).toBe(false)
-    })
+        expect(selector).toEqual(none)
+        expect(stripped.headers.has('authorization')).toBe(false)
+      },
+    )
   })
 
   describe('query', () => {
@@ -512,6 +599,22 @@ describe('readSelector', () => {
         (value) => ({ url: `https://h.example/x?${new URLSearchParams({ key: value })}` }),
       ],
     ]
+
+    test.each(['google/a&b@x.example', 'google/a+b@x.example', 'notion/a#b=c d', 'github/a;b'])(
+      'the selector %s can be pasted into the query slot as it is',
+      (label) => {
+        const raw = `https://h.example/x?alt=json&key=${defaultSelectorShape.format(label)}&q=1`
+
+        const { selector, stripped } = readSelector(
+          defaultSelectorShape,
+          { kind: 'query', param: 'key' },
+          request({ url: raw }),
+        )
+
+        expect(selector).toEqual(named(label))
+        expect(stripped.url.href).toBe('https://h.example/x?alt=json&q=1')
+      },
+    )
 
     describe.each(vendorIds)('%s shape', (vendor) => {
       const shape = selectorShapeOf(vendor)

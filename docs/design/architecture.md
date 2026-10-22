@@ -296,13 +296,15 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 
 ## Implementation reconciliation
 
-- P01 `catalog.ts`: default の `selectorShape` は handle を `encodeURI` で percent-encode して `kurumi:` を付け、`parse` が戻す。HTTP の header の値は Latin1 の範囲しか持てず、日本語の label を生のまま載せると Bun の `Headers` が投げ、curl で送ると server に文字化けで届くため。ASCII の handle は設計の `kurumi:<vendor>/<label>` のまま。
-- P01 `catalog.ts`: anthropic の `selectorShape.parse` は、`sk-ant-kurumi-` の後ろが base64url の文字だけのときに限って handle を返す。壊れた値を handle として読まず `none` にする。
-- P01 `catalog.ts`: `HostRule.host` は完全一致だけにし、`*.example.com` は持たない。使う service が無く、`interceptedHosts()` の集合に載せられないため。
-- P01 `catalog.ts`: Gmail は `www.googleapis.com` の `/upload/gmail/` と `/batch/gmail/`、Calendar は `/batch/calendar/` も `pathPrefix` に持つ。discovery document の `mediaUpload` と `batchPath` の path が service の path の外にあるため。
-- P01 `catalog.ts`: `serviceFor` は照合の前に、query を除き、`.` と `..` の segment を畳み、unreserved 文字の `%XX` を戻す。`/gmail/../calendar/` を Gmail と取り違えると、両方の scope を持つ token が Calendar に使われるため。`%2F` のような unreserved でない escape は戻さず、どの prefix にも合わず null になる。
-- P01 `catalog.ts`: 照合を `createServiceFinder` に切り出して export した。長い `pathPrefix` が先に合うことを、catalog に無い重なりで test するため。`defineCatalog` は `as const satisfies` に置き換えた。`OAuthSpec.identify`、`ServiceSpec.summarize`、`ApprovalSummary` は P02 と P18 で足すので、この PR の型に無い。
+- P01 `catalog.ts`: default の `selectorShape` は label を `encodeURIComponent` で percent-encode し（`/`、`@`、`:` は戻す）、`kurumi:` を付ける。`parse` は prefix を大文字小文字を区別せずに読み、percent-decode する。HTTP の header の値は Latin1 の範囲しか持てず、日本語の label は Bun の `Headers` が投げ、curl で送ると文字化けで届く。query では `&`、`#`、`+` が値を切るため。`+`、`&`、空白、`%` を含む label は `selector` を写した文字列と手で書いた文字列で形が違う（`a b` は `a%20b`）。
+- P01 `catalog.ts`: `SelectorShape.parse` は、vendor の prefix を持つのに壊れた値（anthropic の base64url が正規の形でない、など）を `null` にせず、値そのものを handle として返す。`none` にすると default の account に落ち、名指しの失敗が別の account の使用になるため。どの grant の handle にも一致しないので `account_not_granted` で拒否される。SDK 自身の placeholder は prefix が無いので `none` のまま。
+- P01 `catalog.ts`: `HostRule.host` は完全一致だけにし、`*.example.com` は持たない。使う service が無く、`interceptedHosts()` の集合に載せられないため。host は `normalizeHost`（小文字、末尾の `.` を除く）で比べ、port は hostname に含めない。`isInterceptedHost` を足して、gateway が `serviceFor` と同じ比べ方で MITM の可否を決められるようにした。
+- P01 `catalog.ts`: Gmail は `www.googleapis.com` の `/upload/gmail/`、`/resumable/upload/gmail/`、`/batch/gmail/`、Calendar は `/batch/calendar/` も `pathPrefix` に持つ。discovery document の `mediaUpload` と `batchPath` の path が service の path の外にあるため。
+- P01 `catalog.ts`: `serviceFor` は query を除いた path の unreserved 文字の `%XX` だけを戻して照合し、dot segment、`%2F`、`%5C`、`\`、`;` を含む path は null にする。Google は unreserved の escape を戻して route し、dot segment には redirect を返す（`curl --path-as-is` で確認）。path を畳んで読むと Google の解釈とずれる（`..;`）ので、疑わしい path は service を決めない。gateway は注入した credential を付けたまま redirect を辿ってはならない（`redirect: 'manual'`）。
+- P01 `catalog.ts`: 照合を `createServiceFinder` に切り出して export した。長い `pathPrefix` が先に合うことを、catalog に無い重なりで test するため。`defineCatalog` は `as const satisfies` に置き換えた。`OAuthSpec.identify`、`ServiceSpec.summarize`、`ApprovalSummary` は P02 と P18 で足すので、この PR の型に無い。`serviceBelongsToVendorSql` は全体を括弧で囲む。
 - P01 `select.ts`: `accountHandle(vendor, label)` を足した。`AccountHandle` の brand を付ける場所を 1 か所にするため。
+- P01 `select.ts`: `bearer` と `basic` の slot は、どちらも `Authorization` の `Bearer`、`token`、`Basic`（password）から selector を読む。`gh` や Octokit は `api.github.com` に `token` か `Bearer` を送り、git は `Basic` を送るため、slot を 1 通りに決めると名指しが黙って無視される。default が複数あるときは、最初の行を取らず `account_ambiguous` にする。
+- P01 `.oxlintrc.json`: `no-restricted-imports` で、他の package から import してよい entry を `schema`、`contract`、`server`、`ui`、`cli`、`testing` に限り、`src/` の中と相対 path での越境も拒否する。entry の名前を足す PR は `.oxlintrc.json` も直す。
 
 ## ユーザーが決めたこと（2026-10-22）
 
