@@ -93,16 +93,25 @@ test('a silent SSE stream delivers its event and a recorded body is replayed exa
 })
 
 test.each(['--http2', '--http2-prior-knowledge'])(
-  'curl %s negotiates HTTP/1.1 through MITM',
+  'curl %s obeys the HTTP/1.1-only ALPN policy',
   async (flag) => {
     const { gateway } = await setup()
     const dir = await mkdtemp(join(tmpdir(), 'kurumi-alpn-'))
     stops.push(() => rm(dir, { recursive: true, force: true }))
     const caPath = join(dir, 'ca.pem')
     await writeFile(caPath, gateway.caPem)
+    const curl = process.env.KURUMI_TEST_CURL ?? '/usr/bin/curl'
+    const versionCommand = Bun.spawn([curl, '--version'], { stdout: 'pipe', stderr: 'pipe' })
+    const version = await new Response(versionCommand.stdout).text()
+    expect(await versionCommand.exited).toBe(0)
+    const match = /^curl (\d+)\.(\d+)\./.exec(version)
+    expect(match).not.toBeNull()
+    const onlyH2 =
+      flag === '--http2-prior-knowledge' &&
+      (Number(match![1]) > 8 || (Number(match![1]) === 8 && Number(match![2]) >= 10))
     const child = Bun.spawn(
       [
-        '/usr/bin/curl',
+        curl,
         flag,
         '--silent',
         '--show-error',
@@ -126,6 +135,12 @@ test.each(['--http2', '--http2-prior-knowledge'])(
       new Response(child.stderr).text(),
       child.exited,
     ])
+    if (onlyH2) {
+      expect(code).toBe(35)
+      expect(error).toContain('no application protocol')
+      expect(output).toBe('\n000 0')
+      return
+    }
     expect({ code, error }).toEqual({ code: 0, error: '' })
     expect(output).toContain('"x-injected":"yes"')
     expect(output).toEndWith('\n200 1.1')
