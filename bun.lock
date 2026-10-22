@@ -54,6 +54,9 @@
         "drizzle-orm": "catalog:",
       },
     },
+    "packages/session": {
+      "name": "@kurumi/session",
+    },
   },
   "catalog": {
     "@peculiar/x509": "2.2.0",
@@ -134,6 +137,8 @@
     "@kurumi/host": ["@kurumi/host@workspace:apps/host"],
 
     "@kurumi/rpc": ["@kurumi/rpc@workspace:packages/rpc"],
+
+    "@kurumi/session": ["@kurumi/session@workspace:packages/session"],
 
     "@oxfmt/binding-android-arm-eabi": ["@oxfmt/binding-android-arm-eabi@0.71.0", "", { "os": "android", "cpu": "arm" }, "sha512-l31EyBfB4egJeFua11aQFEUE9nnDtfpWCadqQovm0WL30t/yUHtdFl/5HyFXvd5xT8Ewh3U4TI9f30GowrQ1fw=="],
 
