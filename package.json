@@ -24,6 +24,7 @@
     "generate": "bun run --filter './packages/*' --if-present generate"
   },
   "devDependencies": {
+    "@kurumi/gateway": "workspace:*",
     "@types/bun": "catalog:",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",

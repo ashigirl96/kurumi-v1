@@ -2,6 +2,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { once } from 'node:events'
 import { request } from 'node:http'
 import { connect } from 'node:net'
+import { join } from 'node:path'
 
 import { createCertificateAuthority } from './ca.ts'
 import { startAgentPort } from './port.ts'
@@ -10,6 +11,28 @@ import { openTestTunnel, sendTestRequest, startFakeUpstream, startTestGateway } 
 const stops: (() => void | Promise<void>)[] = []
 afterEach(async () => {
   for (const stop of stops.splice(0).toReversed()) await stop()
+})
+
+test('a root-level lane can start both fixtures through the testing entry alone', () => {
+  const result = Bun.spawnSync(
+    [
+      process.execPath,
+      '-e',
+      `
+    import { startFakeUpstream, startTestGateway } from '@kurumi/gateway/testing'
+    const upstream = await startFakeUpstream()
+    const gateway = await startTestGateway({
+      port: 0, token: 'lane-token', intercepts: new Set(['fake.test']), upstream: upstream.destination,
+    })
+    await gateway.stop()
+    await upstream.stop()
+  `,
+    ],
+    { cwd: join(import.meta.dir, '../../..'), timeout: 5000 },
+  )
+  expect(result.stderr.toString()).toBe('')
+  expect(result.exitCode).toBe(0)
+  expect(result.stdout.toString()).toContain('gateway.started')
 })
 
 async function setup() {
