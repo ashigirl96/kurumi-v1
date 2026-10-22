@@ -8,6 +8,7 @@ import {
   vendorIds,
   vendorOf,
   type CredentialSlot,
+  type SelectorShape,
   type ServiceId,
   type VendorId,
 } from './catalog.ts'
@@ -178,15 +179,15 @@ describe('selectAccount over the Group 1 and Group 2 grants', () => {
   test('a handle that is a prefix or a suffix of a granted one is not granted', () => {
     const candidates = [grant(handleA), grant(accountHandle('google', 'ab@work.example'))]
 
-    for (const named_ of [
+    for (const namedCount of [
       'google/a',
       'google/a@work.example ',
       'google/@work.example',
       'a@work.example',
     ]) {
-      expect(selectAccount('gmail', candidates, named(named_))).toMatchObject({
+      expect(selectAccount('gmail', candidates, named(namedCount))).toMatchObject({
         ok: false,
-        refusal: { code: 'account_not_granted', named: named_ },
+        refusal: { code: 'account_not_granted', named: namedCount },
       })
     }
   })
@@ -200,20 +201,28 @@ describe('selectAccount over the Group 1 and Group 2 grants', () => {
     })
   })
 
-  test('a conflict between selectors is refused whatever the grants, naming what was written', () => {
-    const conflict: Selector = { kind: 'conflict', handles: ['google/a@work.example', 'google/b'] }
+  test('a selector that could not be read is refused whatever the grants, naming what was written', () => {
+    const written = 'Bearer kurumi:google/a@work.example, Bearer kurumi:google/b'
 
     for (const candidates of [[grantA], group1Gmail, []]) {
-      expect(selectAccount('gmail', candidates, conflict)).toEqual({
+      expect(selectAccount('gmail', candidates, { kind: 'unreadable', written })).toEqual({
         ok: false,
         refusal: {
           code: 'account_not_granted',
           service: 'gmail',
-          named: 'google/a@work.example | google/b',
+          named: written,
           granted: candidates.map(({ handle }) => handle),
         },
       })
     }
+  })
+
+  test('what was written is never matched against the granted handles', () => {
+    const candidates = [grant(accountHandle('google', 'kurumi-team'))]
+
+    expect(
+      selectAccount('gmail', candidates, { kind: 'unreadable', written: 'google/kurumi-team' }),
+    ).toMatchObject({ ok: false, refusal: { code: 'account_not_granted' } })
   })
 
   test('a handle is matched exactly', () => {
@@ -258,7 +267,13 @@ describe('selectAccount with a dead refresh token', () => {
 
 describe('selectAccount invariants', () => {
   const pool = [handleA, handleB, handleC]
-  const selectors = [none, named(handleA), named(handleC), named('google/unknown@x.example')]
+  const selectors: Selector[] = [
+    none,
+    named(handleA),
+    named(handleC),
+    named('google/unknown@x.example'),
+    { kind: 'unreadable', written: handleA },
+  ]
 
   function* groups(): Generator<GrantedCandidate[]> {
     for (let mask = 0; mask < 8; mask++) {
@@ -318,397 +333,34 @@ const request = (init: {
 const basic = (user: string, password: string) =>
   `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`
 
-describe('a selector that is malformed but clearly meant', () => {
-  const anthropic = selectorShapeOf('anthropic')
-  const handle = accountHandle('anthropic', 'team')
-  const candidates = [
-    grant(accountHandle('anthropic', 'personal'), { isDefault: true }),
-    grant(handle),
-  ]
-
-  test.each(['sk-ant-kurumi-YW50aHJvcGljL3RlYW0=', 'sk-ant-kurumi-***'])(
-    'the value %s is refused instead of falling back to the default account',
-    (apiKey) => {
-      const { selector } = readSelector(
-        anthropic,
-        { kind: 'header', header: 'x-api-key' },
-        request({ headers: { 'x-api-key': apiKey } }),
-      )
-
-      expect(selectAccount('anthropic-api', candidates, selector)).toMatchObject({
-        ok: false,
-        refusal: { code: 'account_not_granted' },
-      })
-    },
-  )
-
-  test('the SDK placeholder still falls back to the default account', () => {
-    const { selector } = readSelector(
-      anthropic,
-      { kind: 'header', header: 'x-api-key' },
-      request({ headers: { 'x-api-key': 'sk-ant-api03-placeholder' } }),
-    )
-
-    expect(selectAccount('anthropic-api', candidates, selector)).toMatchObject({
-      ok: true,
-      how: 'default',
-    })
-  })
-})
-
 describe('readSelector', () => {
   const handle = 'google/alice@work.example'
 
-  describe('bearer', () => {
-    const slot: CredentialSlot = { kind: 'bearer' }
-
-    test('reads the handle and removes the authorization header', () => {
-      const req = request({
-        headers: { Authorization: `Bearer kurumi:${handle}`, accept: 'application/json' },
-      })
-
-      const { selector, stripped } = readSelector(defaultSelectorShape, slot, req)
-
-      expect(selector).toEqual(named(handle))
-      expect(stripped.headers.has('authorization')).toBe(false)
-      expect(stripped.headers.get('accept')).toBe('application/json')
-      expect(stripped.url.href).toBe(req.url.href)
+  test('reads the handle, removes the credential header and leaves the rest of the request', () => {
+    const req = request({
+      headers: { Authorization: `Bearer kurumi:${handle}`, accept: 'application/json' },
     })
 
-    test('treats the scheme case-insensitively', () => {
-      const { selector } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({ headers: { authorization: `bearer kurumi:${handle}` } }),
-      )
+    const { selector, stripped } = readSelector(defaultSelectorShape, { kind: 'bearer' }, req)
 
-      expect(selector).toEqual(named(handle))
-    })
-
-    test('a token that is not a selector is none, and the slot is still emptied', () => {
-      const req = request({ headers: { authorization: 'Bearer ya29.sdk-placeholder' } })
-
-      const { selector, stripped } = readSelector(defaultSelectorShape, slot, req)
-
-      expect(selector).toEqual(none)
-      expect(stripped.headers.has('authorization')).toBe(false)
-    })
-
-    test('no authorization header is none', () => {
-      const { selector, stripped } = readSelector(defaultSelectorShape, slot, request({}))
-
-      expect(selector).toEqual(none)
-      expect(stripped.headers.has('authorization')).toBe(false)
-    })
-
-    test.each([
-      ['token', `token kurumi:${handle}`],
-      ['Basic', basic('x', `kurumi:${handle}`)],
-    ])('the %s scheme names the account too', (_scheme, authorization) => {
-      const { selector, stripped } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({ headers: { authorization } }),
-      )
-
-      expect(selector).toEqual(named(handle))
-      expect(stripped.headers.has('authorization')).toBe(false)
-    })
-
-    test('a scheme that carries no secret is none and is removed', () => {
-      const { selector, stripped } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({ headers: { authorization: 'Digest username="x"' } }),
-      )
-
-      expect(selector).toEqual(none)
-      expect(stripped.headers.has('authorization')).toBe(false)
-    })
+    expect(selector).toEqual(named(handle))
+    expect(stripped.headers.has('authorization')).toBe(false)
+    expect(stripped.headers.get('accept')).toBe('application/json')
+    expect(stripped.url.href).toBe(req.url.href)
   })
 
-  describe('header', () => {
-    const slot: CredentialSlot = { kind: 'header', header: 'x-api-key' }
+  test('removes only the header of the slot', () => {
     const shape = selectorShapeOf('anthropic')
-
-    test('reads the handle from the anthropic-shaped value and removes only that header', () => {
-      const req = request({
-        url: 'https://api.anthropic.com/v1/messages',
-        headers: { 'X-Api-Key': shape.format('anthropic/team'), authorization: 'Bearer untouched' },
-      })
-
-      const { selector, stripped } = readSelector(shape, slot, req)
-
-      expect(selector).toEqual(named('anthropic/team'))
-      expect(stripped.headers.has('x-api-key')).toBe(false)
-      expect(stripped.headers.get('authorization')).toBe('Bearer untouched')
+    const req = request({
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: { 'X-Api-Key': shape.format('anthropic/team'), authorization: 'Bearer untouched' },
     })
 
-    test('the SDK placeholder is none and the header is removed', () => {
-      const { selector, stripped } = readSelector(
-        shape,
-        slot,
-        request({ headers: { 'x-api-key': 'sk-ant-placeholder' } }),
-      )
+    const { selector, stripped } = readSelector(shape, { kind: 'header', header: 'x-api-key' }, req)
 
-      expect(selector).toEqual(none)
-      expect(stripped.headers.has('x-api-key')).toBe(false)
-    })
-  })
-
-  describe('a header that is sent more than once', () => {
-    const bearer: CredentialSlot = { kind: 'bearer' }
-    const apiKey: CredentialSlot = { kind: 'header', header: 'x-api-key' }
-    const anthropic = selectorShapeOf('anthropic')
-    const key = (label: string) => anthropic.format(label)
-
-    test.each([
-      ['placeholder first', ['Bearer placeholder', 'Bearer kurumi:google/a@x.example']],
-      ['placeholder last', ['Bearer kurumi:google/a@x.example', 'Bearer placeholder']],
-      [
-        'the same selector twice',
-        ['Bearer kurumi:google/a@x.example', 'Bearer kurumi:google/a@x.example'],
-      ],
-    ])('bearer reads the selector, %s', (_where, values) => {
-      const { selector, stripped } = readSelector(
-        defaultSelectorShape,
-        bearer,
-        request({ headers: values.map((value) => ['authorization', value] as [string, string]) }),
-      )
-
-      expect(selector).toEqual(named('google/a@x.example'))
-      expect(stripped.headers.has('authorization')).toBe(false)
-    })
-
-    test('two different selectors conflict', () => {
-      const { selector } = readSelector(
-        anthropic,
-        apiKey,
-        request({
-          headers: [
-            ['x-api-key', key('anthropic/a')],
-            ['x-api-key', key('anthropic/b')],
-          ],
-        }),
-      )
-
-      expect(selector).toEqual({ kind: 'conflict', handles: ['anthropic/a', 'anthropic/b'] })
-    })
-
-    test('a placeholder after the selector does not become part of the handle', () => {
-      const { selector } = readSelector(
-        anthropic,
-        apiKey,
-        request({
-          headers: [
-            ['x-api-key', key('anthropic/a')],
-            ['x-api-key', 'sk-ant-placeholder'],
-          ],
-        }),
-      )
-
-      expect(selector).toEqual(named('anthropic/a'))
-    })
-  })
-
-  describe('basic', () => {
-    const slot: CredentialSlot = { kind: 'basic' }
-
-    test('reads the handle from the password whatever the user name is', () => {
-      const req = request({
-        url: 'https://github.com/o/r.git/info/refs',
-        headers: { authorization: basic('x-access-token', 'kurumi:github/bot') },
-      })
-
-      const { selector, stripped } = readSelector(defaultSelectorShape, slot, req)
-
-      expect(selector).toEqual(named('github/bot'))
-      expect(stripped.headers.has('authorization')).toBe(false)
-    })
-
-    test.each(['Bearer', 'token'])(
-      'the %s scheme of gh and Octokit names the account too',
-      (scheme) => {
-        const { selector } = readSelector(
-          defaultSelectorShape,
-          slot,
-          request({ headers: { authorization: `${scheme} kurumi:github/bot` } }),
-        )
-
-        expect(selector).toEqual(named('github/bot'))
-      },
-    )
-
-    test('a password that holds a colon keeps everything after the first colon', () => {
-      const { selector } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({ headers: { authorization: basic('x', 'kurumi:github/a:b') } }),
-      )
-
-      expect(selector).toEqual(named('github/a:b'))
-    })
-
-    test.each(['Basic', 'Basic !!!', `Basic ${Buffer.from('no-colon').toString('base64')}`])(
-      'a malformed credential %p is none and is removed',
-      (authorization) => {
-        const { selector, stripped } = readSelector(
-          defaultSelectorShape,
-          slot,
-          request({ headers: { authorization } }),
-        )
-
-        expect(selector).toEqual(none)
-        expect(stripped.headers.has('authorization')).toBe(false)
-      },
-    )
-  })
-
-  describe('query', () => {
-    const slot: CredentialSlot = { kind: 'query', param: 'key' }
-
-    test('reads the handle and removes only the key parameter, leaving the rest as written', () => {
-      const req = request({
-        url: 'https://example.googleapis.com/x?q=a%20b&key=kurumi%3Agoogle%2Fa%40x.example&alt=json#top',
-      })
-
-      const { selector, stripped } = readSelector(defaultSelectorShape, slot, req)
-
-      expect(selector).toEqual(named('google/a@x.example'))
-      expect(stripped.url.href).toBe('https://example.googleapis.com/x?q=a%20b&alt=json#top')
-    })
-
-    test('a url whose only parameter is the key loses its query entirely', () => {
-      const { stripped } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({ url: 'https://example.googleapis.com/x?key=kurumi:google/a@x.example' }),
-      )
-
-      expect(stripped.url.href).toBe('https://example.googleapis.com/x')
-    })
-
-    test('a parameter that merely contains the name stays', () => {
-      const { selector, stripped } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({ url: 'https://example.googleapis.com/x?apikey=1&key2=2&Key=3' }),
-      )
-
-      expect(selector).toEqual(none)
-      expect(stripped.url.search).toBe('?apikey=1&key2=2&Key=3')
-    })
-
-    const selection = (search: string, candidates: GrantedCandidate[]) => {
-      const { selector } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({ url: `https://h.example/x${search}` }),
-      )
-      return selectAccount('gmail', candidates, selector)
-    }
-
-    test('a repeated key parameter is all removed', () => {
-      const { stripped } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({
-          url: 'https://example.googleapis.com/x?key=kurumi:google/a@x&k=1&key=kurumi:google/b@x',
-        }),
-      )
-
-      expect(stripped.url.search).toBe('?k=1')
-    })
-
-    describe('a key parameter that appears more than once', () => {
-      const only = grant(accountHandle('google', 'only@x.example'))
-      const preferred = grant(accountHandle('google', 'default@x.example'), { isDefault: true })
-      const wanted = grant(accountHandle('google', 'a@x.example'))
-      const other = grant(accountHandle('google', 'b@x.example'))
-
-      test.each([
-        ['placeholder first', '?key=AIzaPlaceholder&alt=json&key=kurumi%3Agoogle%2Fa%40x.example'],
-        ['placeholder last', '?key=kurumi%3Agoogle%2Fa%40x.example&key=AIzaPlaceholder'],
-        ['empty first', '?key=&key=kurumi%3Agoogle%2Fa%40x.example'],
-        [
-          'the same selector twice',
-          '?key=kurumi:google/a@x.example&key=kurumi%3Agoogle%2Fa%40x.example',
-        ],
-      ])('the selector is read when it comes %s', (_where, search) => {
-        expect(selection(search, [wanted, other])).toMatchObject({
-          ok: true,
-          accountId: wanted.accountId,
-          how: 'named',
-        })
-      })
-
-      test.each([
-        ['one grant', [only]],
-        ['a default', [preferred, wanted]],
-      ])('a selector later in the query does not fall back to %s', (_name, candidates) => {
-        const search = '?key=AIzaPlaceholder&key=kurumi%3Agoogle%2Fgone%40x.example'
-
-        expect(selection(search, candidates)).toMatchObject({
-          ok: false,
-          refusal: { code: 'account_not_granted' },
-        })
-      })
-
-      test.each([
-        [
-          'two grants named',
-          [wanted, other],
-          '?key=kurumi:google/a@x.example&key=kurumi:google/b@x.example',
-        ],
-        ['one grant', [only], '?key=kurumi:google/only@x.example&key=kurumi:google/b@x.example'],
-        [
-          'a default',
-          [preferred, wanted],
-          '?key=kurumi:google/default@x.example&key=kurumi:google/a@x.example',
-        ],
-        [
-          'either order',
-          [wanted, other],
-          '?key=kurumi:google/b@x.example&key=kurumi:google/a@x.example',
-        ],
-      ])('two selectors that disagree are refused (%s)', (_name, candidates, search) => {
-        expect(selection(search, candidates)).toMatchObject({
-          ok: false,
-          refusal: { code: 'account_not_granted' },
-        })
-      })
-    })
-
-    test('a plus written by hand stays a plus', () => {
-      const { selector } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({ url: 'https://h.example/x?key=kurumi:google/a+b@x.example' }),
-      )
-
-      expect(selector).toEqual(named('google/a+b@x.example'))
-    })
-
-    test('no key parameter is none and leaves the url alone', () => {
-      const { selector, stripped } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({ url: 'https://h.example/x?a=1' }),
-      )
-
-      expect(selector).toEqual(none)
-      expect(stripped.url.href).toBe('https://h.example/x?a=1')
-    })
-
-    test('an encoded plus in the handle survives', () => {
-      const { selector } = readSelector(
-        defaultSelectorShape,
-        slot,
-        request({ url: 'https://h.example/x?key=kurumi%3Agoogle%2Fa%2Btag%40x.example' }),
-      )
-
-      expect(selector).toEqual(named('google/a+tag@x.example'))
-    })
+    expect(selector).toEqual(named('anthropic/team'))
+    expect(stripped.headers.has('x-api-key')).toBe(false)
+    expect(stripped.headers.get('authorization')).toBe('Bearer untouched')
   })
 
   test('the request that came in is left as it was', () => {
@@ -724,264 +376,506 @@ describe('readSelector', () => {
     expect(req.url.href).toBe('https://h.example/x?key=kurumi:google/a@x')
   })
 
-  describe('awkward handles through every slot', () => {
-    const handles = [
-      'notion/ノート 共有',
-      'google/a+tag@x.example',
-      'github/a b',
-      'google/日本語+ @x.example',
-      'github/100%',
-      'google/a%41b',
-      'github/a%2Fb',
-    ]
-    const slots: [
-      string,
-      CredentialSlot,
-      (value: string) => { headers?: Record<string, string>; url?: string },
-    ][] = [
-      [
-        'bearer',
-        { kind: 'bearer' },
-        (value) => ({ headers: { authorization: `Bearer ${value}` } }),
-      ],
-      [
-        'header',
-        { kind: 'header', header: 'x-api-key' },
-        (value) => ({ headers: { 'x-api-key': value } }),
-      ],
-      ['basic', { kind: 'basic' }, (value) => ({ headers: { authorization: basic('x', value) } })],
-      [
-        'query',
-        { kind: 'query', param: 'key' },
-        (value) => ({ url: `https://h.example/x?${new URLSearchParams({ key: value })}` }),
-      ],
-    ]
+  test('the scheme and the prefix are read without regard to case', () => {
+    const { selector } = readSelector(
+      defaultSelectorShape,
+      { kind: 'bearer' },
+      request({ headers: { authorization: `bEaReR KURUMI:${handle}` } }),
+    )
 
-    test.each([
-      'google/a&b@x.example',
-      'google/a+b@x.example',
-      'notion/a#b=c d',
-      'github/a;b',
-      'google/a%41b',
-      'github/a%2Fb',
-      'github/%41',
-      'notion/50%25off',
-      'google/a%2Bb@x.example',
-      'github/100%',
-    ])('the selector %s can be pasted into the query slot as it is', (label) => {
-      const raw = `https://h.example/x?alt=json&key=${defaultSelectorShape.format(label)}&q=1`
+    expect(selector).toEqual(named(handle))
+  })
 
-      const { selector, stripped } = readSelector(
-        defaultSelectorShape,
-        { kind: 'query', param: 'key' },
-        request({ url: raw }),
-      )
+  test('a password that holds a colon keeps everything after the first colon', () => {
+    const { selector } = readSelector(
+      defaultSelectorShape,
+      { kind: 'basic' },
+      request({ headers: { authorization: basic('x', 'kurumi:github/a:b') } }),
+    )
 
-      expect(selector).toEqual(named(label))
-      expect(stripped.url.href).toBe('https://h.example/x?alt=json&q=1')
-    })
+    expect(selector).toEqual(named('github/a:b'))
+  })
 
-    test.each([
-      'google/a b',
-      'google/日本語',
-      'google/a%41b',
-      'github/a%2Fb',
-      'google/a+b@x.example',
-    ])('the selector %s survives an encoder that keeps the colon readable', (label) => {
-      const written = encodeURIComponent(defaultSelectorShape.format(label)).replaceAll('%3A', ':')
+  test.each([
+    ['no header', {}],
+    ['a scheme that carries no secret', { authorization: 'Digest username="x"' }],
+    ['an empty Basic credential', { authorization: 'Basic' }],
+    ['a Basic credential that is no base64', { authorization: 'Basic !!!' }],
+    ['a Basic credential with no password', { authorization: basic('no-colon', '').slice(0, -1) }],
+  ])('%s is none, and the slot is still empty', (_name, headers) => {
+    const { selector, stripped } = readSelector(
+      defaultSelectorShape,
+      { kind: 'basic' },
+      request({ headers }),
+    )
 
-      const { selector } = readSelector(
-        defaultSelectorShape,
-        { kind: 'query', param: 'key' },
-        request({ url: `https://h.example/x?key=${written}` }),
-      )
+    expect(selector).toEqual(none)
+    expect(stripped.headers.has('authorization')).toBe(false)
+  })
 
-      expect(selector).toEqual(named(label))
-    })
+  test('a url that has no key parameter is left alone', () => {
+    const { selector, stripped } = readSelector(
+      defaultSelectorShape,
+      { kind: 'query', param: 'key' },
+      request({ url: 'https://h.example/x?a=1&apikey=2&key2=3&Key=4' }),
+    )
 
-    test('a pasted selector names the account it was formatted from, not a lookalike', () => {
-      const formatted = defaultSelectorShape.format('google/a%41b')
-      const { selector } = readSelector(
-        defaultSelectorShape,
-        { kind: 'query', param: 'key' },
-        request({ url: `https://h.example/x?key=${formatted}` }),
-      )
-
-      expect(
-        selectAccount(
-          'gmail',
-          [grant(accountHandle('google', 'aAb')), grant(accountHandle('google', 'a%41b'))],
-          selector,
-        ),
-      ).toMatchObject({ ok: true, handle: 'google/a%41b', how: 'named' })
-    })
-
-    describe.each(vendorIds)('%s shape', (vendor) => {
-      const shape = selectorShapeOf(vendor)
-
-      test.each(slots)('%s slot', (_name, slot, place) => {
-        for (const awkward of handles) {
-          const { selector } = readSelector(shape, slot, request(place(shape.format(awkward))))
-
-          expect(selector).toEqual(named(awkward))
-        }
-      })
-    })
+    expect(selector).toEqual(none)
+    expect(stripped.url.href).toBe('https://h.example/x?a=1&apikey=2&key2=3&Key=4')
   })
 })
 
-type Carrier = {
-  name: string
-  header: string
-  wrap: (secret: string) => string
-  placeholder: string
+type Target = { vendor: VendorId; service: ServiceId; slot: CredentialSlot; shape: SelectorShape }
+type Row = [name: string, value: string, expected: string]
+type Placement = { name: string; wrap: (secret: string) => string }
+
+const headerOf = (slot: CredentialSlot): string =>
+  slot.kind === 'header' ? slot.header : 'authorization'
+
+const groupOf = (vendor: VendorId): GrantedCandidate[] => [
+  grant(accountHandle(vendor, 'main'), { isDefault: true }),
+  ...[
+    'a',
+    'b',
+    'Acme',
+    'Acme, Inc.',
+    'Acme, token team',
+    'a@x.example',
+    'a+b@x.example',
+    'a+tag@x.example',
+  ].map((label) => grant(accountHandle(vendor, label))),
+]
+
+function decide(
+  { vendor, service, slot, shape }: Target,
+  req: ReturnType<typeof request>,
+): { outcome: string; stripped: ReturnType<typeof request> } {
+  const { selector, stripped } = readSelector(shape, slot, req)
+  const selection = selectAccount(service, groupOf(vendor), selector)
+  if (!selection.ok) return { outcome: 'refused', stripped }
+  return { outcome: selection.how === 'named' ? selection.handle : selection.how, stripped }
 }
 
-const authorization = (scheme: string): Carrier => ({
-  name: scheme,
-  header: 'authorization',
-  wrap: (secret) => `${scheme} ${secret}`,
-  placeholder: `${scheme} placeholder`,
-})
+const bearer = (scheme: string): Placement => ({ name: scheme, wrap: (s) => `${scheme} ${s}` })
 
-type HeaderSlot = { vendor: VendorId; service: ServiceId; slot: CredentialSlot }
-
-const headerSlots = [
-  ...new Map(
-    serviceIds.flatMap((service) => {
-      const { slot } = serviceSpec(service)
-      const vendor = vendorOf(service)
-      return slot.kind === 'query' ? [] : [[`${vendor} ${slot.kind}`, { vendor, service, slot }]]
-    }),
-  ).values(),
-] as HeaderSlot[]
-
-const carriersOf = (slot: CredentialSlot): Carrier[] => {
+const placementsOf = (slot: CredentialSlot): Placement[] => {
   switch (slot.kind) {
     case 'bearer':
-      return [authorization('Bearer'), authorization('token')]
+      return [bearer('Bearer'), bearer('token')]
     case 'basic':
-      return [
-        {
-          name: 'Basic',
-          header: 'authorization',
-          wrap: (secret) => basic('x', secret),
-          placeholder: basic('x', 'placeholder'),
-        },
-        authorization('Bearer'),
-      ]
+      return [{ name: 'Basic', wrap: (secret) => basic('x', secret) }]
     case 'header':
-      return [
-        {
-          name: slot.header,
-          header: slot.header,
-          wrap: (secret) => secret,
-          placeholder: 'sk-ant-placeholder',
-        },
-      ]
+      return [{ name: slot.header, wrap: (secret) => secret }]
     case 'query':
       return []
   }
 }
 
-const outcomeOf = (
-  { vendor, service, slot }: HeaderSlot,
-  { header }: Carrier,
-  value: string,
-): string => {
-  const label = (name: string) => accountHandle(vendor, name)
-  const candidates = [
-    grant(label('main'), { isDefault: true }),
-    ...['a', 'b', 'Acme', 'Acme, Inc.'].map((name) => grant(label(name))),
+const slotTargets: Target[] = [
+  ...new Map(
+    serviceIds.flatMap((service) => {
+      const { slot } = serviceSpec(service)
+      const vendor = vendorOf(service)
+      const shape = selectorShapeOf(vendor)
+      const key = `${slot.kind} ${shape === defaultSelectorShape ? 'default' : vendor}`
+      return slot.kind === 'query' ? [] : [[key, { vendor, service, slot, shape }] as const]
+    }),
+  ).values(),
+]
+
+const joined = (...values: string[]) => values.join(', ')
+
+function rowsOf({ vendor, shape }: Target, { wrap }: Placement): Row[] {
+  const handle = (label: string) => `${vendor}/${label}`
+  const written = (label: string) => `kurumi:${handle(label)}`
+  const forms =
+    shape === defaultSelectorShape ? [written] : [written, (l: string) => shape.format(handle(l))]
+  const placeholder = wrap('placeholder')
+  return [
+    ...forms.flatMap((form, i): Row[] => [
+      [`form ${i}: one selector`, wrap(form('b')), handle('b')],
+      [`form ${i}: two different selectors`, joined(wrap(form('a')), wrap(form('b'))), 'refused'],
+      [`form ${i}: the same selector twice`, joined(wrap(form('a')), wrap(form('a'))), 'refused'],
+      [`form ${i}: a placeholder before`, joined(placeholder, wrap(form('a'))), 'refused'],
+      [`form ${i}: a placeholder after`, joined(wrap(form('a')), placeholder), 'refused'],
+    ]),
+    ...forms
+      .slice(1)
+      .map((form): Row => [
+        'a comma in a label of the vendor shape',
+        wrap(form('Acme, Inc.')),
+        handle('Acme, Inc.'),
+      ]),
+    ['capitals in the prefix', wrap(`KURUMI:${handle('b')}`), handle('b')],
+    ['a comma and a space in the label', wrap(written('Acme, Inc.')), handle('Acme, Inc.')],
+    [
+      'a scheme word after the comma',
+      wrap(written('Acme, token team')),
+      handle('Acme, token team'),
+    ],
+    ['a comma written %2C', wrap(written('Acme%2C%20Inc.')), handle('Acme, Inc.')],
+    [
+      'a selector and a real-looking key',
+      wrap(`${written('main')}, sk-ant-api03-placeholder`),
+      'refused',
+    ],
+    ['a label that mentions the word', wrap(written('kurumi-team')), 'refused'],
+    ['an encoded prefix', wrap(`kurumi%3A${vendor}%2Fa`), 'refused'],
+    ['the word hidden by an escape', wrap(`%6Burumi:${handle('a')}`), 'refused'],
+    ['an empty handle', wrap('kurumi:'), 'refused'],
+    ['a malformed escape', wrap('kurumi:%E0'), 'refused'],
+    ['an anthropic look-alike', wrap('sk-ant-kurumi-***'), 'refused'],
+    ['an anthropic prefix alone', wrap('sk-ant-kurumi-'), 'refused'],
+    ['an anthropic payload that is not canonical', wrap('sk-ant-kurumi-YQ=='), 'refused'],
+    ['a real-looking token', wrap('ya29.real-looking'), 'default'],
+    ['the SDK placeholder', placeholder, 'default'],
   ]
-  const { selector } = readSelector(
-    selectorShapeOf(vendor),
-    slot,
-    request({ headers: { [header]: value } }),
-  )
-  const selection = selectAccount(service, candidates, selector)
-  if (!selection.ok) return 'refused'
-  return selection.how === 'named' ? selection.handle : `not named, ${selection.how}`
 }
 
-describe('a selector written into every header slot of the catalog', () => {
-  describe.each(headerSlots)('$vendor $slot.kind', (target) => {
-    const { vendor, slot } = target
-    const handle = (name: string) => `${vendor}/${name}`
-    const forms: [string, (name: string) => string][] = [
-      ['the default form', (name) => `kurumi:${handle(name)}`],
-      ['the vendor shape', (name) => selectorShapeOf(vendor).format(handle(name))],
-      ['the default form in capitals', (name) => `KURUMI:${handle(name)}`],
+function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
+  const selector = `kurumi:${vendor}/a`
+  if (slot.kind === 'header') {
+    return [
+      ['a bearer scheme before the selector', `Bearer ${selector}`, 'refused'],
+      [
+        'a bearer scheme before the vendor shape',
+        `Bearer ${shape.format(`${vendor}/a`)}`,
+        'refused',
+      ],
     ]
+  }
+  return [
+    ['a quoted selector', `Bearer "${selector}"`, 'refused'],
+    ['a scheme that is not a bearer', `Digest ${selector}`, 'refused'],
+    ['an unknown scheme', `OAuth ${selector}`, 'refused'],
+    ['no scheme', selector, 'refused'],
+    ['a colon for the space', `Bearer:${selector}`, 'refused'],
+    ['a word before the selector', `Bearer x ${selector}`, 'refused'],
+    ['the selector as the Basic user (git token-as-user)', basic(selector, ''), 'refused'],
+    ['the selector as the whole Basic credential', basic('kurumi', `${vendor}/a`), 'refused'],
+    [
+      'the word in the Basic user and a selector as the password',
+      basic('kurumi', selector),
+      'refused',
+    ],
+  ]
+}
 
-    describe.each(carriersOf(slot).map((carrier) => [carrier.name, carrier] as const))(
-      'as %s',
-      (_shape, carrier) => {
-        const outcome = (value: string) => outcomeOf(target, carrier, value)
+describe.each(
+  slotTargets.map((target) => [`${target.vendor} ${target.slot.kind}`, target] as const),
+)('a selector written into the %s slot', (_slot, target) => {
+  const header = headerOf(target.slot)
+  const expectOutcome = ([, value, expected]: Row) => {
+    const { outcome, stripped } = decide(target, request({ headers: { [header]: value } }))
 
-        test.each(forms)('%s names the account', (_form, selectorOf) => {
-          expect(outcome(carrier.wrap(selectorOf('b')))).toBe(handle('b'))
-        })
+    expect(stripped.headers.has(header)).toBe(false)
+    expect(outcome).toBe(expected)
+  }
+  const placements = placementsOf(target.slot)
 
-        test.each([['sk-ant-kurumi-***'], ['sk-ant-kurumi-'], ['sk-ant-kurumi-YQ=='], ['kurumi:']])(
-          'a look-alike %s that cannot be read is refused',
-          (lookAlike) => {
-            expect(outcome(carrier.wrap(lookAlike))).toBe('refused')
-          },
-        )
-
-        test('a value that is no selector falls back to the default', () => {
-          expect(outcome(carrier.wrap('ya29.placeholder'))).toBe('not named, default')
-        })
-
-        test('a label with a comma is the account it names, not a lookalike', () => {
-          expect(outcome(carrier.wrap(`kurumi:${handle('Acme, Inc.')}`))).toBe(handle('Acme, Inc.'))
-        })
-
-        test('a label with a comma written as %2C is the same account', () => {
-          expect(outcome(carrier.wrap(`kurumi:${handle('Acme%2C%20Inc.')}`))).toBe(
-            handle('Acme, Inc.'),
-          )
-        })
-
-        describe.each(forms.slice(0, 2))('with %s', (_form, selectorOf) => {
-          const a = carrier.wrap(selectorOf('a'))
-          const b = carrier.wrap(selectorOf('b'))
-
-          test('a placeholder before the selector is ignored', () => {
-            expect(outcome(`${carrier.placeholder}, ${a}`)).toBe(handle('a'))
-          })
-
-          const readsAsLabel = slot.kind === 'header' && selectorOf('a').startsWith('kurumi:')
-
-          test(
-            readsAsLabel
-              ? 'a placeholder after the selector reads as part of the label'
-              : 'a placeholder after the selector is ignored',
-            () => {
-              expect(outcome(`${a}, ${carrier.placeholder}`)).toBe(
-                readsAsLabel ? 'refused' : handle('a'),
-              )
-            },
-          )
-
-          test('two different selectors are refused', () => {
-            expect(outcome(`${a}, ${b}`)).toBe('refused')
-          })
-
-          test('the same selector twice names the account', () => {
-            expect(outcome(`${a}, ${a}`)).toBe(handle('a'))
-          })
-
-          test('two selectors in one value are refused, never the first', () => {
-            expect(outcome(carrier.wrap(`${selectorOf('a')},${selectorOf('b')}`))).toBe('refused')
-          })
-
-          test('a trailing auth-param with a comma never names another account', () => {
-            expect([handle('a'), 'refused']).toContain(outcome(`${a}, realm="x,y"`))
-          })
-        })
-      },
+  test('every row is a different input', () => {
+    const values = [...placements.flatMap((p) => rowsOf(target, p)), ...oddRowsOf(target)].map(
+      ([, value]) => value,
     )
+
+    expect(new Set(values).size).toBe(values.length)
   })
+
+  describe.each(placements.map((placement) => [placement.name, placement] as const))(
+    'as %s',
+    (_placement, placement) => {
+      test.each(rowsOf(target, placement))('%s', (name, value, expected) =>
+        expectOutcome([name, value, expected]),
+      )
+    },
+  )
+
+  test.each(oddRowsOf(target))('%s', (name, value, expected) =>
+    expectOutcome([name, value, expected]),
+  )
+
+  test('no header is none', () => {
+    const { outcome, stripped } = decide(target, request({}))
+
+    expect(outcome).toBe('default')
+    expect(stripped.headers.has(header)).toBe(false)
+  })
+})
+
+describe('an Authorization header read for the bearer and the basic slot alike', () => {
+  const schemes: [string, string][] = [
+    ['Bearer', 'Bearer kurumi:github/bot'],
+    ['token', 'token kurumi:github/bot'],
+    ['Basic', basic('x-access-token', 'kurumi:github/bot')],
+  ]
+
+  test.each(
+    schemes.flatMap(
+      ([scheme, value]) =>
+        [
+          ['bearer', scheme, value],
+          ['basic', scheme, value],
+        ] as const,
+    ),
+  )('the %s slot reads the %s scheme', (kind, _scheme, authorization) => {
+    const { selector, stripped } = readSelector(
+      defaultSelectorShape,
+      { kind },
+      request({ headers: { authorization }, url: 'https://github.com/o/r.git/info/refs' }),
+    )
+
+    expect(selector).toEqual(named('github/bot'))
+    expect(stripped.headers.has('authorization')).toBe(false)
+  })
+})
+
+const search = (query: string) => request({ url: `https://h.example/x${query}` })
+
+describe('a selector written into the query slot', () => {
+  const slot: CredentialSlot = { kind: 'query', param: 'key' }
+  const target: Target = { vendor: 'google', service: 'gmail', slot, shape: defaultSelectorShape }
+
+  const rows: Row[] = [
+    ['an encoded selector', '?key=kurumi%3Agoogle%2Fa%40x.example', 'google/a@x.example'],
+    ['a selector as written', '?key=kurumi:google/a', 'google/a'],
+    ['a label with a comma', '?key=kurumi:google/Acme, Inc.', 'google/Acme, Inc.'],
+    ['a plus written by hand', '?key=kurumi:google/a+b@x.example', 'google/a+b@x.example'],
+    ['an encoded plus', '?key=kurumi%3Agoogle%2Fa%2Btag%40x.example', 'google/a+tag@x.example'],
+    ['a placeholder first', '?key=AIzaPlaceholder&key=kurumi%3Agoogle%2Fa', 'refused'],
+    ['a placeholder last', '?key=kurumi%3Agoogle%2Fa&key=AIzaPlaceholder', 'refused'],
+    ['an empty value first', '?key=&key=kurumi%3Agoogle%2Fa', 'refused'],
+    ['two different selectors', '?key=kurumi:google/a&key=kurumi:google/b', 'refused'],
+    ['the same selector twice', '?key=kurumi:google/a&key=kurumi%3Agoogle%2Fa', 'refused'],
+    ['an encoded prefix twice over', '?key=kurumi%253Agoogle%252Fa', 'refused'],
+    ['an empty handle', '?key=kurumi:', 'refused'],
+    ['a malformed escape', '?key=kurumi:%E0', 'refused'],
+    ['a label that mentions the word', '?key=kurumi:google/kurumi-x', 'refused'],
+    ['a real-looking key', '?key=AIzaPlaceholder', 'default'],
+    ['an empty key', '?key=', 'default'],
+    ['no key', '?alt=json', 'default'],
+  ]
+
+  test.each(rows)('%s', (_name, query, expected) => {
+    const { outcome, stripped } = decide(target, search(query))
+
+    expect(outcome).toBe(expected)
+    expect(stripped.url.searchParams.has('key')).toBe(false)
+  })
+
+  test('only the key parameter is removed and the rest stays as written', () => {
+    const { stripped } = decide(
+      target,
+      request({
+        url: 'https://example.googleapis.com/x?q=a%20b&key=kurumi%3Agoogle%2Fa%40x.example&alt=json#top',
+      }),
+    )
+
+    expect(stripped.url.href).toBe('https://example.googleapis.com/x?q=a%20b&alt=json#top')
+  })
+
+  test('a url whose only parameter is the key loses its query entirely', () => {
+    const { stripped } = decide(target, search('?key=kurumi:google/a'))
+
+    expect(stripped.url.href).toBe('https://h.example/x')
+  })
+
+  test('every repeated key parameter is removed', () => {
+    const { stripped } = decide(target, search('?key=kurumi:google/a&k=1&key=x&Key=2'))
+
+    expect(stripped.url.search).toBe('?k=1&Key=2')
+  })
+})
+
+describe('awkward handles through every slot', () => {
+  const shapes = [...new Set(vendorIds.map(selectorShapeOf))]
+  const place: [string, CredentialSlot, (value: string) => Parameters<typeof request>[0]][] = [
+    ['bearer', { kind: 'bearer' }, (value) => ({ headers: { authorization: `Bearer ${value}` } })],
+    [
+      'header',
+      { kind: 'header', header: 'x-api-key' },
+      (value) => ({ headers: { 'x-api-key': value } }),
+    ],
+    ['basic', { kind: 'basic' }, (value) => ({ headers: { authorization: basic('x', value) } })],
+    [
+      'query',
+      { kind: 'query', param: 'key' },
+      (value) => ({ url: `https://h.example/x?${new URLSearchParams({ key: value })}` }),
+    ],
+  ]
+  const handles = [
+    'notion/ノート 共有',
+    'google/a+tag@x.example',
+    'github/a b',
+    'google/日本語+ @x.example',
+    'github/100%',
+    'google/a%41b',
+    'github/a%2Fb',
+  ]
+
+  describe.each(shapes.map((shape, i) => [`shape ${i}`, shape] as const))('%s', (_name, shape) => {
+    test.each(place)('%s slot', (_slot, slot, placed) => {
+      for (const handle of handles) {
+        const { selector } = readSelector(shape, slot, request(placed(shape.format(handle))))
+
+        expect(selector).toEqual(named(handle))
+      }
+    })
+  })
+
+  test.each([
+    'google/a&b@x.example',
+    'google/a+b@x.example',
+    'notion/a#b=c d',
+    'github/a;b',
+    'google/a%41b',
+    'github/a%2Fb',
+    'github/%41',
+    'notion/50%25off',
+    'google/a%2Bb@x.example',
+    'github/100%',
+  ])('the selector %s can be pasted into the query slot as it is', (label) => {
+    const raw = `https://h.example/x?alt=json&key=${defaultSelectorShape.format(label)}&q=1`
+
+    const { selector, stripped } = readSelector(
+      defaultSelectorShape,
+      { kind: 'query', param: 'key' },
+      request({ url: raw }),
+    )
+
+    expect(selector).toEqual(named(label))
+    expect(stripped.url.href).toBe('https://h.example/x?alt=json&q=1')
+  })
+
+  test.each([
+    'google/a b',
+    'google/日本語',
+    'google/a%41b',
+    'github/a%2Fb',
+    'google/a+b@x.example',
+  ])('the selector %s survives an encoder that keeps the colon readable', (label) => {
+    const written = encodeURIComponent(defaultSelectorShape.format(label)).replaceAll('%3A', ':')
+
+    const { selector } = readSelector(
+      defaultSelectorShape,
+      { kind: 'query', param: 'key' },
+      request({ url: `https://h.example/x?key=${written}` }),
+    )
+
+    expect(selector).toEqual(named(label))
+  })
+
+  test('a pasted selector names the account it was formatted from, not a lookalike', () => {
+    const formatted = defaultSelectorShape.format('google/a%41b')
+    const { selector } = readSelector(
+      defaultSelectorShape,
+      { kind: 'query', param: 'key' },
+      request({ url: `https://h.example/x?key=${formatted}` }),
+    )
+
+    expect(
+      selectAccount(
+        'gmail',
+        [grant(accountHandle('google', 'aAb')), grant(accountHandle('google', 'a%41b'))],
+        selector,
+      ),
+    ).toMatchObject({ ok: true, handle: 'google/a%41b', how: 'named' })
+  })
+})
+
+const mentions = (text: string) => /kurumi/i.test(text)
+
+function handleThatTextNames(text: string): string | null {
+  const prefix = /^kurumi:/i.exec(text)
+  if (prefix) {
+    try {
+      return decodeURIComponent(text.slice(prefix[0].length))
+    } catch {
+      return null
+    }
+  }
+  const anthropic = /^sk-ant-kurumi-/i.exec(text)
+  return anthropic ? Buffer.from(text.slice(anthropic[0].length), 'base64url').toString() : null
+}
+
+describe('whatever a slot holds', () => {
+  const fragments = [
+    'kurumi:',
+    'KURUMI:',
+    'sk-ant-kurumi-',
+    'YW50aHJvcGljL2E',
+    'google/a',
+    'google/Acme',
+    'notion/b',
+    'Acme',
+    'Inc.',
+    ', ',
+    ',',
+    ' ',
+    '%2C',
+    '%20',
+    '%3A',
+    '%2F',
+    '%E0',
+    '%',
+    'Bearer ',
+    'token ',
+    'Basic ',
+    'placeholder',
+    'x:',
+    ':',
+    '"',
+    '*',
+    '=',
+    'ya29.',
+  ]
+  const candidates = [
+    'google/a',
+    'google/Acme',
+    'google/Acme, Inc.',
+    'notion/b',
+    'anthropic/a',
+  ].map((h, i) => grant(h as AccountHandle, { isDefault: i === 0 }))
+  const slots: [string, CredentialSlot, (text: string) => string][] = [
+    ['bearer', { kind: 'bearer' }, (text) => `Bearer ${text}`],
+    ['basic', { kind: 'basic' }, (text) => basic('x', text)],
+    ['header', { kind: 'header', header: 'x-api-key' }, (text) => text],
+  ]
+
+  function* texts(count: number): Generator<string> {
+    let seed = 20260101
+    const next = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
+      return seed / 2 ** 32
+    }
+    for (let i = 0; i < count; i++) {
+      const length = 1 + Math.floor(next() * 7)
+      yield Array.from({ length }, () => fragments[Math.floor(next() * fragments.length)]!).join('')
+    }
+  }
+
+  test.each(slots)(
+    'the %s slot never names an account the text does not name alone',
+    (_name, slot, place) => {
+      let namedCount = 0
+      for (const text of texts(4000)) {
+        const { selector } = readSelector(
+          defaultSelectorShape,
+          slot,
+          request({ headers: { [headerOf(slot)]: place(text) } }),
+        )
+        const selection = selectAccount('gmail', candidates, selector)
+
+        if (!mentions(text)) {
+          expect(selection).toMatchObject({ ok: true, how: 'default' })
+          continue
+        }
+        if (!selection.ok) continue
+        expect(selection.how).toBe('named')
+        namedCount++
+        expect(text.match(/kurumi/gi)).toHaveLength(1)
+        expect<string>(selection.handle).toBe(handleThatTextNames(text)!)
+      }
+      expect(namedCount).toBeGreaterThan(0)
+    },
+  )
 })

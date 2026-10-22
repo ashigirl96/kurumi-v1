@@ -327,12 +327,15 @@ describe('scopes', () => {
 })
 
 describe('selectorShapeOf', () => {
+  const shapes = [...new Set(vendorIds.map(selectorShapeOf))]
+  const anthropic = selectorShapeOf('anthropic')
+
   test('a vendor without its own shape gets the default', () => {
     expect(selectorShapeOf('google')).toBe(defaultSelectorShape)
   })
 
   test('the anthropic shape keeps the sk-ant- prefix an SDK may check', () => {
-    expect(selectorShapeOf('anthropic').format('anthropic/team')).toStartWith('sk-ant-')
+    expect(anthropic.format('anthropic/team')).toStartWith('sk-ant-')
   })
 
   const handles = [
@@ -347,29 +350,20 @@ describe('selectorShapeOf', () => {
     'notion/a&b#c=d?e',
   ]
 
-  test.each(vendorIds)('%s selector shape round-trips awkward handles', (vendor) => {
-    const shape = selectorShapeOf(vendor)
-
-    for (const handle of handles) expect(shape.parse(shape.format(handle))).toBe(handle)
-  })
-
-  test.each(vendorIds)(
-    '%s selector shape produces a value that can ride an HTTP header',
-    (vendor) => {
-      const shape = selectorShapeOf(vendor)
-
+  test.each(shapes.map((shape, i) => [`shape ${i}`, shape] as const))(
+    '%s round-trips awkward handles and its output can ride an HTTP header',
+    (_name, shape) => {
       for (const handle of handles) {
+        expect(shape.parse(shape.format(handle))).toBe(handle)
         const headers = new Headers({ authorization: `Bearer ${shape.format(handle)}` })
         expect(headers.get('authorization')).toBe(`Bearer ${shape.format(handle)}`)
       }
     },
   )
 
-  test.each(vendorIds)(
-    '%s selector shape reads a value that is not a selector as none',
-    (vendor) => {
-      const shape = selectorShapeOf(vendor)
-
+  test.each(shapes.map((shape, i) => [`shape ${i}`, shape] as const))(
+    '%s reads a value that is no selector as null',
+    (_name, shape) => {
       for (const value of [
         '',
         'sk-ant-api03-realkey',
@@ -382,49 +376,42 @@ describe('selectorShapeOf', () => {
     },
   )
 
-  test.each(vendorIds)('%s selector shape reads the default form as well as its own', (vendor) => {
-    const shape = selectorShapeOf(vendor)
-
-    expect(shape.parse('kurumi:anthropic/b')).toBe('anthropic/b')
-    expect(shape.parse(shape.format('anthropic/b'))).toBe('anthropic/b')
-  })
-
-  test.each(vendorIds)('%s selector shape refuses a look-alike of either form', (vendor) => {
-    const shape = selectorShapeOf(vendor)
-
-    for (const value of ['sk-ant-kurumi-***', 'SK-ANT-KURUMI-YQ==', 'sk-ant-kurumi-']) {
-      expect(shape.parse(value)).toBe(value)
+  test('every shape reads the default form as well as the anthropic one', () => {
+    for (const shape of shapes) {
+      expect(shape.parse('kurumi:anthropic/b')).toBe('anthropic/b')
+      expect(shape.parse(anthropic.format('anthropic/b'))).toBe('anthropic/b')
     }
   })
 
-  test('the default shape accepts a handle typed by hand', () => {
+  test('the default form is typed by hand without regard to case', () => {
     expect(defaultSelectorShape.parse('kurumi:google/alice@work.example')).toBe(
       'google/alice@work.example',
     )
-    expect(defaultSelectorShape.format('google/alice@work.example')).toBe(
-      'kurumi:google/alice@work.example',
-    )
-  })
-
-  test('the default prefix is read without regard to case', () => {
     expect(defaultSelectorShape.parse('Kurumi:google/alice@work.example')).toBe(
       'google/alice@work.example',
     )
   })
 
+  test('a label may hold spaces and commas as typed or as escaped', () => {
+    expect(defaultSelectorShape.parse('kurumi:notion/Acme, Inc.')).toBe('notion/Acme, Inc.')
+    expect(defaultSelectorShape.parse('kurumi:notion/Acme%2C%20Inc.')).toBe('notion/Acme, Inc.')
+  })
+
   test.each([
+    'kurumi:',
+    'kurumi:%E0',
+    'kurumi%3Anotion%2Fa',
     'sk-ant-kurumi-***',
+    'SK-ANT-KURUMI-YQ==',
     'sk-ant-kurumi-',
     'sk-ant-kurumi-A',
     'sk-ant-kurumi-YQ==',
     'sk-ant-kurumi-YR',
     'sk-ant-kurumi-anthropic/team',
-  ])(
-    'a value %p with the anthropic prefix but a malformed payload is returned whole, never none',
-    (value) => {
-      expect(selectorShapeOf('anthropic').parse(value)).toBe(value)
-    },
-  )
+  ])('a value %p that looks like a selector but cannot be read is null', (value) => {
+    expect(selectorShapeOf('anthropic').parse(value)).toBeNull()
+    expect(defaultSelectorShape.parse(value)).toBeNull()
+  })
 
   test('format output stays readable for the characters a handle is made of', () => {
     expect(defaultSelectorShape.format('google/alice@work.example')).toBe(

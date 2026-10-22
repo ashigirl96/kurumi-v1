@@ -25,41 +25,33 @@ export type OAuthSpec = {
 }
 
 /**
- * `parse` returns null for a slot value that carries no selector (the SDK's own placeholder). A value that looks like
- * a selector of either form but is malformed is returned whole: it names no granted account, so the caller refuses it
- * instead of falling back to the default.
+ * `parse` returns the handle of a value that is exactly one selector in either form, and null for anything else:
+ * the SDK's own placeholder, a look-alike that cannot be read, or text around a selector. The reader decides which
+ * of those is a placeholder to ignore and which is a refusal.
  */
 export type SelectorShape = {
   format: (handle: string) => string
   parse: (slotValue: string) => string | null
 }
 
-const decodeIfEncoded = (value: string): string => {
-  try {
-    return decodeURIComponent(value)
-  } catch {
-    return value
-  }
-}
-
 const defaultPrefix = /^kurumi:/i
 const anthropicPrefix = 'sk-ant-kurumi-'
 const anthropicPrefixPattern = /^sk-ant-kurumi-/i
 
-export const startsSelector = (value: string): boolean =>
-  defaultPrefix.test(value) || anthropicPrefixPattern.test(value)
-
-export const selectorMayHoldComma = (value: string): boolean => defaultPrefix.test(value)
-
 function parseDefaultForm(value: string): string | null {
-  return defaultPrefix.test(value) ? decodeIfEncoded(value.slice('kurumi:'.length)) : null
+  if (!defaultPrefix.test(value)) return null
+  try {
+    return decodeURIComponent(value.slice('kurumi:'.length)) || null
+  } catch {
+    return null
+  }
 }
 
 function parseAnthropicForm(value: string): string | null {
   if (!anthropicPrefixPattern.test(value)) return null
   const payload = value.slice(anthropicPrefix.length)
   const decoded = Buffer.from(payload, 'base64url').toString()
-  return decoded !== '' && Buffer.from(decoded).toString('base64url') === payload ? decoded : value
+  return decoded !== '' && Buffer.from(decoded).toString('base64url') === payload ? decoded : null
 }
 
 const parseSelector = (value: string): string | null =>

@@ -1,11 +1,4 @@
-import {
-  selectorMayHoldComma,
-  startsSelector,
-  type CredentialSlot,
-  type SelectorShape,
-  type ServiceId,
-  type VendorId,
-} from './catalog.ts'
+import type { CredentialSlot, SelectorShape, ServiceId, VendorId } from './catalog.ts'
 
 export type AccountHandle = `${VendorId}/${string}` & { readonly __brand: 'AccountHandle' }
 
@@ -22,7 +15,7 @@ export type GrantedCandidate = {
 
 export type Selector =
   | { kind: 'handle'; handle: string }
-  | { kind: 'conflict'; handles: readonly [string, string, ...string[]] }
+  | { kind: 'unreadable'; written: string }
   | { kind: 'none' }
 
 export type Selection =
@@ -31,7 +24,8 @@ export type Selection =
 
 /**
  * Every refusal names the next step for the agent and none lists accounts outside the caller's group: an agent
- * learns about other groups' accounts only through a human-facing Connect Card.
+ * learns about other groups' accounts only through a human-facing Connect Card. For `account_not_granted`, `named`
+ * is the handle the agent wrote, or the text it wrote where no single selector could be read from it.
  */
 export type SelectionRefusal =
   | { code: 'account_not_connected'; service: ServiceId }
@@ -62,34 +56,21 @@ export function selectAccount(
   candidates: readonly GrantedCandidate[],
   selector: Selector,
 ): Selection {
-  const granted = () => candidates.map(({ handle }) => handle)
+  const notGranted = (named: string): Selection => ({
+    ok: false,
+    refusal: {
+      code: 'account_not_granted',
+      service,
+      named,
+      granted: candidates.map(({ handle }) => handle),
+    },
+  })
 
-  if (selector.kind === 'conflict') {
-    return {
-      ok: false,
-      refusal: {
-        code: 'account_not_granted',
-        service,
-        named: selector.handles.join(' | '),
-        granted: granted(),
-      },
-    }
-  }
+  if (selector.kind === 'unreadable') return notGranted(selector.written)
 
   if (selector.kind === 'handle') {
     const match = candidates.find(({ handle }) => handle === selector.handle)
-    if (!match) {
-      return {
-        ok: false,
-        refusal: {
-          code: 'account_not_granted',
-          service,
-          named: selector.handle,
-          granted: granted(),
-        },
-      }
-    }
-    return use(service, match, 'named')
+    return match ? use(service, match, 'named') : notGranted(selector.handle)
   }
 
   const [first, ...others] = candidates
@@ -99,7 +80,14 @@ export function selectAccount(
   const defaults = candidates.filter(({ isDefault }) => isDefault)
   const [preferred] = defaults
   if (preferred && defaults.length === 1) return use(service, preferred, 'default')
-  return { ok: false, refusal: { code: 'account_ambiguous', service, granted: granted() } }
+  return {
+    ok: false,
+    refusal: {
+      code: 'account_ambiguous',
+      service,
+      granted: candidates.map(({ handle }) => handle),
+    },
+  }
 }
 
 const decodeQueryComponent = (value: string): string => {
@@ -124,77 +112,72 @@ function takeQueryParam(url: URL, param: string): string[] {
   return values
 }
 
-type HeaderGrammar = {
-  holdsCommas: (value: string) => boolean
-  startsValue: (rest: string) => boolean
-  secretOf: (value: string) => string | null
-}
+/** What a slot value holds beside the one place its credential goes. */
+type Written = { beside: string; credential: string }
 
-/** A label may hold a comma, so a comma ends a value only where the next value starts. */
-function splitValues(joined: string, grammar: HeaderGrammar): string[] {
-  const values: string[] = []
-  for (let rest = joined.trim(); rest !== '';) {
-    const end = endOfValue(rest, grammar)
-    values.push(rest.slice(0, end).trim())
-    rest = rest.slice(end + 1).trim()
-  }
-  return values
-}
-
-function endOfValue(rest: string, { holdsCommas, startsValue }: HeaderGrammar): number {
-  const open = holdsCommas(rest)
-  for (let comma = rest.indexOf(','); comma !== -1; comma = rest.indexOf(',', comma + 1)) {
-    if (!open || startsValue(rest.slice(comma + 1).trimStart())) return comma
-  }
-  return rest.length
-}
-
-function takeHeader(headers: Headers, name: string, grammar: HeaderGrammar): string[] {
-  const joined = headers.get(name)
-  headers.delete(name)
-  if (joined === null) return []
-  return splitValues(joined, grammar).flatMap((value) => grammar.secretOf(value) ?? [])
-}
-
-function secretOfAuthorization(authorization: string): string | null {
-  if (startsSelector(authorization)) return authorization
-  const [, scheme = '', value = ''] = /^(\w+)\s+(.+)$/.exec(authorization) ?? []
-  switch (scheme.toLowerCase()) {
+function writtenInAuthorization(header: string): Written {
+  const [, scheme = '', credential = ''] = /^(\w+\s+)(.+)$/.exec(header) ?? []
+  switch (scheme.trim().toLowerCase()) {
     case 'bearer':
     case 'token':
-      return value
+      return { beside: scheme, credential }
     case 'basic': {
-      const userAndPassword = Buffer.from(value, 'base64').toString()
-      const separator = userAndPassword.indexOf(':')
-      return separator === -1 ? null : userAndPassword.slice(separator + 1)
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(credential)) break
+      const userAndPassword = Buffer.from(credential, 'base64').toString()
+      const separator = userAndPassword.indexOf(':') + 1
+      return {
+        beside: userAndPassword.slice(0, separator),
+        credential: userAndPassword.slice(separator),
+      }
     }
-    default:
-      return null
   }
+  return { beside: header, credential: '' }
 }
 
-const authorizationGrammar: HeaderGrammar = {
-  holdsCommas: (value) => selectorMayHoldComma(value.replace(/^(?:bearer|token)\s+/i, '')),
-  startsValue: (rest) => /^(?:bearer|token|basic)\s/i.test(rest) || startsSelector(rest),
-  secretOf: secretOfAuthorization,
+function takeHeader(headers: Headers, name: string): string[] {
+  const value = headers.get(name)
+  headers.delete(name)
+  return value === null ? [] : [value]
 }
 
-const plainGrammar: HeaderGrammar = {
-  holdsCommas: selectorMayHoldComma,
-  startsValue: startsSelector,
-  secretOf: (value) => value,
-}
+const alone = (credential: string): Written => ({ beside: '', credential })
 
-function takeCredentials(slot: CredentialSlot, headers: Headers, url: URL): string[] {
+function takeWritten(slot: CredentialSlot, headers: Headers, url: URL): Written[] {
   switch (slot.kind) {
     case 'bearer':
     case 'basic':
-      return takeHeader(headers, 'authorization', authorizationGrammar)
+      return takeHeader(headers, 'authorization').map(writtenInAuthorization)
     case 'header':
-      return takeHeader(headers, slot.header, plainGrammar)
+      return takeHeader(headers, slot.header).map(alone)
     case 'query':
-      return takeQueryParam(url, slot.param)
+      return takeQueryParam(url, slot.param).map(alone)
   }
+}
+
+/** Real third-party credentials do not hold the word, so a value that does is the agent naming an account. */
+function mentionsKurumi(text: string): boolean {
+  const base64Tokens = text.split(/[\s,]+/).map((token) => Buffer.from(token, 'base64').toString())
+  return [text, decodeQueryComponent(text), ...base64Tokens].some((view) => /kurumi/i.test(view))
+}
+
+/**
+ * Every value in the slot gets one of two readings. With no value mentioning kurumi there is no selector and the
+ * result is `none`, which is how the SDK's own placeholder passes. Once any value mentions it the request names an
+ * account, and it is read only when the slot holds one value that is one selector where the credential goes and
+ * names a label that does not mention the word. Everything else is refused, never `none` and never another account.
+ */
+function selectorIn(
+  values: readonly Written[],
+  parse: (credential: string) => string | null,
+): Selector {
+  const texts = values.map(({ beside, credential }) => beside + credential)
+  if (!texts.some(mentionsKurumi)) return { kind: 'none' }
+  const [only, ...more] = values
+  const handle =
+    only && more.length === 0 && !mentionsKurumi(only.beside) ? parse(only.credential) : null
+  return handle !== null && !mentionsKurumi(handle)
+    ? { kind: 'handle', handle }
+    : { kind: 'unreadable', written: texts.join(' | ') }
 }
 
 /**
@@ -207,18 +190,7 @@ function parseAsWrittenThenDecoded(shape: SelectorShape, value: string): string 
   return shape.parse(first) ?? shape.parse(second)
 }
 
-function selectorOf(handles: readonly string[]): Selector {
-  const [first, second, ...rest] = [...new Set(handles)]
-  if (first === undefined) return { kind: 'none' }
-  if (second === undefined) return { kind: 'handle', handle: first }
-  return { kind: 'conflict', handles: [first, second, ...rest] }
-}
-
-/**
- * Reads the handle the agent wrote where the real credential would go, and returns the request with that slot
- * emptied whether or not it held a selector. A value the shape does not recognize (the SDK's own placeholder)
- * is `none`, unless another value in the same slot carries a selector.
- */
+/** Reads the handle the agent wrote where the real credential would go, and returns the request with that slot emptied whether or not it held a selector. */
 export function readSelector(
   shape: SelectorShape,
   slot: CredentialSlot,
@@ -226,8 +198,10 @@ export function readSelector(
 ): { selector: Selector; stripped: { headers: Headers; url: URL } } {
   const headers = new Headers(req.headers)
   const url = new URL(req.url)
-  const parse = (value: string) =>
-    slot.kind === 'query' ? parseAsWrittenThenDecoded(shape, value) : shape.parse(value)
-  const handles = takeCredentials(slot, headers, url).flatMap((value) => parse(value) ?? [])
-  return { selector: selectorOf(handles), stripped: { headers, url } }
+  const parse = (credential: string) =>
+    slot.kind === 'query' ? parseAsWrittenThenDecoded(shape, credential) : shape.parse(credential)
+  return {
+    selector: selectorIn(takeWritten(slot, headers, url), parse),
+    stripped: { headers, url },
+  }
 }
