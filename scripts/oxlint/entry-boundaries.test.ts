@@ -1,4 +1,4 @@
-import { afterAll, expect, test } from 'bun:test'
+import { afterAll, describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 
@@ -44,7 +44,6 @@ test('another package cannot import a module that its package does not export', 
   const specifiers = internal.flatMap(({ domain, module }) => [
     `@kurumi/${domain}/${module}`,
     `@kurumi/${domain}/src/${module}.ts`,
-    `../../${domain}/src/${module}.ts`,
   ])
 
   const refused = await refusedSpecifiers(specifiers)
@@ -59,4 +58,77 @@ test('another package can still import the entries of a package', async () => {
   const refused = await refusedSpecifiers(entries)
 
   expect([...refused]).toEqual([])
+})
+
+const boundaryCodes = new Set([
+  'eslint(no-restricted-imports)',
+  'kurumi(no-relative-package-import)',
+])
+
+async function refusedFiles(files: Record<string, string>): Promise<Set<string>> {
+  const diagnostics = await lintProbes(files)
+  return new Set(diagnostics.filter(({ code }) => boundaryCodes.has(code)).map((d) => d.filename))
+}
+
+const importing = (imports: Record<string, string>): Record<string, string> =>
+  Object.fromEntries(
+    Object.entries(imports).map(([path, specifier]) => [
+      path,
+      `import * as m from '${specifier}'\nexport const used = m\n`,
+    ]),
+  )
+
+describe('a relative import that leaves its package', () => {
+  const account = 'account/src/catalog.ts'
+
+  test('is refused from any depth and from any file of the package', async () => {
+    const files = importing({
+      'packages/probe/src/main.ts': `../../${account}`,
+      'packages/probe/src/a/main.ts': `../../../${account}`,
+      'packages/probe/src/a/b/main.ts': `../../../../${account}`,
+      'packages/probe/src/a/b/c/d/e/main.ts': `../../../../../../../${account}`,
+      'packages/probe/main.ts': `../${account}`,
+      'packages/probe/drizzle.config.ts': `../${account}`,
+      'packages/probe/migrations/main.ts': `../../${account}`,
+      'packages/probe/src/to-migrations.ts': '../../account/migrations/index.ts',
+      'packages/probe/src/to-manifest.ts': '../../account/package.json',
+      'packages/probe/src/to-app.ts': '../../../apps/probe/src/main.ts',
+      'apps/probe/src/main.ts': `../../../packages/${account}`,
+      'tools/main.ts': `../packages/${account}`,
+    })
+
+    const refused = await refusedFiles(files)
+
+    expect(Object.keys(files).filter((path) => !refused.has(path))).toEqual([])
+  })
+
+  test('is refused whether it is imported, re-exported or loaded on demand', async () => {
+    const specifier = `../../../../account/src/catalog.ts`
+    const files = {
+      'packages/probe/src/a/b/import.ts': `import '${specifier}'\n`,
+      'packages/probe/src/a/b/export.ts': `export * from '${specifier}'\n`,
+      'packages/probe/src/a/b/named.ts': `export { catalog } from '${specifier}'\n`,
+      'packages/probe/src/a/b/dynamic.ts': `export const load = () => import('${specifier}')\n`,
+    }
+
+    const refused = await refusedFiles(files)
+
+    expect(Object.keys(files).filter((path) => !refused.has(path))).toEqual([])
+  })
+
+  test('inside the package is still allowed', async () => {
+    const files = importing({
+      'packages/probe/src/main.ts': './other.ts',
+      'packages/probe/src/to-migrations.ts': '../migrations/index.ts',
+      'packages/probe/src/a/b/main.ts': '../../other.ts',
+      'packages/probe/src/a/b/to-migrations.ts': '../../../migrations/index.ts',
+      'packages/probe/src/a/b/to-manifest.ts': '../../../package.json',
+      'packages/probe/drizzle.config.ts': './src/schema.ts',
+      'tools/main.ts': './other.ts',
+    })
+
+    const refused = await refusedFiles(files)
+
+    expect([...refused]).toEqual([])
+  })
 })

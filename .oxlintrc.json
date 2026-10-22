@@ -10,6 +10,7 @@
   },
   "rules": {
     "kurumi/disable-reason": "error",
+    "kurumi/no-relative-package-import": "error",
     // 指定しないと oxlint は import type だけでできた循環を見逃す。
     "import/no-cycle": ["error", { "ignoreTypes": false }],
     // 名前の _ だけで判断するので、外が決めた名前にも当たる。
@@ -36,10 +37,6 @@
               "!@kurumi/*/testing"
             ],
             "message": "他の package から import してよいのは schema・contract・server・ui・cli・testing の entry だけ。catalog や select のような内側の module と src/ の中は import しない（docs/design/module-map.md）"
-          },
-          {
-            "group": ["**/packages/*/src/**", "../../*/src/**", "../../../*/src/**"],
-            "message": "相対 path で他の package の src/ の中を import しない。entry は @kurumi/<package>/<entry> で import する（docs/design/module-map.md）"
           }
         ]
       }
