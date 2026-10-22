@@ -609,6 +609,21 @@ function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
       'refused',
     ],
     [
+      'a selector behind seventeen commas is refused unread',
+      `Basic A${','.repeat(17)}${b64(`x:${selector}`)}`,
+      'refused',
+    ],
+    [
+      'twenty padded pieces without the word are refused unread',
+      `Basic ${'a='.repeat(20)}`,
+      'refused',
+    ],
+    [
+      'two Basic credentials joined by a space',
+      `${basic('x', 'placeholder')} ${basic('x', selector)}`,
+      'refused',
+    ],
+    [
       'a Basic selector joined after a bearer value is not seen',
       `Bearer placeholder, ${basic('x', selector)}`,
       'default',
@@ -730,6 +745,11 @@ describe('what a refused Basic credential echoes', () => {
     [
       'two joined: the decoded credential that holds the word',
       `${basic('u', 'REALSECRET')}, ${basic('x', 'kurumi:github/b')}`,
+      'x:kurumi:github/b',
+    ],
+    [
+      'two joined with the first unpadded: its decoded text, not the misaligned whole',
+      `Basic ${b64url('x:kurumi:github/b')}, ${basic('git', 'ghp_realtoken')}`,
       'x:kurumi:github/b',
     ],
   ])('%s', (_name, authorization, written) => {

@@ -99,20 +99,18 @@ const mentionsIn =
 const mentions = mentionsIn(decodedOnce)
 const mentionsInQuery = mentionsIn(decodedQueryValue)
 
-// Two Basic headers arrive joined by a comma, and Buffer stops at a `=`, so a credential that is not one base64 blob
-// is seen piece by piece: between commas, without the scheme word and whitespace, and split at padding. A piece under
-// 8 characters cannot hold the word, and a credential of more than 16 pieces is refused unread.
+// Two Basic headers arrive joined by a comma, which Buffer skips, and Buffer stops at the first `=`, so a credential
+// that is not one base64 blob is also seen piece by piece: fields between commas or scheme words, without whitespace,
+// split where padding is followed by base64. A piece under 8 characters cannot hold the word, and a credential of
+// more than 16 pieces is refused unread.
 const notOneBlob = /[^A-Za-z0-9+/=_-]|=[A-Za-z0-9+/_-]/
 const piecesOf = (credential: string): string[] =>
-  credential
-    .split(',', 17)
-    .flatMap((piece) =>
-      piece
-        .replace(/^\s*basic\s+/i, '')
-        .replaceAll(/\s+/g, '')
-        .split(/=+/),
-    )
-    .filter((piece) => piece !== '')
+  credential.split(/,|\s+basic\s+/i, 17).flatMap((field) =>
+    field
+      .replace(/^\s*basic\s+/i, '')
+      .replaceAll(/\s+/g, '')
+      .split(/=+(?=[A-Za-z0-9+/_-])/, 17),
+  )
 const decodedBase64 = (text: string): string => Buffer.from(text, 'base64').toString()
 
 function takeQueryParam(url: URL, param: string): string[] {
@@ -140,14 +138,15 @@ function writtenInAuthorization(header: string): Written {
     case 'basic': {
       const blob = credential.replaceAll(/\s+/g, '')
       const oneBlob = !notOneBlob.test(blob)
-      const pieces = oneBlob ? [] : piecesOf(credential)
       const userAndPassword = decodedBase64(blob)
+      const pieces = oneBlob ? [] : piecesOf(credential)
       const long = pieces.slice(0, 16).filter((piece) => piece.length >= 8)
-      const decoded = [userAndPassword, ...long.map(decodedBase64)]
+      const decoded = oneBlob ? [userAndPassword] : long.map(decodedBase64)
       const seen = decoded.find((text) => mentions(text))
       const colon = userAndPassword.indexOf(':')
       return {
-        mentions: seen !== undefined || pieces.length > 16 || mentions(header),
+        mentions:
+          seen !== undefined || pieces.length > 16 || mentions(userAndPassword) || mentions(header),
         written: seen ?? header,
         credential:
           oneBlob && colon !== -1 && !mentions(userAndPassword.slice(0, colon))

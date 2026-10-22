@@ -76,10 +76,13 @@ const spellings: ((shape: SelectorShape, handle: string) => string)[] = [
 const inAuthorization: ((credential: string, user: string) => string)[] = [
   (c) => `Bearer ${c}`,
   (c) => `Bearer ${c}`,
+  (c) => `Bearer ${c}`,
+  (c) => `token ${c}`,
   (c) => `token ${c}`,
   (c) => `bearer\t${c}`,
   (c) => `Digest ${c}`,
   (c) => c,
+  (c, user) => basic(user, c),
   (c, user) => basic(user, c),
   (c, user) => basic(user, c),
   (c) => basic(c, ''),
@@ -97,6 +100,10 @@ const inAuthorization: ((credential: string, user: string) => string)[] = [
   (c, user) => `${basic(user, 'placeholder')}, ${basic(user, c).replace(/^(Basic .{6})/, '$1 ')}`,
   (c, user) =>
     Array.from({ length: 17 }, (_, i) => (i === 16 ? basic(user, c) : basic(user, 'x'))).join(', '),
+  (c, user) => `${basic(user, 'placeholder')} ${basic(user, c)}`,
+  (c, user) => `Basic A${','.repeat(17)}${b64(`${user}:${c}`)}`,
+  (c, user) => `${basic(user, 'placeholder')}${', Basic '.repeat(17)}${basic(user, c)}`,
+  (c, user) => `Basic ${b64url(`${user}:${c}`)}, ${basic(user, 'placeholder')}`,
   (c, user) => `Bearer placeholder, ${basic(user, c)}`,
   (c) => `Basic ${b64(c)}`,
 ]
