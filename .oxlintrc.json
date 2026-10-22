@@ -1,0 +1,52 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "import"],
+  "jsPlugins": ["./scripts/oxlint/kurumi.js"],
+  "options": { "typeAware": true },
+  "ignorePatterns": ["docs/**", ".agents/**", ".claude/**"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+  "rules": {
+    "kurumi/disable-reason": "error",
+    "kurumi/no-relative-package-import": "error",
+    // 指定しないと oxlint は import type だけでできた循環を見逃す。
+    "import/no-cycle": ["error", { "ignoreTypes": false }],
+    // 名前の _ だけで判断するので、外が決めた名前にも当たる。
+    "eslint/no-underscore-dangle": "off",
+    // 害の無い不要な `!` と `as` を咎める。
+    "typescript/no-unnecessary-type-assertion": "off",
+    "typescript/no-unsafe-type-assertion": "off",
+    // 網羅した switch のように、値を返さない分岐が意図どおりの関数に出る。返り値の抜けは tsc の noImplicitReturns が見る。
+    "typescript/consistent-return": "off",
+    // 「これ以外を禁じる」は group の否定で書く。regex の先読みは黙って効かない。
+    "no-restricted-imports": [
+      "error",
+      {
+        "patterns": [
+          {
+            "group": [
+              "@kurumi/*/*",
+              "@kurumi/*/*/**",
+              "!@kurumi/*/schema",
+              "!@kurumi/*/contract",
+              "!@kurumi/*/server",
+              "!@kurumi/*/ui",
+              "!@kurumi/*/cli",
+              "!@kurumi/*/testing"
+            ],
+            "message": "他の package から import してよいのは schema・contract・server・ui・cli・testing の entry だけ。catalog や select のような内側の module と src/ の中は import しない（docs/design/module-map.md）"
+          }
+        ]
+      }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["**/*.ts", "**/*.tsx"],
+      "excludeFiles": ["**/*.test.ts", "**/testing.ts"],
+      "rules": { "kurumi/testing-entry": "error" }
+    }
+  ]
+}
