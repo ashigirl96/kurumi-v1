@@ -2,5 +2,20 @@
   "name": "@kurumi/account",
   "private": true,
   "type": "module",
-  "exports": {}
+  "exports": {
+    "./schema": "./src/schema.ts",
+    "./server": "./src/server.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "scripts": {
+    "generate": "drizzle-kit generate"
+  },
+  "dependencies": {
+    "@kurumi/agent": "workspace:*",
+    "@kurumi/rpc": "workspace:*",
+    "drizzle-orm": "catalog:"
+  },
+  "devDependencies": {
+    "drizzle-kit": "catalog:"
+  }
 }

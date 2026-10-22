@@ -11,6 +11,7 @@
   "rules": {
     "kurumi/disable-reason": "error",
     "kurumi/no-relative-package-import": "error",
+    "kurumi/sync-transaction": "error",
     // 指定しないと oxlint は import type だけでできた循環を見逃す。
     "import/no-cycle": ["error", { "ignoreTypes": false }],
     // 名前の _ だけで判断するので、外が決めた名前にも当たる。
@@ -43,6 +44,10 @@
     ]
   },
   "overrides": [
+    {
+      "files": ["packages/*/src/**", "apps/host/src/**"],
+      "rules": { "kurumi/cross-domain-write": "error" }
+    },
     {
       "files": ["**/*.ts", "**/*.tsx"],
       "excludeFiles": ["**/*.test.ts", "**/testing.ts"],
