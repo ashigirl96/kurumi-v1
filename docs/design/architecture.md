@@ -311,9 +311,9 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 - P02 `catalog.ts`: `identityScopes` は `VendorSpec` でなく `OAuthSpec` に置いた。key で接続する vendor には identity が無いため。`identify` は sketch の `async (accessToken, tokenResponse: unknown)` でなく、解析済みの `TokenResponse` を取る同期関数にした。Google は `id_token` だけで足り、Notion のように応答の別の field で名前が決まる vendor は、その PR で `TokenResponse` を広げる。`TokenResponse`、`Identity`、`IdentifyError` は `OAuthSpec` の型が要るので `catalog.ts` に置く（`oauth.ts` が `catalog.ts` を import するので、逆にすると循環する）。Notion の `identify` は、まだ誰も呼ばないので「未対応」を投げる。
 - P02 `oauth.ts`: `OAuthVendorId` は `'google'` だけにした。token の解析は `expires_in` を必須とし、client の渡し方は form の body 固定で、Notion の応答（`expires_in` が無い）と token endpoint（Basic 認証）に合わない。Notion を足す PR が `OAuthSpec` に client の認証方式を持たせて広げる。
 - P02 `oauth.ts`: `authorizeUrl` は `mergesEarlierGrant: false` で、catalog の `include_granted_scopes` を外せる。製品の接続は常に付ける。script の `--services` が前の同意と混ざらない新しい同意を取り、`--add` が混ぜた同意を取るために使う。
-- P02 `packages/account/scripts/google-consent.ts`: `tsconfig.json` の `include` が `packages/*/scripts` を含まないので、`bun run check` はこの script の型を見ない（oxlint は見る）。`tsconfig.json` は P02 の Files に無いので触っていない。script は P14 で消える。
+- P02 `tsconfig.json`: `include` に `packages/*/scripts` を足した。足す前は `bun run check` が `packages/account/scripts/google-consent.ts` の型を見なかった（oxlint は見た）。今は `tsc` がこの script を検査する。script は P14 で消える。
 - P02 `fixtures/google/`: JSON でなく `.ts` にした。unsigned の JWT を文字列で commit すると、CI の gitleaks の `jwt` rule が検知するため。`id_token` は読み込むときに claims から組み立てる。
-- P02 `google-consent.ts` の `--revoke`: 同じ実行で得た refresh token を取り消し、その refresh が `invalid_grant` になることを確かめる。token は file にも画面にも出さないので、別の実行へ渡せない。計画の lane 10 の「8 日後の確認に使う 1 本」は、この script では残せない。
+- P02 `google-consent.ts` の `--revoke`: 同じ実行で得た最初の refresh token を 1 本だけ取り消し、その run の refresh token すべてについて、refresh が `invalid_grant` になることを確かめる。Google は 1 本の revoke でそのアカウントと client の grant 全体を終わらせ、同じ grant の別の refresh token の revoke は 400 になるため、2 本目以降は revoke せず refresh で確かめる。token は file にも画面にも出さないので、別の実行へ渡せない。計画の lane 10 の「8 日後の確認に使う 1 本」は、この script では残せない。
 
 ## ユーザーが決めたこと（2026-10-22）
 
@@ -330,11 +330,13 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 - 1 回の同意で gmail と calendar を 1 行のアカウントにまとめる流れは、実際のログインで成り立った（2026-10-22、P02）。Google の test account と、別の Google アカウント 1 つで観察した。Google の project は「本番環境」で、ログインのたびに「このアプリは Google で確認されていません」の画面が出る。「詳細」を開いて「kurumi（安全ではないページ）に移動」を押すと同意画面に進み、token が取れた。
   - 1 回の同意で `scope` に Gmail と Calendar の scope が並び、`id_token` の `sub` は 1 つだった。同じアカウントの 5 回の同意で `sub` は同じで、別のアカウントでは違った。`(vendor, subject)` での upsert はこの事実に立てる。
   - 同意画面で Calendar の checkbox を外すと、token 応答の `scope` に Calendar の scope が出なかった。その token で Gmail は 200、Calendar は 403（`ACCESS_TOKEN_SCOPE_INSUFFICIENT`）だった。scope の一部だけを許可する接続は、通常の経路として起こる。
-  - `include_granted_scopes=true` で Calendar を後から足すと、2 回目の token 応答の `scope` も、その refresh token で refresh した応答の `scope` も、Gmail と Calendar の両方を持った。逆に `include_granted_scopes` を付けない同意は、その同意で許可した scope だけを返した。前の同意を取り消した後の再同意も同じだった。
+  - `include_granted_scopes=true` で Calendar を後から足すと、2 回目の token 応答の `scope` も、その refresh token で refresh した応答の `scope` も、Gmail と Calendar の両方を持った。逆に `include_granted_scopes` を付けない同意は、前の Gmail の同意が生きているあいだも、その同意で許可した Calendar の scope だけを返した（応答も、その refresh token で refresh した応答も同じ）。そのとき前の refresh token は、そのまま refresh できた。前の同意を取り消した後の再同意も同じだった。
   - 同意画面は、まず「kurumi にログイン」（メールアドレスの確認）を出し、その後に scope の checkbox を出す。最初の同意では checkbox が全部入っていたが、その後の同意では全部空で出た。接続の画面は、許可されなかった service を前提にして作る。
-  - token 応答の形は fixture の写しと同じだった。code 交換は `access_token`、`expires_in`、`refresh_token`、`scope`、`token_type`、`id_token` を返し、refresh は `refresh_token` を除いた同じ形を返す。refresh の応答にも `id_token` があり、`sub` と `email` は交換のときと同じである。`refresh_token_expires_in` は出なかった。
-  - 同じ code を 2 回交換すると、2 回目は `invalid_grant` で失敗した。1 回目の token は、その後も revoke できた（200）。
-  - refresh token を revoke すると 200 が返り、その refresh token での refresh は `invalid_grant` になった。同意画面でキャンセルすると、callback は `error=access_denied` を受け、code は出ない。
+  - token 応答の body の key と `id_token` の claim の key は、fixture の写しと同じだった。code 交換は `access_token`、`expires_in`、`refresh_token`、`scope`、`token_type`、`id_token` を返し、refresh は `refresh_token` を除いた同じ形を返す。`id_token` の header は違う。Google は `alg`、`kid`、`typ` を送り、fixture は `{alg: 'none', typ: 'JWT'}` だけである。refresh の応答にも `id_token` があり、`sub` と `email` は交換のときと同じだった（2 回の同意の両方で確認）。`refresh_token_expires_in` は出なかった。
+  - 同じ code の 2 回目の交換は、1 回目の直後だけ通った。0.2 秒後と 0.3 秒後の 2 回は受け付けられ、1 回目とは別の access token と refresh token が出た。0.5 秒後から 103.7 秒後までの 16 回は、すべて `invalid_grant` で失敗した（3 回の同意で観察。1 回目を送ってからの秒数は 0.5、0.9、1.2、1.3、1.6、2.2、2.4、3.3、3.4、3.5、4.5、6.6、9.7、13.4、43.5、103.7）。1 回目の token は、その後も revoke できた（200）。script は 5 秒待ってから 2 回目を送る。
+  - refresh token を revoke すると 200 が返り、その refresh token での refresh は `invalid_grant` になった。
+  - 1 本の revoke は、そのアカウントと client の grant 全体を終わらせた。同じアカウントで 2 回同意して得た refresh token A と B のうち B を revoke すると、B も A も refresh が `invalid_grant` になり、A の revoke は 400 を返した（2 組で同じだった。1 組は A も B も Gmail、もう 1 組は A が Gmail で B が Calendar）。この grant の token は、1 本を revoke すると全部使えなくなる。
+  - 同意画面でキャンセルすると、callback は `error=access_denied` を受け、code は出ない。
   - Gmail API と Calendar API は、Google の project で有効にするまで 403 `SERVICE_DISABLED`（`accessNotConfigured`）を返す。scope があっても通らないので、project の前提に加える。
 
 ## Open questions and risks
@@ -342,7 +344,7 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 - HTTP/2・WebSocket・長い SSE の背圧で Bun の MITM が崩れないか。崩れた場合、forward の engine だけを Node の子 process に出す必要があり、そのとき account との境界は `credentialFor` の RPC になる（unit 1）。
 - leaf cert は CONNECT の host で選ぶので、SNI と CONNECT の host が違う client では名前が合わない。curl は一致した。食い違う client が見つかったら、Client Hello を自分で読んで SNI を取り出す。
 - Linux の Docker Engine で、container から host の 127.0.0.1 bind に届くか。macOS の Docker Desktop では届く（試作で確認）。Linux では docker0 の address に bind する必要があるかもしれない（未検証）。
-- Google の project を「本番環境」にした（2026-10-22）。Gmail（制限付き）と Calendar（機密性の高い）の scope があるので、Console は「アプリの検証が必要です」と表示する。審査には出していない。refresh token が 7 日を超えて生きるかは未観察。refresh token は 1 つのアカウントと client の組で 100 本までで、超えると古いものが黙って無効になる（Google の文書）。prompt=consent で接続し直すたびに 1 本増えるので、接続し直しを繰り返す試験では上限に注意する。
+- Google の project を「本番環境」にした（2026-10-22）。Gmail（制限付き）と Calendar（機密性の高い）の scope があるので、Console は「アプリの検証が必要です」と表示する。審査には出していない。Google の文書「When is verification not needed」では、100 人未満の personal use は未審査のまま使え、ログインのたびに「未確認のアプリ」の警告を押し進める。警告を押し進めて token を得られることは、P02 の実際のログインで確かめた。refresh token が 7 日を超えて生きるかは未観察。refresh token は 1 つのアカウントと client の組で 100 本までで、超えると古いものが黙って無効になる（Google の文書）。prompt=consent で接続し直すたびに 1 本増えるので、接続し直しを繰り返す試験では上限に注意する。
 - Anthropic / Google の SDK が `kurumi:…` を credential として受け入れるか。受け入れない vendor には `selectorShape` を足す（unit 4）。
 - 承認後の再送で、agent が本文を作り直す頻度。多ければ「承認時に body を保存しておき、gateway が承認済みの body で送る」案（replay）を検討するか（unit 5）。
 - generic な Secret（任意の host に任意の header）を vendor `custom` として行に host を持たせるか。持たせると「vendor / service の一覧は 1 object」の例外になる。
