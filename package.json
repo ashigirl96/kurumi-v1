@@ -1,0 +1,30 @@
+{
+  "name": "kurumi",
+  "private": true,
+  "workspaces": {
+    "packages": [
+      "apps/*",
+      "packages/*"
+    ],
+    "catalog": {
+      "@types/bun": "1.4.3",
+      "oxfmt": "0.71.0",
+      "oxlint": "1.86.0",
+      "oxlint-tsgolint": "7.0.2003",
+      "typescript": "7.0.2"
+    }
+  },
+  "type": "module",
+  "scripts": {
+    "check": "oxlint --no-error-on-unmatched-pattern --report-unused-disable-directives-severity=error && oxfmt --check && tsc --noEmit && bun test",
+    "generate": "bun run --filter './packages/*' --if-present generate"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "oxfmt": "catalog:",
+    "oxlint": "catalog:",
+    "oxlint-tsgolint": "catalog:",
+    "typescript": "catalog:"
+  },
+  "packageManager": "bun@1.4.3"
+}

@@ -1,0 +1,13 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "ignorePatterns": [
+    "**/*.md",
+    "docs/**",
+    ".agents/**",
+    ".claude/**",
+    "packages/*/migrations/*/**"
+  ],
+  "semi": false,
+  "singleQuote": true,
+  "sortImports": true
+}

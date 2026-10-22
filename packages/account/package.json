@@ -1,0 +1,6 @@
+{
+  "name": "@kurumi/account",
+  "private": true,
+  "type": "module",
+  "exports": {}
+}

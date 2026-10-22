@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    # テストの中の同期の無限ループは bun test の timeout では止まらず、既定では 360 分走り続ける。
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.12 -color
+
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # PR の途中の commit で入れて後の commit で消した secret も、履歴には残るので全履歴を見る。
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: docker run --rm -v "$PWD:/repo" --workdir /repo zricethezav/gitleaks:v8.30.1 git --redact --no-banner

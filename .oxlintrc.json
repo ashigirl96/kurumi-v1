@@ -1,0 +1,59 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "import"],
+  "jsPlugins": ["./scripts/oxlint/kurumi.js"],
+  "options": { "typeAware": true },
+  "ignorePatterns": ["docs/**", ".agents/**", ".claude/**"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+  "rules": {
+    "kurumi/disable-reason": "error",
+    // 指定しないと oxlint は import type だけでできた循環を見逃す。
+    "import/no-cycle": ["error", { "ignoreTypes": false }],
+    // 「これ以外を禁じる」は group の否定で書く。regex の先読みは黙って効かない。
+    // 名前の _ だけで判断するので、外が決めた名前にも当たる。
+    "eslint/no-underscore-dangle": "off",
+    // unknown や Buffer を `${…}` に入れる形を咎める。`[object Object]` になる値は no-base-to-string が見る。
+    "typescript/restrict-template-expressions": "off",
+    // 害の無い不要な `!` と `as` を咎める。
+    "typescript/no-unnecessary-type-assertion": "off",
+    // `JSON.parse(…) as { pid: number }` のように、検査せずに型を付ける `as` をすべて咎める。
+    "typescript/no-unsafe-type-assertion": "off",
+    // 網羅した switch のように、値を返さない分岐が意図どおりの関数に出る。返り値の抜けは tsc の noImplicitReturns が見る。
+    "typescript/consistent-return": "off",
+    "no-restricted-imports": [
+      "error",
+      {
+        "patterns": [
+          {
+            "group": [
+              "@kurumi/*/*",
+              "@kurumi/*/*/**",
+              "!@kurumi/*/schema",
+              "!@kurumi/*/contract",
+              "!@kurumi/*/server",
+              "!@kurumi/*/ui",
+              "!@kurumi/*/cli",
+              "!@kurumi/*/testing"
+            ],
+            "message": "他の package から import してよいのは schema・contract・server・ui・cli・testing の entry だけ。catalog や select のような内側の module と src/ の中は import しない（docs/design/module-map.md）"
+          }
+        ]
+      }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["**/*.ts", "**/*.tsx"],
+      "excludeFiles": ["**/*.test.ts", "**/testing.ts"],
+      "rules": { "kurumi/testing-entry": "error" }
+    },
+    {
+      // bun-types が `expect(…).rejects` の matcher を void を返す型にしているための誤検知。rule に従って await を外すと、test が reject を待たなくなる。
+      "files": ["**/*.test.ts"],
+      "rules": { "typescript/await-thenable": "off" }
+    }
+  ]
+}
