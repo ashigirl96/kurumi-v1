@@ -146,10 +146,22 @@ export function createDockerDriver(options: {
     if (!owned) return
     const { name, kind } = owned
     let removed = false
+    let removalError: unknown
     try {
-      const stdout = await run(['rm', '--force', name])
-      removed = stdout.trim() === name
-    } catch (removalError) {
+      const exit = await cli.start(['rm', '--force', name]).result
+      if (
+        exit.code !== 0 &&
+        /^(?:Error response from daemon: )?No such container(?:: [^\r\n]+)?\s*$/.test(exit.stderr)
+      ) {
+        removed = true
+      } else {
+        const stdout = output(exit, 'rm')
+        removed = kind !== 'uncertain' || stdout.trim() === name
+      }
+    } catch (cause) {
+      removalError = cause
+    }
+    if (!removed) {
       try {
         const names = await run([
           'ps',
@@ -162,15 +174,10 @@ export function createDockerDriver(options: {
         if (names.trim() !== '') throw error(`container ${name} still exists`)
       } catch (absenceError) {
         throw new CleanupError(
-          `Docker (${options.image}): cleanup of ${name} failed: ${String(removalError)}; ${String(absenceError)}`,
+          `Docker (${options.image}): cleanup of ${name} failed: ${String(removalError ?? 'removal unconfirmed')}; ${String(absenceError)}`,
           { cause: absenceError },
         )
       }
-    }
-    if (kind === 'uncertain' && !removed) {
-      throw new CleanupError(
-        `Docker (${options.image}): cleanup of ${name} unconfirmed: create outcome is uncertain; positive removal is required`,
-      )
     }
     owned = undefined
   }
