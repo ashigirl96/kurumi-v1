@@ -1,10 +1,4 @@
-import {
-  wasReEncoded,
-  type CredentialSlot,
-  type SelectorShape,
-  type ServiceId,
-  type VendorId,
-} from './catalog.ts'
+import type { CredentialSlot, SelectorShape, ServiceId, VendorId } from './catalog.ts'
 
 export type AccountHandle = `${VendorId}/${string}` & { readonly __brand: 'AccountHandle' }
 
@@ -98,10 +92,17 @@ const decodedQueryValue = (value: string): string | null => decodedOnce(value.re
 const word = /kurumi/i
 const escapedLetterOfWord = /%(?:6b|4b|75|55|72|52|6d|4d|69|49)/i
 
-const mentions = (text: string, decode = decodedOnce): boolean =>
-  word.test(text) || (escapedLetterOfWord.test(text) && word.test(decode(text) ?? ''))
+const mentionsIn =
+  (decode: (text: string) => string | null) =>
+  (text: string): boolean =>
+    word.test(text) || (escapedLetterOfWord.test(text) && word.test(decode(text) ?? ''))
+const mentions = mentionsIn(decodedOnce)
+const mentionsInQuery = mentionsIn(decodedQueryValue)
 
-const notBase64 = /[^A-Za-z0-9+/=_-]+/
+// Two Basic headers arrive joined by a comma, and Buffer stops at a `=`, so a credential that is not one base64 blob
+// has its first runs decoded to see the word. A run under 8 characters cannot hold the word; no client joins 16 headers.
+const notOneBlob = /[^A-Za-z0-9+/=_-]|=[A-Za-z0-9+/_-]/
+const base64Run = /[A-Za-z0-9+/_-]{8,}/g
 const decodedBase64 = (text: string): string => Buffer.from(text, 'base64').toString()
 
 function takeQueryParam(url: URL, param: string): string[] {
@@ -126,18 +127,20 @@ function writtenInAuthorization(header: string): Written {
     case 'bearer':
     case 'token':
       return { mentions: mentions(header), written: header, credential }
-    // Two Basic headers arrive joined by a comma, so every base64 run of the credential is decoded to see the word.
     case 'basic': {
       const blob = credential.replaceAll(/\s+/g, '')
-      const joined = notBase64.test(blob)
-      const runs = joined ? credential.split(notBase64).map(decodedBase64) : []
+      const oneBlob = !notOneBlob.test(blob)
+      const runs = oneBlob ? [] : [...credential.matchAll(base64Run).take(16)]
       const userAndPassword = decodedBase64(blob)
       const colon = userAndPassword.indexOf(':')
       return {
-        mentions: [header, userAndPassword, ...runs].some((text) => mentions(text)),
-        written: userAndPassword,
+        mentions:
+          mentions(header) ||
+          mentions(userAndPassword) ||
+          runs.some(([run]) => mentions(decodedBase64(run))),
+        written: oneBlob ? userAndPassword : header,
         credential:
-          !joined && colon !== -1 && !mentions(userAndPassword.slice(0, colon))
+          oneBlob && colon !== -1 && !mentions(userAndPassword.slice(0, colon))
             ? userAndPassword.slice(colon + 1)
             : null,
       }
@@ -146,11 +149,9 @@ function writtenInAuthorization(header: string): Written {
   return { mentions: mentions(header), written: header, credential: null }
 }
 
-const alone = (value: string, decode = decodedOnce): Written => ({
-  mentions: mentions(value, decode),
-  written: value,
-  credential: value,
-})
+const alone =
+  (seen: (text: string) => boolean) =>
+  (value: string): Written => ({ mentions: seen(value), written: value, credential: value })
 
 function takeHeader(
   headers: Headers,
@@ -172,7 +173,7 @@ function takeWritten(slot: CredentialSlot, headers: Headers, url: URL): Written[
     // An SDK sends its auth token as Authorization, so a service whose slot is another header still sees a selector there.
     case 'header':
       return [
-        ...takeHeader(headers, slot.header, (value) => alone(value)),
+        ...takeHeader(headers, slot.header, alone(mentions)),
         ...takeHeader(
           headers,
           'authorization',
@@ -181,7 +182,7 @@ function takeWritten(slot: CredentialSlot, headers: Headers, url: URL): Written[
         ),
       ]
     case 'query':
-      return takeQueryParam(url, slot.param).map((value) => alone(value, decodedQueryValue))
+      return takeQueryParam(url, slot.param).map(alone(mentionsInQuery))
   }
 }
 
@@ -198,9 +199,12 @@ function selectorIn(
     : { kind: 'unreadable', written: naming.map(({ written }) => written).join(' | ') }
 }
 
+/** `format` keeps `/` readable, so a `%2F` means a component encoder re-encoded the value, which is decoded first. */
+const reEncoded = /%2f/i
+
 function parseQueryValue(shape: SelectorShape, value: string): string | null {
   const decoded = decodedQueryValue(value)
-  const [first, second] = wasReEncoded(value) ? [decoded, value] : [value, decoded]
+  const [first, second] = reEncoded.test(value) ? [decoded, value] : [value, decoded]
   const parsed = (text: string | null) => (text === null ? null : shape.parse(text))
   return parsed(first) ?? parsed(second)
 }

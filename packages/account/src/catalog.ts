@@ -59,8 +59,6 @@ export const defaultSelectorShape: SelectorShape = {
   parse: parseDefaultForm,
 }
 
-export const wasReEncoded = (value: string): boolean => /%2f/i.test(value)
-
 export type VendorSpec = {
   displayName: string
   connect: { kind: 'oauth'; oauth: OAuthSpec } | { kind: 'key' }

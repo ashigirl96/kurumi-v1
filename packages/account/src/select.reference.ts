@@ -1,4 +1,4 @@
-import { wasReEncoded, type CredentialSlot, type SelectorShape } from './catalog.ts'
+import type { CredentialSlot, SelectorShape } from './catalog.ts'
 import type { GrantedCandidate, Selection, SelectionRefusal } from './select.ts'
 
 export type ReferenceSelector =
@@ -8,7 +8,7 @@ export type ReferenceSelector =
 
 const word = /kurumi/i
 
-const decodedOnce = (text: string): string | null => {
+export const decodedOnce = (text: string): string | null => {
   try {
     return decodeURIComponent(text)
   } catch {
@@ -16,12 +16,15 @@ const decodedOnce = (text: string): string | null => {
   }
 }
 
-const mentions = (text: string): boolean => word.test(text) || word.test(decodedOnce(text) ?? '')
-
 const asQueryWrites = (value: string): string => value.replaceAll('+', ' ')
 
-// Two Basic headers arrive joined by a comma, so every base64 run of the credential is decoded to see the word.
-const notBase64 = /[^A-Za-z0-9+/=_-]+/
+const mentions = (text: string): boolean => word.test(text) || word.test(decodedOnce(text) ?? '')
+const mentionsInQuery = (value: string): boolean => mentions(asQueryWrites(value))
+
+// Two Basic headers arrive joined by a comma, and Buffer stops at a `=`, so a credential that is not one base64 blob
+// has its first runs decoded to see the word. A run under 8 characters cannot hold the word; no client joins 16 headers.
+const notOneBlob = /[^A-Za-z0-9+/=_-]|=[A-Za-z0-9+/_-]/
+const base64Run = /[A-Za-z0-9+/_-]{8,}/g
 const decodedBase64 = (text: string): string => Buffer.from(text, 'base64').toString()
 
 type Value = { mentions: boolean; credential: string | null }
@@ -34,14 +37,16 @@ function valueInAuthorization(header: string): Value {
       return { mentions: mentions(header), credential }
     case 'basic': {
       const blob = credential.replaceAll(/\s+/g, '')
-      const runs = [...new Set([blob, ...credential.split(notBase64)])].map(decodedBase64)
-      const [user = '', ...password] = decodedBase64(blob).split(':')
+      const oneBlob = !notOneBlob.test(blob)
+      const runs = oneBlob ? [] : [...credential.matchAll(base64Run).take(16)]
+      const userAndPassword = decodedBase64(blob)
+      const [user = '', ...password] = userAndPassword.split(':')
       return {
-        mentions: mentions(header) || runs.some(mentions),
-        credential:
-          !notBase64.test(blob) && password.length > 0 && !mentions(user)
-            ? password.join(':')
-            : null,
+        mentions:
+          mentions(header) ||
+          mentions(userAndPassword) ||
+          runs.some(([run]) => mentions(decodedBase64(run))),
+        credential: oneBlob && password.length > 0 && !mentions(user) ? password.join(':') : null,
       }
     }
   }
@@ -51,7 +56,7 @@ function valueInAuthorization(header: string): Value {
 const valueInHeader = (value: string): Value => ({ mentions: mentions(value), credential: value })
 
 const valueInQuery = (value: string): Value => ({
-  mentions: mentions(asQueryWrites(value)),
+  mentions: mentionsInQuery(value),
   credential: value,
 })
 
@@ -94,7 +99,7 @@ function takeValues(slot: CredentialSlot, headers: Headers, url: URL): Value[] {
 
 function parseQueryValue(shape: SelectorShape, value: string): string | null {
   const decoded = decodedOnce(asQueryWrites(value))
-  const order = wasReEncoded(value) ? [decoded, value] : [value, decoded]
+  const order = /%2f/i.test(value) ? [decoded, value] : [value, decoded]
   for (const text of order) {
     const handle = text === null ? null : shape.parse(text)
     if (handle !== null) return handle
