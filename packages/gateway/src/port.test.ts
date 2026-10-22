@@ -218,3 +218,38 @@ test('malformed inner HTTP closes the tunnel', async () => {
   await closed
   expect(tunnel.socket.destroyed).toBe(true)
 })
+
+test('new tunnels receive a refreshed leaf while the existing tunnel stays usable', async () => {
+  const upstream = await startFakeUpstream()
+  stops.push(upstream.stop)
+  const ca = await createCertificateAuthority()
+  let leaf = await ca.mintLeaf('fake.test')
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    ca: { ...ca, leafFor: () => Promise.resolve(leaf) },
+    authenticate: () => ({}),
+    intercepts: () => true,
+    forward: { upstream: upstream.destination, inject: ({ path, headers }) => ({ path, headers }) },
+  })
+  stops.push(gateway.stop)
+  const first = await openTestTunnel({
+    proxyPort: gateway.port,
+    token: 'token',
+    caPem: gateway.caPem,
+  })
+  stops.push(first.close)
+  expect((await sendTestRequest(first, { path: '/echo' })).status).toBe(200)
+  leaf = await ca.mintLeaf('fake.test')
+  const second = await openTestTunnel({
+    proxyPort: gateway.port,
+    token: 'token',
+    caPem: gateway.caPem,
+  })
+  stops.push(second.close)
+  expect(second.socket.getPeerCertificate().fingerprint256).not.toBe(
+    first.socket.getPeerCertificate().fingerprint256,
+  )
+  expect(second.socket.alpnProtocol).toBe('http/1.1')
+  expect((await sendTestRequest(first, { path: '/echo' })).status).toBe(200)
+  expect((await sendTestRequest(second, { path: '/echo' })).status).toBe(200)
+})

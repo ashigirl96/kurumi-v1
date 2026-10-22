@@ -41,8 +41,16 @@ const hopHeaders = [
 
 function withoutHopHeaders(headers: Headers): Headers {
   const result = new Headers(headers)
-  for (const name of headers.get('connection')?.split(',') ?? []) result.delete(name.trim())
-  for (const name of hopHeaders) result.delete(name)
+  const nominated = new Set(
+    headers
+      .get('connection')
+      ?.toLowerCase()
+      .split(',')
+      .map((name) => name.trim()),
+  )
+  for (const name of headers.keys()) {
+    if (hopHeaders.includes(name) || nominated.has(name)) result.delete(name)
+  }
   return result
 }
 

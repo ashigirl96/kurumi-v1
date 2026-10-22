@@ -19,7 +19,7 @@ type HostListener<Principal> = {
   server: ReturnType<typeof createTlsServer>
   port: number
   leaf: Leaf
-  pending: Map<number, Tunnel<Principal>>
+  pending: Map<string, Tunnel<Principal>>
 }
 
 export type AgentPort = {
@@ -116,7 +116,7 @@ export async function startAgentPort<Principal extends object>(deps: {
   }
 
   async function makeListener(leaf: Leaf): Promise<HostListener<Principal>> {
-    const pending = new Map<number, Tunnel<Principal>>()
+    const pending = new Map<string, Tunnel<Principal>>()
     const server = createTlsServer(
       {
         key: leaf.keyPem,
@@ -125,8 +125,9 @@ export async function startAgentPort<Principal extends object>(deps: {
         handshakeTimeout: 10_000,
       },
       (socket) => {
-        const tunnel = pending.get(socket.remotePort ?? -1)
-        pending.delete(socket.remotePort ?? -1)
+        const key = `${socket.remoteAddress}:${socket.remotePort}`
+        const tunnel = pending.get(key)
+        pending.delete(key)
         track(socket)
         if (!tunnel || tunnel.signal.aborted || stopping) {
           socket.destroy()
@@ -204,16 +205,18 @@ export async function startAgentPort<Principal extends object>(deps: {
       return
     }
     if (listener) {
-      const localPort = outbound.localPort
-      if (localPort === undefined) throw new Error('Loopback connection has no TCP port')
+      if (outbound.localPort === undefined || outbound.localAddress === undefined) {
+        throw new Error('Loopback connection has no TCP address')
+      }
+      const key = `${outbound.localAddress}:${outbound.localPort}`
       const tunnel: Tunnel<Principal> = {
         target,
         authenticate: () => deps.authenticate(token),
         signal: aborted.signal,
       }
-      listener.pending.set(localPort, tunnel)
+      listener.pending.set(key, tunnel)
       outbound.once('close', () => {
-        if (listener.pending.get(localPort) === tunnel) listener.pending.delete(localPort)
+        if (listener.pending.get(key) === tunnel) listener.pending.delete(key)
       })
     }
     client.write('HTTP/1.1 200 Connection Established\r\n\r\n')

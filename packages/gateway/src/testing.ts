@@ -1,6 +1,5 @@
 import { createHash, X509Certificate } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import {
   request as httpRequest,
   type IncomingHttpHeaders,
@@ -8,8 +7,6 @@ import {
 } from 'node:http'
 import { Agent, createServer, request } from 'node:https'
 import { isIP, type Socket } from 'node:net'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { pipeline, Readable } from 'node:stream'
 import { connect, type TLSSocket } from 'node:tls'
 
@@ -176,16 +173,8 @@ export async function startTestGateway({
       },
     },
   })
-  const directory = await mkdtemp(join(tmpdir(), 'kurumi-gateway-'))
-  const caPemPath = join(directory, 'ca.pem')
-  await writeFile(caPemPath, gateway.caPem)
-  let stopped: Promise<void> | undefined
-  const stop = () => {
-    stopped ??= gateway.stop().finally(() => rm(directory, { recursive: true, force: true }))
-    return stopped
-  }
   console.info(JSON.stringify({ event: 'gateway.started', pid: process.pid, port: gateway.port }))
-  return { ...gateway, stop, pid: process.pid, caPemPath, connects }
+  return { ...gateway, pid: process.pid, connects }
 }
 
 type TestTunnel = { target: ConnectTarget; socket: TLSSocket; agent: Agent; close: () => void }

@@ -79,6 +79,20 @@ test('an upstream 503 keeps its status and body', async () => {
   expect(response.body).toBe('try later')
 })
 
+test('an upstream Connection field with empty or invalid tokens cannot crash forwarding', async () => {
+  const { upstream, tunnel } = await setup()
+  upstream.setResponse('/connection', {
+    status: 200,
+    body: 'ok',
+    headers: { connection: 'keep-alive, , bad token, x-hop', 'x-hop': 'remove', 'x-keep': 'keep' },
+  })
+  const response = await sendTestRequest(tunnel, { path: '/connection' })
+  expect(response.status).toBe(200)
+  expect(response.body).toBe('ok')
+  expect(response.headers['x-hop']).toBeUndefined()
+  expect(response.headers['x-keep']).toBe('keep')
+})
+
 test('an unknown-length response retains every byte', async () => {
   const { tunnel } = await setup()
   const response = await sendTestRequest(tunnel, { path: '/chunked?bytes=131073' })
