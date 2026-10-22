@@ -23,14 +23,17 @@ import {
 
 const googleServices = Object.keys(catalog.google.services) as readonly ServiceId[]
 
+// Google accepted a replay of a code up to 0.3 s after the first exchange and refused it from 0.5 s on.
+const REUSE_DELAY_SECONDS = 5
+
 const USAGE = `usage: bun packages/account/scripts/google-consent.ts (--services <ids> | --add <ids>) [flags]
 
   --services <ids>  consent to these services (${googleServices.join(', ')}) as a fresh grant, without merging an earlier one
   --add <ids>       consent to more services; Google merges them into the earlier grant (include_granted_scopes)
   --refresh         refresh once with the new refresh token and print the refreshed grant
   --probe           call the Gmail and Calendar APIs with the new access token and check each status against the services the grant covers
-  --reuse-code      exchange the same code a second time and print Google's refusal (runs after --refresh and --probe)
-  --revoke          revoke the refresh token this run obtained and check that refreshing with it then fails
+  --reuse-code      exchange the same code a second time, ${REUSE_DELAY_SECONDS} s after the first, and print Google's refusal (runs after --refresh and --probe)
+  --revoke          revoke the refresh token this run obtained; Google ends the whole grant with it, so every refresh token of the run must then fail to refresh
   --mask            print the email as a***@domain and the subject as its first and last 4 characters
   --port <n>        callback port on 127.0.0.1 (default: any free port)
   --timeout <s>     seconds to wait for the browser callback (default: 300)
@@ -188,34 +191,40 @@ async function revokeAndCheck(
   obtained: readonly TokenResponse[],
 ): Promise<boolean> {
   const refreshTokens = obtained.flatMap(({ refreshToken }) => refreshToken ?? [])
-  if (refreshTokens.length === 0) {
+  const [revokedToken] = refreshTokens
+  if (revokedToken === undefined) {
     fail('--revoke found no refresh token to revoke, so nothing was checked.')
     return false
   }
-  let ok = true
+  const revoked = await fetch(REVOKE_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ token: revokedToken }),
+  })
+  out(`revoke refresh_token #1: HTTP ${revoked.status}`)
+  let ok = revoked.status === 200
+  if (!ok) fail('Google did not accept the revoke of refresh_token #1.')
+  if (refreshTokens.length > 1) {
+    out(
+      'Revoking one refresh token ends the whole grant, so the other refresh tokens of this run are checked by refreshing, not by revoking.',
+    )
+  }
   for (const [index, token] of refreshTokens.entries()) {
-    const label = `refresh_token #${index + 1}`
-    const revoked = await fetch(REVOKE_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token }),
-    })
-    out(`revoke ${label}: HTTP ${revoked.status}`)
-    if (revoked.status !== 200) {
-      ok = false
-      fail(`Google did not accept the revoke of ${label}.`)
-    }
+    const label =
+      index === 0
+        ? 'revoked refresh_token #1'
+        : `refresh_token #${index + 1}, in the grant that the revoke of #1 ended`
     const outcome = await attempt(refresh({ vendor: 'google', client, refreshToken: token }))
     if (
       !outcome.ok &&
       outcome.error instanceof OAuthError &&
       outcome.error.code === 'invalid_grant'
     ) {
-      out(`refresh with revoked ${label}: refused (invalid_grant)`)
+      out(`refresh with ${label}: refused (invalid_grant)`)
     } else {
       ok = false
       fail(
-        `refresh with revoked ${label}: ${outcome.ok ? 'Google still issued an access token' : describe(outcome.error)}`,
+        `refresh with ${label}: ${outcome.ok ? 'Google still issued an access token' : describe(outcome.error)}`,
       )
     }
   }
@@ -256,11 +265,12 @@ async function exercise(input: {
   options: Options
   client: OAuthClient
   first: TokenResponse
+  firstExchangedAt: number
   covered: readonly ServiceId[]
   exchange: () => Promise<TokenResponse>
   obtained: TokenResponse[]
 }): Promise<boolean> {
-  const { options, client, first, covered, exchange, obtained } = input
+  const { options, client, first, firstExchangedAt, covered, exchange, obtained } = input
   let ok = true
   if (options.refresh) {
     if (first.refreshToken === null) {
@@ -280,14 +290,18 @@ async function exercise(input: {
   }
   if (options.probe) ok = (await probeApis(first.accessToken, covered)) && ok
   if (options.reuseCode) {
+    await Bun.sleep(REUSE_DELAY_SECONDS * 1000 - (performance.now() - firstExchangedAt))
     const second = await attempt(exchange())
+    const gap = `${((performance.now() - firstExchangedAt) / 1000).toFixed(1)} s after the first`
     if (second.ok) {
       obtained.push(second.value)
       ok = false
-      fail('The second exchange of the same code was accepted, which Google should refuse.')
+      fail(
+        `The second exchange of the same code, ${gap}, was accepted, which Google should refuse.`,
+      )
     } else if (second.error instanceof OAuthError) {
       out(
-        `second exchange of the same code: refused (${second.error.code}). ${second.error.message}`,
+        `second exchange of the same code, ${gap}: refused (${second.error.code}). ${second.error.message}`,
       )
     } else {
       throw second.error
@@ -343,6 +357,7 @@ async function consent(options: Options): Promise<boolean> {
       (async () => {
         const first = await exchange()
         obtained.push(first)
+        const firstExchangedAt = performance.now()
         const grant = catalog.google.connect.oauth.identify(first)
         printGrant(grant, options.mask)
         out(`refresh_token: ${first.refreshToken === null ? 'absent' : 'present'}`)
@@ -350,6 +365,7 @@ async function consent(options: Options): Promise<boolean> {
           options,
           client,
           first,
+          firstExchangedAt,
           covered: servicesCovered('google', grant.grantedScopes),
           exchange,
           obtained,
