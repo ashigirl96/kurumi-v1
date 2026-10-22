@@ -845,8 +845,8 @@ describe('awkward handles through every slot', () => {
 })
 
 const base64Edge = /(^|[^A-Za-z0-9+/=_-])a3VydW1p($|[^A-Za-z0-9+/=_-])/
-const mentions = (text: string, base64Counts: boolean) =>
-  /kurumi/i.test(text.replace(/%6b/gi, 'k')) || (base64Counts && base64Edge.test(text))
+const mentions = (text: string) =>
+  /kurumi/i.test(text.replace(/%6b/gi, 'k')) || base64Edge.test(text)
 
 function handleThatTextNames(text: string): string | null {
   const prefix = /^kurumi:/i.exec(text)
@@ -946,8 +946,8 @@ describe('whatever a slot holds', () => {
         )
         const selection = selectAccount('gmail', candidates, selector)
 
-        if (!mentions(text, slot.kind !== 'basic')) {
-          if (!text.includes('a3VydW1p') || slot.kind === 'basic')
+        if (!mentions(text)) {
+          if (!text.includes('a3VydW1p'))
             expect(selection).toMatchObject({ ok: true, how: 'default' })
           continue
         }

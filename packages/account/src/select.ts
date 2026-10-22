@@ -100,26 +100,26 @@ function takeQueryParam(url: URL, param: string): string[] {
   return values
 }
 
-type Written = { raw: string; around: string; credential: string }
+type Written = { scan: readonly string[]; around: string; credential: string }
 
 function writtenInAuthorization(header: string): Written {
   const [, scheme = '', credential = ''] = /^(\w+\s+)(.+)$/.exec(header) ?? []
   switch (scheme.trim().toLowerCase()) {
     case 'bearer':
     case 'token':
-      return { raw: header, around: scheme, credential }
+      return { scan: [header], around: scheme, credential }
     case 'basic': {
       if (!/^[A-Za-z0-9+/]+={0,2}$/.test(credential)) break
       const userAndPassword = Buffer.from(credential, 'base64').toString()
       const separator = userAndPassword.indexOf(':') + 1
       return {
-        raw: header,
+        scan: [header, userAndPassword],
         around: userAndPassword.slice(0, separator),
         credential: userAndPassword.slice(separator),
       }
     }
   }
-  return { raw: header, around: header, credential: '' }
+  return { scan: [header], around: header, credential: '' }
 }
 
 function takeHeader(headers: Headers, name: string): string[] {
@@ -137,7 +137,7 @@ function takeNamingAuthorization(headers: Headers): Written[] {
   return value !== null && mentionsKurumi(value) ? takeAuthorization(headers) : []
 }
 
-const alone = (credential: string): Written => ({ raw: credential, around: '', credential })
+const alone = (credential: string): Written => ({ scan: [credential], around: '', credential })
 
 function takeWritten(slot: CredentialSlot, headers: Headers, url: URL): Written[] {
   switch (slot.kind) {
@@ -156,26 +156,23 @@ const escapesDecoded = (text: string): string =>
     String.fromCharCode(Number.parseInt(hex, 16)),
   )
 
+/** The shortest base64 that holds the six bytes of the word is eight characters. */
 const base64Views = (text: string): string[] =>
-  [text.replace(/\s+/g, ''), ...text.split(/[^A-Za-z0-9+/=_-]+/)].map((token) =>
-    Buffer.from(token, 'base64').toString(),
-  )
-
-const escapeViews = (text: string): string[] => [
-  text,
-  text.replace(/^\w+\s+/, ''),
-  escapesDecoded(text),
-  decodeQueryComponent(text),
-]
+  [text.replaceAll(/\s+/g, ''), ...text.split(/[^A-Za-z0-9+/=_-]+/)]
+    .filter((token) => token.length >= 8)
+    .map((token) => Buffer.from(token, 'base64').toString())
 
 /**
  * Real third-party credentials do not hold the word, so a value that does is the agent naming an account. The word
- * is looked for as written, past a scheme, with percent escapes decoded, and inside base64 tokens of those.
+ * is looked for as written, with percent escapes decoded, and inside base64 tokens of the value past its scheme.
  */
 function mentionsKurumi(text: string): boolean {
-  const views = escapeViews(text)
-  const decoded = views.flatMap(base64Views).flatMap(escapeViews)
-  return [...views, ...decoded].some((view) => /kurumi/iu.test(view))
+  const escaped = text.includes('%') ? [escapesDecoded(text), decodeQueryComponent(text)] : []
+  const body = text.replace(/^\w+\s+/, '')
+  return (
+    [text, ...escaped].some((view) => /kurumi/iu.test(view)) ||
+    [body, ...escaped].some((view) => base64Views(view).some((decoded) => /kurumi/iu.test(decoded)))
+  )
 }
 
 /** Once the word appears the result is never `none`, which would fall back to the default account. */
@@ -183,10 +180,9 @@ function selectorIn(
   values: readonly Written[],
   parse: (credential: string) => string | null,
 ): Selector {
-  const naming = values.filter(({ raw }) => mentionsKurumi(raw))
+  const naming = values.filter(({ scan }) => scan.some(mentionsKurumi))
   const [only] = values
-  if (!only) return { kind: 'none' }
-  if (naming.length === 0) return { kind: 'none' }
+  if (!only || naming.length === 0) return { kind: 'none' }
   const handle = values.length === 1 && !mentionsKurumi(only.around) ? parse(only.credential) : null
   return handle !== null && !mentionsKurumi(handle)
     ? { kind: 'handle', handle }
