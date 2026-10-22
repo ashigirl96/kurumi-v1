@@ -23,7 +23,6 @@ export default {
         }
       },
     },
-    // 理由の無い disable は、後から外してよいかを誰も判断できない。
     'disable-reason': {
       create(context) {
         return {

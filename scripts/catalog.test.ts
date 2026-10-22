@@ -40,7 +40,7 @@ test('root の catalog は版を ^ も ~ も付けずに固定する', () => {
   const { workspaces } = readManifest('package.json') as RootManifest
 
   const ranged = Object.entries(workspaces.catalog).filter(
-    ([, version]) => !/^\d+\.\d+\.\d+/.test(version),
+    ([, version]) => !/^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/.test(version),
   )
 
   expect(Object.keys(workspaces.catalog).length).toBeGreaterThan(0)

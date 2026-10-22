@@ -44,6 +44,7 @@ test('another package cannot import a module that its package does not export', 
   const specifiers = internal.flatMap(({ domain, module }) => [
     `@kurumi/${domain}/${module}`,
     `@kurumi/${domain}/src/${module}.ts`,
+    `../../${domain}/src/${module}.ts`,
   ])
 
   const refused = await refusedSpecifiers(specifiers)
