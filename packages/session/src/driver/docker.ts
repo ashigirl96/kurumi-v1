@@ -88,7 +88,9 @@ export function createDockerDriver(options: {
   if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
     throw error('timeoutMs must be a positive integer no greater than 2147483647')
   }
-  let owned: { name: string; kind: 'uncertain' | 'confirmed' | 'absent' } | undefined
+  let owned:
+    | { name: string; kind: 'uncertain' | 'confirmed' | 'absent'; create: CliProcess | undefined }
+    | undefined
   let active = false
 
   function normalize(operation: string, cause: unknown): Error {
@@ -117,25 +119,27 @@ export function createDockerDriver(options: {
 
   async function run(args: readonly string[]): Promise<string> {
     const operation = args[0] ?? 'command'
+    const container = operation === 'create' ? owned : undefined
     try {
-      const exit = await cli.start(args).result
-      if (operation === 'create' && owned) {
-        if (exit.code === 0) owned.kind = 'confirmed'
+      const proc = cli.start(args)
+      if (container) container.create = proc
+      const exit = await proc.result
+      if (container) {
+        if (exit.code === 0) container.kind = 'confirmed'
         else if (/^(?:Error response from daemon: )?No such image: [^\r\n]+\s*$/.test(exit.stderr))
-          owned.kind = 'absent'
+          container.kind = 'absent'
       }
       return output(exit, operation)
     } catch (cause) {
       if (
-        operation === 'create' &&
-        owned &&
+        container &&
         cause instanceof Error &&
         'code' in cause &&
         typeof cause.code === 'string' &&
         'syscall' in cause &&
         cause.syscall === 'spawn docker'
       )
-        owned.kind = 'absent'
+        container.kind = 'absent'
       if (cause instanceof Error && cause.message.startsWith(`Docker (${options.image}):`))
         throw cause
       throw normalize(operation, cause)
@@ -188,10 +192,11 @@ export function createDockerDriver(options: {
       active = true
       let name: string | undefined
       let attach: CliProcess | undefined
-      const aborted = Promise.withResolvers<never>()
+      let aborted: ReturnType<typeof Promise.withResolvers<never>> | undefined
       const abort = () => {
+        owned?.create?.kill()
         attach?.kill()
-        aborted.reject(error('probe aborted'))
+        aborted?.reject(error('probe aborted'))
       }
       let body = ''
       let failure: Error | undefined
@@ -199,7 +204,8 @@ export function createDockerDriver(options: {
         await cleanup()
         if (signal?.aborted) throw error('probe aborted')
         name = `kurumi-probe-${randomUUID()}`
-        owned = { name, kind: 'uncertain' }
+        owned = { name, kind: 'uncertain', create: undefined }
+        signal?.addEventListener('abort', abort, { once: true })
         await run([
           'create',
           '--rm',
@@ -230,8 +236,8 @@ export function createDockerDriver(options: {
           throw normalize('start', cause)
         }
         const attached = result(attach, 'start')
+        aborted = Promise.withResolvers<never>()
         const raced = Promise.race([attached, aborted.promise])
-        signal?.addEventListener('abort', abort, { once: true })
         if (signal?.aborted) abort()
         body = await raced
       } catch (cause) {
