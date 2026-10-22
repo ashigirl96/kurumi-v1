@@ -296,7 +296,13 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 
 ## Implementation reconciliation
 
-（実装中に記入する）
+- P01 `catalog.ts`: default の `selectorShape` は handle を `encodeURI` で percent-encode して `kurumi:` を付け、`parse` が戻す。HTTP の header の値は Latin1 の範囲しか持てず、日本語の label を生のまま載せると Bun の `Headers` が投げ、curl で送ると server に文字化けで届くため。ASCII の handle は設計の `kurumi:<vendor>/<label>` のまま。
+- P01 `catalog.ts`: anthropic の `selectorShape.parse` は、`sk-ant-kurumi-` の後ろが base64url の文字だけのときに限って handle を返す。壊れた値を handle として読まず `none` にする。
+- P01 `catalog.ts`: `HostRule.host` は完全一致だけにし、`*.example.com` は持たない。使う service が無く、`interceptedHosts()` の集合に載せられないため。
+- P01 `catalog.ts`: Gmail は `www.googleapis.com` の `/upload/gmail/` と `/batch/gmail/`、Calendar は `/batch/calendar/` も `pathPrefix` に持つ。discovery document の `mediaUpload` と `batchPath` の path が service の path の外にあるため。
+- P01 `catalog.ts`: `serviceFor` は照合の前に、query を除き、`.` と `..` の segment を畳み、unreserved 文字の `%XX` を戻す。`/gmail/../calendar/` を Gmail と取り違えると、両方の scope を持つ token が Calendar に使われるため。`%2F` のような unreserved でない escape は戻さず、どの prefix にも合わず null になる。
+- P01 `catalog.ts`: 照合を `createServiceFinder` に切り出して export した。長い `pathPrefix` が先に合うことを、catalog に無い重なりで test するため。`defineCatalog` は `as const satisfies` に置き換えた。`OAuthSpec.identify`、`ServiceSpec.summarize`、`ApprovalSummary` は P02 と P18 で足すので、この PR の型に無い。
+- P01 `select.ts`: `accountHandle(vendor, label)` を足した。`AccountHandle` の brand を付ける場所を 1 か所にするため。
 
 ## ユーザーが決めたこと（2026-10-22）
 
