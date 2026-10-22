@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from 'bun:test'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 
 import { cleanUpLintProbes, lintProbes } from './lint-probes'
@@ -10,15 +11,20 @@ const repo = join(import.meta.dir, '../..')
 
 const entryNames = ['schema', 'contract', 'server', 'ui', 'cli', 'testing']
 
-function internalModules(): { domain: string; module: string }[] {
+function internalModules(root = repo): { domain: string; module: string }[] {
   const found: { domain: string; module: string }[] = []
-  for (const manifest of new Bun.Glob('packages/*/package.json').scanSync({ cwd: repo })) {
+  for (const manifest of new Bun.Glob('packages/*/package.json').scanSync({ cwd: root })) {
     const domain = manifest.split('/')[1]!
-    const { exports } = JSON.parse(readFileSync(join(repo, manifest), 'utf8')) as {
-      exports: Record<string, string>
+    const { exports } = JSON.parse(readFileSync(join(root, manifest), 'utf8')) as {
+      exports?: Record<string, string>
+    }
+    if (!exports) {
+      throw new Error(
+        `${manifest} has no "exports" field. Declare it, as {} for a package with no entry yet.`,
+      )
     }
     const exported = new Set(Object.values(exports).map((target) => basename(target)))
-    for (const file of new Bun.Glob('src/*.ts').scanSync({ cwd: join(repo, 'packages', domain) })) {
+    for (const file of new Bun.Glob('src/*.ts').scanSync({ cwd: join(root, 'packages', domain) })) {
       const name = basename(file)
       if (name.endsWith('.test.ts') || exported.has(name)) continue
       found.push({ domain, module: name.replace(/\.ts$/, '') })
@@ -204,5 +210,22 @@ describe('an override that sets no-restricted-imports', () => {
     const entry = [severity, { ...options, patterns: [...options.patterns, extra] }]
 
     expect(overridesDroppingBoundary(withOverride({ 'no-restricted-imports': entry }))).toEqual([])
+  })
+})
+
+describe('a package that does not declare exports', () => {
+  const roots: string[] = []
+  afterAll(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true })
+  })
+
+  test('is named in the failure instead of crashing the probe', () => {
+    const root = mkdtempSync(join(tmpdir(), 'kurumi-exports-'))
+    roots.push(root)
+    mkdirSync(join(root, 'packages/bare/src'), { recursive: true })
+    writeFileSync(join(root, 'packages/bare/package.json'), '{ "name": "@kurumi/bare" }')
+    writeFileSync(join(root, 'packages/bare/src/inner.ts'), 'export {}\n')
+
+    expect(() => internalModules(root)).toThrow('packages/bare/package.json')
   })
 })
