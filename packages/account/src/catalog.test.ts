@@ -171,6 +171,57 @@ describe('serviceFor', () => {
     )
   })
 
+  describe('a host that only one service uses', () => {
+    const inDoubt = [
+      '/repos/o/r/branches/feature%2Fx',
+      '/repos/o/r/contents/.github%2Fworkflows%2Fci.yml',
+      '/repos/o/r/git/ref/heads%2Ffeature%2Fx',
+      '/a/../b',
+      '/a/%2e%2e/b',
+      '/a%5Cb',
+      '/a\\b',
+      '/a;b=1',
+      '/',
+      '',
+    ]
+    const singleServiceHosts = allServices.flatMap(({ vendor, id, service }) =>
+      service.hosts
+        .filter(
+          ({ host, pathPrefix }) =>
+            pathPrefix === undefined &&
+            allServices.every(
+              (other) => other.id === id || other.service.hosts.every((rule) => rule.host !== host),
+            ),
+        )
+        .map(({ host }) => [host, vendor, id] as const),
+    )
+
+    test('the catalog has such hosts', () => {
+      expect(singleServiceHosts.map(([host]) => host)).toEqual(
+        expect.arrayContaining([
+          'api.github.com',
+          'github.com',
+          'api.notion.com',
+          'api.anthropic.com',
+          'gmail.googleapis.com',
+        ]),
+      )
+    })
+
+    test.each(singleServiceHosts)(
+      '%s routes to its service whatever the path',
+      (host, vendor, id) => {
+        for (const path of inDoubt) {
+          expect(serviceFor(host, path)).toEqual({ vendor, service: id } as never)
+        }
+      },
+    )
+
+    test('a host shared by two services still refuses a path in doubt', () => {
+      expect(serviceFor('www.googleapis.com', '/gmail/v1/users/me/messages%2Fx')).toBeNull()
+    })
+  })
+
   test('a host with a port is not a hostname and belongs to no service', () => {
     expect(serviceFor('www.googleapis.com:443', '/gmail/v1/x')).toBeNull()
   })
@@ -191,6 +242,24 @@ describe('serviceFor', () => {
         expect(find('h.example', '/z')?.service).toBe('rest')
         expect(find('other.example', '/a/b/c')).toBeNull()
       }
+    })
+
+    test('a host with one service and no prefix takes every path, a prefixed one only its own', () => {
+      const find = createServiceFinder([
+        { vendor: 'v', service: 'whole', hosts: [{ host: 'whole.example' }] },
+        { vendor: 'v', service: 'part', hosts: [{ host: 'part.example', pathPrefix: '/p/' }] },
+        {
+          vendor: 'v',
+          service: 'both',
+          hosts: [{ host: 'both.example' }, { host: 'both.example', pathPrefix: '/p/' }],
+        },
+      ])
+
+      expect(find('whole.example', '/x%2Fy/../z')?.service).toBe('whole')
+      expect(find('both.example', '/x%2Fy/../z')?.service).toBe('both')
+      expect(find('part.example', '/p/x')?.service).toBe('part')
+      expect(find('part.example', '/p/x%2Fy')).toBeNull()
+      expect(find('part.example', '/other')).toBeNull()
     })
   })
 })

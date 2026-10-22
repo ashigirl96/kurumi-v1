@@ -225,10 +225,24 @@ export const normalizeHost = (host: string): string => host.toLowerCase().replac
 
 type Located<V extends string, S extends string> = Readonly<{ vendor: V; service: S }>
 
+type PrefixRule<V extends string, S extends string> = { prefix: string; located: Located<V, S> }
+
+/** The service a host belongs to as a whole, when no other service shares it. */
+function wholeHostService<V extends string, S extends string>(
+  rules: readonly PrefixRule<V, S>[],
+): Located<V, S> | null {
+  const whole = rules.find(({ prefix }) => prefix === '')?.located
+  if (!whole) return null
+  const alone = rules.every(
+    ({ located }) => located.vendor === whole.vendor && located.service === whole.service,
+  )
+  return alone ? whole : null
+}
+
 export function createServiceFinder<V extends string, S extends string>(
   entries: readonly { vendor: V; service: S; hosts: readonly HostRule[] }[],
 ): (host: string, path: string) => Located<V, S> | null {
-  const rulesByHost = new Map<string, { prefix: string; located: Located<V, S> }[]>()
+  const rulesByHost = new Map<string, PrefixRule<V, S>[]>()
   for (const { vendor, service, hosts } of entries) {
     for (const { host, pathPrefix } of hosts) {
       const rules = rulesByHost.get(host) ?? []
@@ -236,14 +250,19 @@ export function createServiceFinder<V extends string, S extends string>(
       rulesByHost.set(host, rules)
     }
   }
-  for (const rules of rulesByHost.values()) rules.sort((a, b) => b.prefix.length - a.prefix.length)
+  const routesByHost = new Map<string, { rules: PrefixRule<V, S>[]; whole: Located<V, S> | null }>()
+  for (const [host, rules] of rulesByHost) {
+    rules.sort((a, b) => b.prefix.length - a.prefix.length)
+    routesByHost.set(host, { rules, whole: wholeHostService(rules) })
+  }
 
   return (host, path) => {
-    const rules = rulesByHost.get(normalizeHost(host))
-    if (!rules) return null
+    const routes = routesByHost.get(normalizeHost(host))
+    if (!routes) return null
+    if (routes.whole) return routes.whole
     const routed = routablePath(path)
     if (routed === null) return null
-    return rules.find(({ prefix }) => routed.startsWith(prefix))?.located ?? null
+    return routes.rules.find(({ prefix }) => routed.startsWith(prefix))?.located ?? null
   }
 }
 
