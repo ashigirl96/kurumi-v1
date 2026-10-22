@@ -102,15 +102,15 @@ function takeQueryParam(url: URL, param: string): string[] {
   return values
 }
 
-function takeHeader(headers: Headers, name: string): string[] {
+function takeHeader(headers: Headers, name: string): string | null {
   const value = headers.get(name)
   headers.delete(name)
-  return value === null ? [] : [value.trim()]
+  return value?.trim() ?? null
 }
 
 /** `Bearer` and `token` carry the secret itself, `Basic` carries it as the password. */
-function secretOfAuthorization(authorization: string): string | null {
-  const [, scheme = '', value = ''] = /^(\w+)\s+(.+)$/.exec(authorization) ?? []
+function secretOfAuthorization(authorization: string | null): string | null {
+  const [, scheme = '', value = ''] = /^(\w+)\s+(.+)$/.exec(authorization ?? '') ?? []
   switch (scheme.toLowerCase()) {
     case 'bearer':
     case 'token':
@@ -125,16 +125,15 @@ function secretOfAuthorization(authorization: string): string | null {
   }
 }
 
+const present = (value: string | null): string[] => (value === null ? [] : [value])
+
 function takeCredentials(slot: CredentialSlot, headers: Headers, url: URL): string[] {
   switch (slot.kind) {
     case 'bearer':
     case 'basic':
-      return takeHeader(headers, 'authorization').flatMap((authorization) => {
-        const secret = secretOfAuthorization(authorization)
-        return secret === null ? [] : [secret]
-      })
+      return present(secretOfAuthorization(takeHeader(headers, 'authorization')))
     case 'header':
-      return takeHeader(headers, slot.header)
+      return present(takeHeader(headers, slot.header))
     case 'query':
       return takeQueryParam(url, slot.param)
   }
