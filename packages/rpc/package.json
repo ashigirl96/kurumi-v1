@@ -1,0 +1,11 @@
+{
+  "name": "@kurumi/rpc",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./server": "./src/server.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "catalog:"
+  }
+}
