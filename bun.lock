@@ -12,6 +12,14 @@
         "typescript": "catalog:",
       },
     },
+    "apps/host": {
+      "name": "@kurumi/host",
+      "dependencies": {
+        "@kurumi/account": "workspace:*",
+        "@kurumi/agent": "workspace:*",
+        "drizzle-orm": "catalog:",
+      },
+    },
     "packages/account": {
       "name": "@kurumi/account",
       "dependencies": {
@@ -110,6 +118,8 @@
     "@kurumi/account": ["@kurumi/account@workspace:packages/account"],
 
     "@kurumi/agent": ["@kurumi/agent@workspace:packages/agent"],
+
+    "@kurumi/host": ["@kurumi/host@workspace:apps/host"],
 
     "@kurumi/rpc": ["@kurumi/rpc@workspace:packages/rpc"],
 
