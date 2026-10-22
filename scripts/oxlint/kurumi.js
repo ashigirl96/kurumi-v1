@@ -1,11 +1,11 @@
 // oxlint は node で動き、node の版によっては TS の plugin を読めないので JS で書く。
 
-import { dirname, resolve } from 'node:path'
+import { dirname, relative, resolve } from 'node:path'
 
 const TESTING_ENTRY = /^@kurumi\/[^/]+\/testing$/
-const PACKAGE_DIR = /.*\/((?:packages|apps)\/[^/]+)\//
+const PACKAGE_DIR = /^((?:packages|apps)\/[^/]+)\//
 
-const packageOf = (path) => PACKAGE_DIR.exec(`${path}/`)?.[1] ?? null
+const packageOf = (path, root) => PACKAGE_DIR.exec(`${relative(root, path)}/`)?.[1] ?? null
 
 export default {
   meta: { name: 'kurumi' },
@@ -30,11 +30,11 @@ export default {
     },
     'no-relative-package-import': {
       create(context) {
-        const ownPackage = packageOf(context.filename)
-        const check = (node) => {
-          const specifier = node.source?.value
+        const root = context.cwd
+        const ownPackage = packageOf(context.filename, root)
+        const check = (node, specifier) => {
           if (typeof specifier !== 'string' || !specifier.startsWith('.')) return
-          const target = packageOf(resolve(dirname(context.filename), specifier))
+          const target = packageOf(resolve(dirname(context.filename), specifier), root)
           if (target === null || target === ownPackage) return
           context.report({
             node,
@@ -42,11 +42,15 @@ export default {
               '相対 path で他の package の file を import しない。entry は @kurumi/<package>/<entry> で import する（docs/design/module-map.md）',
           })
         }
+        const checkSource = (node) => check(node, node.source?.value)
         return {
-          ImportDeclaration: check,
-          ExportNamedDeclaration: check,
-          ExportAllDeclaration: check,
-          ImportExpression: check,
+          ImportDeclaration: checkSource,
+          ExportNamedDeclaration: checkSource,
+          ExportAllDeclaration: checkSource,
+          ImportExpression: checkSource,
+          Literal: (node) => {
+            if (node.parent?.type === 'TSImportType') check(node, node.value)
+          },
         }
       },
     },

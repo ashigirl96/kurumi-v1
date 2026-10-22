@@ -101,6 +101,7 @@ describe('a relative import that leaves its package', () => {
       'packages/probe/src/to-app.ts': '../../../apps/probe/src/main.ts',
       'apps/probe/src/main.ts': `../../../packages/${account}`,
       'tools/main.ts': `../packages/${account}`,
+      'packages/a/src/apps/foo/x.ts': '../../../../b/src/apps/foo/y.ts',
     })
 
     const refused = await refusedFiles(files)
@@ -115,6 +116,7 @@ describe('a relative import that leaves its package', () => {
       'packages/probe/src/a/b/export.ts': `export * from '${specifier}'\n`,
       'packages/probe/src/a/b/named.ts': `export { catalog } from '${specifier}'\n`,
       'packages/probe/src/a/b/dynamic.ts': `export const load = () => import('${specifier}')\n`,
+      'packages/probe/src/a/b/type.ts': `export type Rule = import('${specifier}').HostRule\n`,
     }
 
     const refused = await refusedFiles(files)
@@ -131,6 +133,8 @@ describe('a relative import that leaves its package', () => {
       'packages/probe/src/a/b/to-manifest.ts': '../../../package.json',
       'packages/probe/drizzle.config.ts': './src/schema.ts',
       'tools/main.ts': './other.ts',
+      'packages/probe/src/apps/foo/x.ts': '../../lib.ts',
+      'packages/probe/src/packages/util.ts': '../main.ts',
     })
 
     const refused = await refusedFiles(files)
