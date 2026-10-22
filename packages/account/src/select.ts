@@ -56,14 +56,10 @@ export function selectAccount(
   candidates: readonly GrantedCandidate[],
   selector: Selector,
 ): Selection {
+  const granted = () => candidates.map(({ handle }) => handle)
   const notGranted = (named: string): Selection => ({
     ok: false,
-    refusal: {
-      code: 'account_not_granted',
-      service,
-      named,
-      granted: candidates.map(({ handle }) => handle),
-    },
+    refusal: { code: 'account_not_granted', service, named, granted: granted() },
   })
 
   if (selector.kind === 'unreadable') return notGranted(selector.written)
@@ -80,14 +76,7 @@ export function selectAccount(
   const defaults = candidates.filter(({ isDefault }) => isDefault)
   const [preferred] = defaults
   if (preferred && defaults.length === 1) return use(service, preferred, 'default')
-  return {
-    ok: false,
-    refusal: {
-      code: 'account_ambiguous',
-      service,
-      granted: candidates.map(({ handle }) => handle),
-    },
-  }
+  return { ok: false, refusal: { code: 'account_ambiguous', service, granted: granted() } }
 }
 
 const decodeQueryComponent = (value: string): string => {
@@ -190,7 +179,10 @@ function parseAsWrittenThenDecoded(shape: SelectorShape, value: string): string 
   return shape.parse(first) ?? shape.parse(second)
 }
 
-/** Reads the handle the agent wrote where the real credential would go, and returns the request with that slot emptied whether or not it held a selector. */
+/**
+ * Reads the handle the agent wrote where the real credential would go, and returns the request with that slot
+ * emptied whether or not it held a selector.
+ */
 export function readSelector(
   shape: SelectorShape,
   slot: CredentialSlot,
