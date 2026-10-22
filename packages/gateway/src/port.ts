@@ -60,6 +60,7 @@ function rejectConnect(socket: Duplex, status: 400 | 407 | 502): void {
   const challenge = status === 407 ? 'Proxy-Authenticate: Basic realm="kurumi"\r\n' : ''
   socket.end(
     `HTTP/1.1 ${status} ${reason}\r\n${challenge}Connection: close\r\nContent-Length: 0\r\n\r\n`,
+    () => socket.destroy(),
   )
 }
 

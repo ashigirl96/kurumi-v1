@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { once } from 'node:events'
 import { request } from 'node:http'
+import { connect } from 'node:net'
 
 import { createCertificateAuthority } from './ca.ts'
 import { startAgentPort } from './port.ts'
@@ -55,6 +56,30 @@ test.each([undefined, 'wrong-token'])(
     expect(upstream.requests).toHaveLength(0)
   },
 )
+
+test('a rejected CONNECT releases a peer that keeps its write half open', async () => {
+  const { gateway } = await setup()
+  const client = connect({ host: '127.0.0.1', port: gateway.port, allowHalfOpen: true })
+  client.on('error', () => client.destroy())
+  stops.push(() => {
+    client.destroy()
+  })
+  let response = ''
+  client.on('data', (chunk: Buffer) => {
+    response += chunk.toString()
+  })
+  await once(client, 'connect')
+  const ended = once(client, 'end')
+  client.write('CONNECT fake.test:443 HTTP/1.1\r\nHost: fake.test\r\n\r\n')
+  await ended
+  expect(response).toContain('407 Proxy Authentication Required')
+  const closed = new Promise<void>((resolve) => {
+    client.once('close', () => resolve())
+  })
+  client.write('still writing after rejection')
+  await closed
+  expect(client.destroyed).toBe(true)
+})
 
 test('one MITM tunnel injects both keep-alive requests', async () => {
   const { upstream, gateway } = await setup()

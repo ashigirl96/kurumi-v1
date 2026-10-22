@@ -92,12 +92,18 @@ export async function forward<Principal>(
     ...target,
     method: req.method ?? 'GET',
     path,
-    headers: requestHeaders(req),
+    headers: withoutHopHeaders(requestHeaders(req)),
     rawHeaders: [...req.rawHeaders],
   })
   if (context.signal.aborted || res.destroyed) return
   const headers = withoutHopHeaders(injection.headers)
   headers.set('host', authority(target))
+  headers.delete('content-length')
+  if (req.headers['transfer-encoding'] !== undefined) {
+    headers.set('transfer-encoding', req.headers['transfer-encoding'])
+  } else if (req.headers['content-length'] !== undefined) {
+    headers.set('content-length', req.headers['content-length'])
+  }
   const destination = deps.upstream?.host === target.host ? deps.upstream : undefined
   const body = new PassThrough()
   const upstream = request({

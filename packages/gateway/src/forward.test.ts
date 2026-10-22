@@ -28,33 +28,85 @@ async function setup(options: Parameters<typeof startFakeUpstream>[0] = {}) {
   return { upstream, gateway, tunnel }
 }
 
-test('the first upload chunk arrives before the client finishes its body', async () => {
-  const received = Promise.withResolvers<void>()
-  const { tunnel } = await setup({ onUploadChunk: () => received.resolve() })
-  const response = Promise.withResolvers<string>()
-  const client = request(
-    { hostname: 'fake.test', port: 443, path: '/upload', method: 'POST', agent: tunnel.agent },
-    (res) => {
-      const chunks: Buffer[] = []
-      res.on('data', (chunk: Buffer) => chunks.push(chunk))
-      res.on('error', response.reject)
-      res.on('end', () => response.resolve(Buffer.concat(chunks).toString()))
-    },
-  )
-  client.on('error', response.reject)
-  stops.push(() => {
-    client.destroy()
+test.each(['POST', 'DELETE'])(
+  'the first %s upload chunk arrives before the client finishes its body',
+  async (method) => {
+    const received = Promise.withResolvers<void>()
+    const { tunnel } = await setup({ onUploadChunk: () => received.resolve() })
+    const response = Promise.withResolvers<string>()
+    const client = request(
+      {
+        hostname: 'fake.test',
+        port: 443,
+        path: '/upload',
+        method,
+        agent: tunnel.agent,
+        headers: { 'transfer-encoding': 'chunked' },
+      },
+      (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (chunk: Buffer) => chunks.push(chunk))
+        res.on('error', response.reject)
+        res.on('end', () => response.resolve(Buffer.concat(chunks).toString()))
+      },
+    )
+    client.on('error', response.reject)
+    stops.push(() => {
+      client.destroy()
+    })
+    const first = Buffer.alloc(64 * 1024, 97)
+    client.write(first)
+    await received.promise
+    expect(client.writableEnded).toBe(false)
+    client.end('last')
+    const body: unknown = JSON.parse(await response.promise)
+    expect(body).toEqual({
+      bytes: first.length + 4,
+      sha256: createHash('sha256').update(first).update('last').digest('hex'),
+    })
+  },
+)
+
+test.each(['GET', 'DELETE', 'OPTIONS'])(
+  'a chunked %s body retains its bytes and digest',
+  async (method) => {
+    const { tunnel } = await setup()
+    const response = await sendTestRequest(tunnel, {
+      path: '/upload',
+      method,
+      headers: { 'transfer-encoding': 'chunked' },
+      body: 'helloworld',
+    })
+    expect(response.status).toBe(200)
+    expect(JSON.parse(response.body)).toEqual({
+      bytes: 10,
+      sha256: '936a185caaa266bb9cbe981e9e05cb78cd732b0b3280eb944412bb6f8f8f07af',
+    })
+  },
+)
+
+test('body framing survives a client Connection nomination', async () => {
+  const { tunnel } = await setup()
+  const response = await sendTestRequest(tunnel, {
+    path: '/upload',
+    method: 'DELETE',
+    headers: { 'content-length': '10', connection: 'content-length' },
+    body: 'helloworld',
   })
-  const first = Buffer.alloc(64 * 1024, 97)
-  client.write(first)
-  await received.promise
-  expect(client.writableEnded).toBe(false)
-  client.end('last')
-  const body: unknown = JSON.parse(await response.promise)
-  expect(body).toEqual({
-    bytes: first.length + 4,
-    sha256: createHash('sha256').update(first).update('last').digest('hex'),
+  expect(JSON.parse(response.body)).toEqual({
+    bytes: 10,
+    sha256: '936a185caaa266bb9cbe981e9e05cb78cd732b0b3280eb944412bb6f8f8f07af',
   })
+})
+
+test('a client cannot nominate a gateway-injected header for removal', async () => {
+  const { upstream, tunnel } = await setup()
+  const response = await sendTestRequest(tunnel, {
+    path: '/echo',
+    headers: { connection: 'x-injected', 'x-injected': 'client-value' },
+  })
+  expect(response.status).toBe(200)
+  expect(upstream.requests[0]?.headers['x-injected']).toBe('yes')
 })
 
 test('a redirect and its body pass through without a second upstream request', async () => {
