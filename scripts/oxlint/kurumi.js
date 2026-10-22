@@ -30,11 +30,8 @@ function packageOf(path, root) {
 
 function isRequire(callee) {
   if (callee.type === 'Identifier') return callee.name === 'require'
-  return (
-    callee.type === 'MemberExpression' &&
-    callee.object.type === 'MetaProperty' &&
-    callee.property.name === 'require'
-  )
+  if (callee.type !== 'MemberExpression' || callee.object.type !== 'MetaProperty') return false
+  return (callee.computed ? callee.property.value : callee.property.name) === 'require'
 }
 
 function specifierOf(node) {

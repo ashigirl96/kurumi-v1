@@ -131,6 +131,7 @@ describe('a relative import that leaves its package', () => {
       'packages/probe/src/a/b/require.ts': `export const m = require('${deep}')\n`,
       'packages/probe/src/a/b/require-template.ts': `export const m = require(\`${deep}\`)\n`,
       'packages/probe/src/a/b/import-meta-require.ts': `export const m = import.meta.require('${deep}')\n`,
+      'packages/probe/src/a/b/import-meta-computed.ts': `export const m = import.meta['require']('${deep}')\n`,
       'packages/probe/src/a/b/equals.ts': `import m = require('${deep}')\nexport const used = m\n`,
     },
     outside: importing({
