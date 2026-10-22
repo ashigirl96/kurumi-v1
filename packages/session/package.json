@@ -1,0 +1,8 @@
+{
+  "name": "@kurumi/session",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./server": "./src/server.ts"
+  }
+}
