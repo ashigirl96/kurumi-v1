@@ -186,6 +186,12 @@ function listenForCallback(port: number, state: string) {
   return { server, callback: callback.promise }
 }
 
+const refreshLabel = (index: number, revokeAccepted: boolean): string => {
+  const number = `refresh_token #${index + 1}`
+  if (!revokeAccepted) return number
+  return index === 0 ? `revoked ${number}` : `${number}, in the grant that the revoke of #1 ended`
+}
+
 async function revokeAndCheck(
   client: OAuthClient,
   obtained: readonly TokenResponse[],
@@ -202,18 +208,16 @@ async function revokeAndCheck(
     body: new URLSearchParams({ token: revokedToken }),
   })
   out(`revoke refresh_token #1: HTTP ${revoked.status}`)
-  let ok = revoked.status === 200
-  if (!ok) fail('Google did not accept the revoke of refresh_token #1.')
-  if (refreshTokens.length > 1) {
+  const accepted = revoked.status === 200
+  let ok = accepted
+  if (!accepted) fail('Google did not accept the revoke of refresh_token #1.')
+  if (accepted && refreshTokens.length > 1) {
     out(
       'Revoking one refresh token ends the whole grant, so the other refresh tokens of this run are checked by refreshing, not by revoking.',
     )
   }
   for (const [index, token] of refreshTokens.entries()) {
-    const label =
-      index === 0
-        ? 'revoked refresh_token #1'
-        : `refresh_token #${index + 1}, in the grant that the revoke of #1 ended`
+    const label = refreshLabel(index, accepted)
     const outcome = await attempt(refresh({ vendor: 'google', client, refreshToken: token }))
     if (
       !outcome.ok &&
