@@ -28,12 +28,9 @@ export type GrantResult = { ok: true } | { ok: false; refusal: GrantRefusal }
 export type SetDefaultResult = { ok: true } | { ok: false; refusal: 'grant_not_found' }
 
 export type AccountLedger = {
-  /** Idempotent. */
   grant(tx: Tx, input: GrantInput): GrantResult
-  /** Idempotent, and also drops the default that rested on this grant. */
   revoke(tx: Tx, input: GrantKey): void
   setDefault(tx: Tx, input: GrantKey): SetDefaultResult
-  /** Sorted by label. */
   candidates(agentGroupId: string, service: ServiceId): GrantedCandidate[]
 }
 
