@@ -304,7 +304,10 @@ describe('selectAccount invariants', () => {
   })
 })
 
-const request = (init: { headers?: Record<string, string>; url?: string }) => ({
+const request = (init: {
+  headers?: Record<string, string> | [string, string][]
+  url?: string
+}) => ({
   headers: new Headers(init.headers),
   url: new URL(init.url ?? 'https://www.googleapis.com/gmail/v1/users/me/messages'),
 })
@@ -446,6 +449,61 @@ describe('readSelector', () => {
 
       expect(selector).toEqual(none)
       expect(stripped.headers.has('x-api-key')).toBe(false)
+    })
+  })
+
+  describe('a header that is sent more than once', () => {
+    const bearer: CredentialSlot = { kind: 'bearer' }
+    const apiKey: CredentialSlot = { kind: 'header', header: 'x-api-key' }
+    const anthropic = selectorShapeOf('anthropic')
+    const key = (label: string) => anthropic.format(label)
+
+    test.each([
+      ['placeholder first', ['Bearer placeholder', 'Bearer kurumi:google/a@x.example']],
+      ['placeholder last', ['Bearer kurumi:google/a@x.example', 'Bearer placeholder']],
+      [
+        'the same selector twice',
+        ['Bearer kurumi:google/a@x.example', 'Bearer kurumi:google/a@x.example'],
+      ],
+    ])('bearer reads the selector, %s', (_where, values) => {
+      const { selector, stripped } = readSelector(
+        defaultSelectorShape,
+        bearer,
+        request({ headers: values.map((value) => ['authorization', value] as [string, string]) }),
+      )
+
+      expect(selector).toEqual(named('google/a@x.example'))
+      expect(stripped.headers.has('authorization')).toBe(false)
+    })
+
+    test('two different selectors conflict', () => {
+      const { selector } = readSelector(
+        anthropic,
+        apiKey,
+        request({
+          headers: [
+            ['x-api-key', key('anthropic/a')],
+            ['x-api-key', key('anthropic/b')],
+          ],
+        }),
+      )
+
+      expect(selector).toEqual({ kind: 'conflict', handles: ['anthropic/a', 'anthropic/b'] })
+    })
+
+    test('a placeholder after the selector does not become part of the handle', () => {
+      const { selector } = readSelector(
+        anthropic,
+        apiKey,
+        request({
+          headers: [
+            ['x-api-key', key('anthropic/a')],
+            ['x-api-key', 'sk-ant-placeholder'],
+          ],
+        }),
+      )
+
+      expect(selector).toEqual(named('anthropic/a'))
     })
   })
 
@@ -707,6 +765,24 @@ describe('readSelector', () => {
 
       expect(selector).toEqual(named(label))
       expect(stripped.url.href).toBe('https://h.example/x?alt=json&q=1')
+    })
+
+    test.each([
+      'google/a b',
+      'google/日本語',
+      'google/a%41b',
+      'github/a%2Fb',
+      'google/a+b@x.example',
+    ])('the selector %s survives an encoder that keeps the colon readable', (label) => {
+      const written = encodeURIComponent(defaultSelectorShape.format(label)).replaceAll('%3A', ':')
+
+      const { selector } = readSelector(
+        defaultSelectorShape,
+        { kind: 'query', param: 'key' },
+        request({ url: `https://h.example/x?key=${written}` }),
+      )
+
+      expect(selector).toEqual(named(label))
     })
 
     test('a pasted selector names the account it was formatted from, not a lookalike', () => {

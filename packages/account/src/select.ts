@@ -15,7 +15,7 @@ export type GrantedCandidate = {
 
 export type Selector =
   | { kind: 'handle'; handle: string }
-  | { kind: 'conflict'; handles: string[] }
+  | { kind: 'conflict'; handles: readonly [string, string, ...string[]] }
   | { kind: 'none' }
 
 export type Selection =
@@ -117,15 +117,16 @@ function takeQueryParam(url: URL, param: string): string[] {
   return values
 }
 
-function takeHeader(headers: Headers, name: string): string | null {
+/** A header sent twice reaches us as one value joined with commas, which no selector contains. */
+function takeHeader(headers: Headers, name: string): string[] {
   const value = headers.get(name)
   headers.delete(name)
-  return value?.trim() ?? null
+  return value === null ? [] : value.split(',').map((part) => part.trim())
 }
 
 /** `Bearer` and `token` carry the secret itself, `Basic` carries it as the password. */
-function secretOfAuthorization(authorization: string | null): string | null {
-  const [, scheme = '', value = ''] = /^(\w+)\s+(.+)$/.exec(authorization ?? '') ?? []
+function secretOfAuthorization(authorization: string): string | null {
+  const [, scheme = '', value = ''] = /^(\w+)\s+(.+)$/.exec(authorization) ?? []
   switch (scheme.toLowerCase()) {
     case 'bearer':
     case 'token':
@@ -140,30 +141,36 @@ function secretOfAuthorization(authorization: string | null): string | null {
   }
 }
 
-const present = (value: string | null): string[] => (value === null ? [] : [value])
-
 function takeCredentials(slot: CredentialSlot, headers: Headers, url: URL): string[] {
   switch (slot.kind) {
     case 'bearer':
     case 'basic':
-      return present(secretOfAuthorization(takeHeader(headers, 'authorization')))
+      return takeHeader(headers, 'authorization').flatMap((authorization) => {
+        const secret = secretOfAuthorization(authorization)
+        return secret === null ? [] : [secret]
+      })
     case 'header':
-      return present(takeHeader(headers, slot.header))
+      return takeHeader(headers, slot.header)
     case 'query':
       return takeQueryParam(url, slot.param)
   }
 }
 
+/**
+ * Every handle holds a `/`, which a component encoder writes as `%2F` and `format` never does. A value with `%2F`
+ * was encoded again and is decoded first. Any other value is the shape's own text, read as written.
+ */
 function parseAsWrittenThenDecoded(shape: SelectorShape, value: string): string | null {
-  return shape.parse(value) ?? shape.parse(decodeQueryComponent(value))
+  const decoded = decodeQueryComponent(value)
+  const [first, second] = /%2f/i.test(value) ? [decoded, value] : [value, decoded]
+  return shape.parse(first) ?? shape.parse(second)
 }
 
 function selectorOf(handles: readonly string[]): Selector {
-  const distinct = [...new Set(handles)]
-  const [only] = distinct
-  if (only === undefined) return { kind: 'none' }
-  if (distinct.length === 1) return { kind: 'handle', handle: only }
-  return { kind: 'conflict', handles: distinct }
+  const [first, second, ...rest] = [...new Set(handles)]
+  if (first === undefined) return { kind: 'none' }
+  if (second === undefined) return { kind: 'handle', handle: first }
+  return { kind: 'conflict', handles: [first, second, ...rest] }
 }
 
 /**
