@@ -13,7 +13,10 @@ export type GrantedCandidate = {
   status: 'active' | 'needs_reauth'
 }
 
-export type Selector = { kind: 'handle'; handle: string } | { kind: 'none' }
+export type Selector =
+  | { kind: 'handle'; handle: string }
+  | { kind: 'conflict'; handles: string[] }
+  | { kind: 'none' }
 
 export type Selection =
   | { ok: true; accountId: string; handle: AccountHandle; how: 'named' | 'only' | 'default' }
@@ -53,6 +56,18 @@ export function selectAccount(
   selector: Selector,
 ): Selection {
   const granted = () => candidates.map(({ handle }) => handle)
+
+  if (selector.kind === 'conflict') {
+    return {
+      ok: false,
+      refusal: {
+        code: 'account_not_granted',
+        service,
+        named: selector.handles.join(' | '),
+        granted: granted(),
+      },
+    }
+  }
 
   if (selector.kind === 'handle') {
     const match = candidates.find(({ handle }) => handle === selector.handle)
@@ -139,24 +154,16 @@ function takeCredentials(slot: CredentialSlot, headers: Headers, url: URL): stri
   }
 }
 
-/**
- * A value written in a query is either the shape's own text pasted as it is, or that text percent-encoded again
- * by a URL builder. Reading the pasted form first keeps a `%` the shape wrote from being decoded twice.
- */
-function parseQueryValue(shape: SelectorShape, value: string): string | null {
+function parseAsWrittenThenDecoded(shape: SelectorShape, value: string): string | null {
   return shape.parse(value) ?? shape.parse(decodeQueryComponent(value))
 }
 
-/**
- * Two selectors that disagree name a handle that cannot be granted, because a granted handle starts with a vendor
- * id and a slash. They are refused the way a malformed selector is, never settled by taking one of them.
- */
 function selectorOf(handles: readonly string[]): Selector {
   const distinct = [...new Set(handles)]
   const [only] = distinct
   if (only === undefined) return { kind: 'none' }
   if (distinct.length === 1) return { kind: 'handle', handle: only }
-  return { kind: 'handle', handle: `conflicting selectors: ${distinct.join(' | ')}` }
+  return { kind: 'conflict', handles: distinct }
 }
 
 /**
@@ -172,7 +179,7 @@ export function readSelector(
   const headers = new Headers(req.headers)
   const url = new URL(req.url)
   const parse = (value: string) =>
-    slot.kind === 'query' ? parseQueryValue(shape, value) : shape.parse(value)
+    slot.kind === 'query' ? parseAsWrittenThenDecoded(shape, value) : shape.parse(value)
   const handles = takeCredentials(slot, headers, url).flatMap((value) => parse(value) ?? [])
   return { selector: selectorOf(handles), stripped: { headers, url } }
 }

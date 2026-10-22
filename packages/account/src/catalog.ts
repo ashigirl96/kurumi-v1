@@ -227,7 +227,6 @@ type Located<V extends string, S extends string> = Readonly<{ vendor: V; service
 
 type PrefixRule<V extends string, S extends string> = { prefix: string; located: Located<V, S> }
 
-/** The service a host belongs to as a whole, when no other service shares it. */
 function wholeHostService<V extends string, S extends string>(
   rules: readonly PrefixRule<V, S>[],
 ): Located<V, S> | null {
