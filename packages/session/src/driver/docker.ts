@@ -151,7 +151,7 @@ export function createDockerDriver(options: {
     const { name, kind } = owned
     let removed = false
     let removing = false
-    let removalError: unknown
+    let removalError = 'removal unconfirmed'
     try {
       const exit = await cli.start(['rm', '--force', name]).result
       removing =
@@ -169,7 +169,7 @@ export function createDockerDriver(options: {
         removed = kind !== 'uncertain' || stdout.trim() === name
       }
     } catch (cause) {
-      removalError = cause
+      removalError = String(cause)
     }
     if (!removed) {
       try {
@@ -190,7 +190,7 @@ export function createDockerDriver(options: {
         }
       } catch (absenceError) {
         throw new CleanupError(
-          `Docker (${options.image}): cleanup of ${name} failed: ${String(removalError ?? 'removal unconfirmed')}; ${String(absenceError)}`,
+          `Docker (${options.image}): cleanup of ${name} failed: ${removalError}; ${String(absenceError)}`,
           { cause: absenceError },
         )
       }
