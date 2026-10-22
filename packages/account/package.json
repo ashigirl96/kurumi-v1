@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./schema": "./src/schema.ts"
+    "./schema": "./src/schema.ts",
+    "./server": "./src/server.ts",
+    "./testing": "./src/testing.ts"
   },
   "scripts": {
     "generate": "drizzle-kit generate"
