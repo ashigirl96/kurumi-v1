@@ -16,7 +16,7 @@ async function call(cli: FakeCli, index: number) {
   for (let turn = 0; turn < 30; turn++) {
     const result = cli.started[index]
     if (result) return result
-    await Promise.resolve()
+    await Bun.sleep(5)
   }
   throw new Error(`Docker call ${index} was never started: ${cli.joined().join('; ')}`)
 }
@@ -143,27 +143,32 @@ test('a signal aborted before probe allocates no container', async () => {
   expect(cli.started).toHaveLength(0)
 })
 
-test('abort during create waits for late creation before removal and never starts it', async () => {
-  const { cli, driver } = setup()
-  const abort = new AbortController()
-  let settled = false
-  const outcome = observe(driver.probe(url, { signal: abort.signal })).finally(() => {
-    settled = true
-  })
-  const create = await call(cli, 0)
-  abort.abort()
-  await Promise.resolve()
-  expect(create.proc.killed).toBe(false)
-  expect(cli.started).toHaveLength(1)
-  expect(settled).toBe(false)
-  create.proc.complete({ stdout: 'late-container' })
-  const removal = await call(cli, 1)
-  expect(removal.args[0]).toBe('rm')
-  expect(settled).toBe(false)
-  removal.proc.complete()
-  expect((await outcome).kind).toBe('failure')
-  expect(cli.started.map(({ args }) => args[0])).toEqual(['create', 'rm'])
-})
+test.each(['success', 'failure'])(
+  'abort kills create and joins its late %s before cleanup',
+  async (late) => {
+    const { cli, driver } = setup()
+    const abort = new AbortController()
+    let settled = false
+    const outcome = observe(driver.probe(url, { signal: abort.signal })).finally(() => {
+      settled = true
+    })
+    const create = await call(cli, 0)
+    abort.abort()
+    expect(create.proc.killed).toBe(true)
+    expect(settled).toBe(false)
+    expect(cli.started).toHaveLength(1)
+    if (late === 'success') create.proc.complete({ stdout: 'late-container' })
+    else create.proc.fail(new Error('late create failure'))
+    const removal = await call(cli, 1)
+    expect(removal.args[0]).toBe('rm')
+    expect(settled).toBe(false)
+    removal.proc.complete({ code: 1, stderr: 'No such container' })
+    const failed = await outcome
+    expect(failed.kind).toBe('failure')
+    if (failed.kind === 'failure') expect(failed.error).not.toHaveProperty('cleanupFailed')
+    expect(cli.started.map(({ args }) => args[0])).toEqual(['create', 'rm'])
+  },
+)
 
 test('abort during attach removes the container and joins the killed child before rejecting', async () => {
   const { cli, driver } = setup()
@@ -201,12 +206,12 @@ test('cleanup is a barrier for success and overlapping probes are rejected', asy
   expect(await outcome).toBe('fresh-nonce')
 })
 
-test('an auto-removed container is absent only after a successful exact-name query', async () => {
+test('an auto-removed container is absent after a successful exact-name query', async () => {
   const { cli, driver } = setup()
   cli.responses.push(
     { match: /^create /, result: {} },
     { match: /^start /, result: { stdout: 'fresh-nonce' } },
-    { match: /^rm /, result: { code: 1, stderr: 'No such container' } },
+    { match: /^rm /, result: { code: 1, stderr: 'container removal failed' } },
     { match: /^ps /, result: { stdout: '' } },
   )
   expect(await driver.probe(url)).toBe('fresh-nonce')
@@ -273,21 +278,58 @@ test('an ambiguous create error and Docker outage retain the same owned name', a
   expect(cli.started.filter(({ args }) => args[0] === 'create')).toHaveLength(1)
 })
 
-test.each(['empty removal', 'empty query', 'different removal name'])(
-  'an ambiguous create retains ownership after %s until positive deletion',
+test.each(['no such container', 'empty query', 'empty removal', 'different removal name'])(
+  'failed create cleanup confirms absence through %s without retaining a cleanup failure',
+  async (absence) => {
+    const { cli, driver } = setup()
+    const outcome = observe(driver.probe(url))
+    const create = await call(cli, 0)
+    const name = create.args[create.args.indexOf('--name') + 1]
+    create.proc.complete({ code: 1, stderr: 'Cannot connect to Docker' })
+    if (absence === 'no such container') cli.responses.push({ match: /^ps /, result: {} })
+    ;(await call(cli, 1)).proc.complete({
+      code: absence === 'no such container' || absence === 'empty query' ? 1 : 0,
+      stderr: absence === 'no such container' ? `No such container: ${name}` : '',
+      stdout: absence === 'different removal name' ? 'other-container\n' : '',
+    })
+    if (absence !== 'no such container') (await call(cli, 2)).proc.complete()
+    const failed = await outcome
+    expect(failed.kind).toBe('failure')
+    if (failed.kind === 'failure') expect(failed.error).not.toHaveProperty('cleanupFailed')
+  },
+)
+
+test('empty removal cannot release an uncertain name while Docker cannot confirm absence', async () => {
+  const { cli, driver } = setup()
+  const outcome = observe(driver.probe(url))
+  ;(await call(cli, 0)).proc.complete({ code: 1, stderr: 'Cannot connect to Docker' })
+  const removal = await call(cli, 1)
+  removal.proc.complete()
+  ;(await call(cli, 2)).proc.complete({ code: 1, stderr: 'Cannot connect to Docker' })
+  const failed = await outcome
+  if (failed.kind !== 'failure') throw new Error('probe unexpectedly succeeded')
+  expect(failed.error).toHaveProperty('cleanupFailed', true)
+  const retry = observe(driver.probe(url))
+  const retriedRemoval = await call(cli, 3)
+  expect(retriedRemoval.args).toEqual(removal.args)
+  retriedRemoval.proc.complete({ code: 1, stderr: 'Cannot connect to Docker' })
+  ;(await call(cli, 4)).proc.complete({ code: 1, stderr: 'Cannot connect to Docker' })
+  expect((await retry).kind).toBe('failure')
+  expect(cli.started.filter(({ args }) => args[0] === 'create')).toHaveLength(1)
+})
+
+test.each(['no such container', 'empty query', 'empty removal', 'different removal name'])(
+  'Docker recovery confirms uncertain name absence through %s and permits a fresh probe',
   async (absence) => {
     const { cli, driver } = setup()
     const first = observe(driver.probe(url))
     const create = await call(cli, 0)
     const name = create.args[create.args.indexOf('--name') + 1]
     if (!name) throw new Error('probe has no container name')
-    create.proc.complete({ code: 1, stderr: 'error during connect: Post: EOF' })
+    create.proc.complete({ code: 1, stderr: 'Cannot connect to Docker' })
     const removal = await call(cli, 1)
-    removal.proc.complete({
-      code: absence === 'empty query' ? 1 : 0,
-      stdout: absence === 'different removal name' ? 'other-container\n' : '',
-    })
-    if (absence === 'empty query') (await call(cli, 2)).proc.complete()
+    removal.proc.complete({ code: 1, stderr: 'Cannot connect to Docker' })
+    ;(await call(cli, 2)).proc.complete({ code: 1, stderr: 'Cannot connect to Docker' })
     const failed = await first
     expect(failed.kind).toBe('failure')
     if (failed.kind !== 'failure') throw new Error('probe unexpectedly succeeded')
@@ -298,45 +340,71 @@ test.each(['empty removal', 'empty query', 'different removal name'])(
     const retry = observe(driver.probe(url))
     const retryRemoval = await call(cli, retryIndex)
     expect(retryRemoval.args).toEqual(removal.args)
-    retryRemoval.proc.complete()
-    const retried = await retry
-    expect(retried.kind).toBe('failure')
-    if (retried.kind !== 'failure') throw new Error('probe unexpectedly succeeded')
-    expect(retried.error).toHaveProperty('cleanupFailed', true)
-    expect(String(retried.error)).toContain(name)
-    expect(cli.started.filter(({ args }) => args[0] === 'create')).toHaveLength(1)
-
-    const recoveryIndex = cli.started.length
-    const recovered = driver.probe(url)
-    const positiveRemoval = await call(cli, recoveryIndex)
-    expect(positiveRemoval.args).toEqual(removal.args)
-    positiveRemoval.proc.complete({ stdout: `${name}\n` })
-    const replacement = await call(cli, recoveryIndex + 1)
+    if (absence === 'no such container') cli.responses.push({ match: /^ps /, result: {} })
+    retryRemoval.proc.complete({
+      code: absence === 'no such container' || absence === 'empty query' ? 1 : 0,
+      stderr:
+        absence === 'no such container'
+          ? `Error response from daemon: No such container: ${name}`
+          : '',
+      stdout: absence === 'different removal name' ? 'other-container\n' : '',
+    })
+    let next = retryIndex + 1
+    if (absence !== 'no such container') {
+      ;(await call(cli, next++)).proc.complete()
+    }
+    const replacement = await call(cli, next++)
     expect(replacement.args[0]).toBe('create')
     expect(replacement.args).not.toContain(name)
     replacement.proc.complete()
-    ;(await call(cli, recoveryIndex + 2)).proc.complete({ stdout: 'new-nonce' })
-    ;(await call(cli, recoveryIndex + 3)).proc.complete()
-    expect(await recovered).toBe('new-nonce')
+    ;(await call(cli, next++)).proc.complete({ stdout: 'new-nonce' })
+    ;(await call(cli, next)).proc.complete()
+    expect(await retry).toEqual({ kind: 'success', body: 'new-nonce' })
   },
 )
 
-test('a listed container cannot be mistaken for successful auto-removal', async () => {
+test('removal already in progress waits through a listed container until it disappears', async () => {
   const { cli, driver } = setup()
   const outcome = observe(driver.probe(url))
   const create = await call(cli, 0)
   const name = create.args[create.args.indexOf('--name') + 1]
   create.proc.complete()
   ;(await call(cli, 1)).proc.complete({ stdout: 'fresh-nonce' })
-  ;(await call(cli, 2)).proc.complete({ code: 1, stderr: 'removal in progress' })
+  ;(await call(cli, 2)).proc.complete({
+    code: 1,
+    stderr: `Error response from daemon: removal of container ${name} is already in progress`,
+  })
   ;(await call(cli, 3)).proc.complete({ stdout: `${name}\n` })
-  const failure = await outcome
-  expect(failure.kind).toBe('failure')
-  if (failure.kind === 'failure') {
-    expect(failure.error).toBeInstanceOf(Error)
-    expect(failure.error).toHaveProperty('cleanupFailed', true)
-  }
+  ;(await call(cli, 4)).proc.complete()
+  expect(await outcome).toEqual({ kind: 'success', body: 'fresh-nonce' })
 })
+
+test.each(['permission denied', 'removal already in progress'])(
+  'cleanup retains ownership when the container remains after %s',
+  async (stderr) => {
+    const cli = new FakeCli()
+    const driver = createDockerDriver({ install: 'test', image, timeoutMs: 30, cli })
+    const outcome = observe(driver.probe(url))
+    const create = await call(cli, 0)
+    const name = create.args[create.args.indexOf('--name') + 1]
+    create.proc.complete()
+    ;(await call(cli, 1)).proc.complete({ stdout: 'fresh-nonce' })
+    cli.responses.push({ match: /^ps /, result: { stdout: `${name}\n` } })
+    ;(await call(cli, 2)).proc.complete({ code: 1, stderr })
+    const failure = await outcome
+    expect(failure.kind).toBe('failure')
+    if (failure.kind === 'failure') {
+      expect(failure.error).toBeInstanceOf(Error)
+      expect(failure.error).toHaveProperty('cleanupFailed', true)
+    }
+    const retry = observe(driver.probe(url))
+    const retriedRemoval = await call(cli, cli.started.length - 1)
+    expect(retriedRemoval.args).toEqual(['rm', '--force', name])
+    retriedRemoval.proc.complete({ code: 1, stderr: 'permission denied' })
+    expect((await retry).kind).toBe('failure')
+    expect(cli.started.filter(({ args }) => args[0] === 'create')).toHaveLength(1)
+  },
+)
 
 test('ordinary failures do not claim cleanup failed', async () => {
   const { cli, driver } = setup()
