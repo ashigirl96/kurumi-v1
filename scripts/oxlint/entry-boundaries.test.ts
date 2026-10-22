@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 import { cleanUpLintProbes, lintProbes } from './lint-probes'
 
@@ -229,6 +229,7 @@ describe('a relative import that leaves its package', () => {
 })
 
 type OxlintConfig = {
+  ignorePatterns?: string[]
   rules: Record<string, unknown>
   overrides?: { files: string[]; rules?: Record<string, unknown> }[]
 }
@@ -269,11 +270,40 @@ function overridesDroppingBoundary(config: OxlintConfig): string[] {
     .map(({ files }) => files.join(', '))
 }
 
-function nestedOxlintConfigs(root: string): string[] {
-  return [...new Bun.Glob('{apps,packages}/**/.oxlintrc.json').scanSync({ cwd: root, dot: true })]
-    .filter((path) => !path.includes('node_modules/'))
+const oxlintConfigNames = new Set([
+  '.oxlintrc.json',
+  '.oxlintrc.jsonc',
+  'oxlint.config.ts',
+  'oxlint.config.mts',
+])
+
+function extraOxlintConfigs(root: string, dir = ''): string[] {
+  return readdirSync(join(root, dir), { withFileTypes: true })
+    .flatMap((entry) => {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        return entry.name === 'node_modules' || entry.name === '.git'
+          ? []
+          : extraOxlintConfigs(root, path)
+      }
+      return oxlintConfigNames.has(entry.name) && path !== '.oxlintrc.json' ? [path] : []
+    })
     .toSorted()
 }
+
+const globCharacters = /[*?[\\\]{}!]/
+
+function mayIgnorePackagesOrApps(pattern: string): boolean {
+  const trimmed = pattern.trim()
+  if (trimmed === '' || trimmed.startsWith('#') || trimmed.startsWith('!')) return false
+  const withoutDirectoryMark = trimmed.replace(/\/+$/, '')
+  if (!withoutDirectoryMark.includes('/')) return true
+  const [first = ''] = withoutDirectoryMark.replace(/^\.?\//, '').split('/')
+  return globCharacters.test(first) || ['packages', 'apps'].includes(first.toLowerCase())
+}
+
+const ignoresPackagesOrApps = (config: OxlintConfig): string[] =>
+  (config.ignorePatterns ?? []).filter(mayIgnorePackagesOrApps)
 
 describe('an override of the import boundary', () => {
   const config = readConfig()
@@ -355,23 +385,89 @@ describe('a package that does not declare exports', () => {
   })
 })
 
-describe('a nested oxlint config', () => {
+describe('an oxlint config other than the root one', () => {
   const roots: string[] = []
   afterAll(() => {
     for (const root of roots) rmSync(root, { recursive: true, force: true })
   })
 
-  test('does not exist, because it replaces the root config for its folder', () => {
-    expect(nestedOxlintConfigs(repo)).toEqual([])
-  })
-
-  test('is found under a package', () => {
+  const rootWith = (files: Record<string, string>): string => {
     const root = mkdtempSync(join(tmpdir(), 'kurumi-nested-'))
     roots.push(root)
-    mkdirSync(join(root, 'packages/x/src'), { recursive: true })
-    writeFileSync(join(root, 'packages/x/src/.oxlintrc.json'), '{}')
+    for (const [path, source] of Object.entries(files)) {
+      mkdirSync(join(root, dirname(path)), { recursive: true })
+      writeFileSync(join(root, path), source)
+    }
+    return root
+  }
 
-    expect(nestedOxlintConfigs(root)).toEqual(['packages/x/src/.oxlintrc.json'])
+  test('does not exist, because it replaces the root config for its folder', () => {
+    expect(extraOxlintConfigs(repo)).toEqual([])
+  })
+
+  test.each([
+    'packages/x/src/.oxlintrc.json',
+    'packages/x/.oxlintrc.jsonc',
+    'packages/x/oxlint.config.ts',
+    'apps/y/oxlint.config.mts',
+    'scripts/.oxlintrc.json',
+    'tools/deep/er/.oxlintrc.jsonc',
+    'oxlint.config.ts',
+    'oxlint.config.mts',
+    '.oxlintrc.jsonc',
+  ])('is found at %s', (path) => {
+    const root = rootWith({ '.oxlintrc.json': '{}', [path]: '{}' })
+
+    expect(extraOxlintConfigs(root)).toEqual([path])
+  })
+
+  test('is not looked for in node_modules, and the root config is not extra', () => {
+    const root = rootWith({
+      '.oxlintrc.json': '{}',
+      'node_modules/dep/.oxlintrc.json': '{}',
+      'packages/x/node_modules/dep/oxlint.config.ts': '{}',
+    })
+
+    expect(extraOxlintConfigs(root)).toEqual([])
+  })
+})
+
+describe('an ignore pattern of the root config', () => {
+  test('does not cover a path under packages or apps', () => {
+    expect(ignoresPackagesOrApps(readConfig())).toEqual([])
+  })
+
+  test.each([
+    'packages/**',
+    'packages/other/**',
+    'packages',
+    'packages/',
+    '/packages/other',
+    './apps/web/**',
+    'APPS/**',
+    '**/src/**',
+    '*.ts',
+    'src',
+    'node_modules',
+    'docs/',
+    '{packages,apps}/**',
+    'pack*/**',
+    '[p]ackages/**',
+    'p?ckages/x',
+  ])('is noticed when it is %s', (pattern) => {
+    expect(ignoresPackagesOrApps({ ignorePatterns: [pattern], rules: {} })).toEqual([pattern])
+  })
+
+  test.each([
+    'docs/**',
+    '/docs',
+    './docs/generated/**',
+    '.claude/**',
+    '!packages/keep/**',
+    '# packages/**',
+    'scripts/packages/**',
+  ])('may be %s', (pattern) => {
+    expect(ignoresPackagesOrApps({ ignorePatterns: [pattern], rules: {} })).toEqual([])
   })
 })
 
