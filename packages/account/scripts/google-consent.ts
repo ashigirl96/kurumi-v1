@@ -360,7 +360,7 @@ async function consent(options: Options): Promise<boolean> {
     if (!run.ok) throw run.error
     return run.value && revoked
   } finally {
-    await server.stop(true)
+    await server.stop()
   }
 }
 
