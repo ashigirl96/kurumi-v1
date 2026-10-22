@@ -127,15 +127,24 @@ function takeHeader(headers: Headers, name: string): string[] {
   return value === null ? [] : [value]
 }
 
+const takeAuthorization = (headers: Headers): Written[] =>
+  takeHeader(headers, 'authorization').map(writtenInAuthorization)
+
+/** An SDK sends its auth token as Authorization, so a service whose slot is another header still sees a selector there. */
+function takeNamingAuthorization(headers: Headers): Written[] {
+  const value = headers.get('authorization')
+  return value !== null && mentionsKurumi(value) ? takeAuthorization(headers) : []
+}
+
 const alone = (credential: string): Written => ({ around: '', credential })
 
 function takeWritten(slot: CredentialSlot, headers: Headers, url: URL): Written[] {
   switch (slot.kind) {
     case 'bearer':
     case 'basic':
-      return takeHeader(headers, 'authorization').map(writtenInAuthorization)
+      return takeAuthorization(headers)
     case 'header':
-      return takeHeader(headers, slot.header).map(alone)
+      return [...takeHeader(headers, slot.header).map(alone), ...takeNamingAuthorization(headers)]
     case 'query':
       return takeQueryParam(url, slot.param).map(alone)
   }

@@ -602,6 +602,36 @@ describe.each(
   })
 })
 
+describe('the Authorization header of a service whose slot is another header', () => {
+  const target = slotTargets.find(({ slot }) => slot.kind === 'header')!
+  const apiKey = target.shape.format('anthropic/b')
+
+  test.each([
+    ['names the account', { authorization: 'Bearer kurumi:anthropic/b' }, 'anthropic/b'],
+    [
+      'is refused beside an x-api-key selector',
+      { authorization: `Bearer ${apiKey}`, 'x-api-key': apiKey },
+      'refused',
+    ],
+    [
+      'is refused beside an x-api-key placeholder',
+      { authorization: 'Bearer kurumi:anthropic/b', 'x-api-key': 'sk-ant-api03-placeholder' },
+      'refused',
+    ],
+    ['is refused when it is a look-alike', { authorization: 'Bearer kurumi:' }, 'refused'],
+    [
+      'is none when it holds an SDK placeholder',
+      { authorization: 'Bearer placeholder' },
+      'default',
+    ],
+  ])('%s', (_name, headers, expected) => {
+    const { outcome, stripped } = decide(target, request({ headers }))
+
+    expect(outcome).toBe(expected)
+    expect(stripped.headers.has('authorization')).toBe(expected === 'default')
+  })
+})
+
 describe('an Authorization header read for the bearer and the basic slot alike', () => {
   const schemes: [string, string][] = [
     ['Bearer', 'Bearer kurumi:github/bot'],
