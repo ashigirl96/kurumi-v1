@@ -3,6 +3,7 @@ import { parseArgs } from 'node:util'
 import {
   catalog,
   IdentifyError,
+  isRecord,
   servicesCovered,
   type Identity,
   type ServiceId,
@@ -221,12 +222,28 @@ async function revokeAndCheck(
   return ok
 }
 
+function refusalReasons(body: unknown): string {
+  if (!isRecord(body) || !isRecord(body.error)) return ''
+  const { status, errors, details } = body.error
+  const reasons = [errors, details].flatMap((list) =>
+    Array.isArray(list)
+      ? list.flatMap((entry: unknown) =>
+          isRecord(entry) && typeof entry.reason === 'string' ? [entry.reason] : [],
+        )
+      : [],
+  )
+  return [typeof status === 'string' ? status : [], ...reasons].flat().join(' ')
+}
+
 async function probeApis(accessToken: string, covered: readonly ServiceId[]): Promise<boolean> {
   let ok = true
   for (const { service, url } of PROBES) {
     const response = await fetch(url, { headers: { authorization: `Bearer ${accessToken}` } })
     const expected = covered.includes(service) ? 200 : 403
-    out(`probe ${service}: GET ${url} -> HTTP ${response.status} (expected ${expected})`)
+    const reasons = response.ok ? '' : refusalReasons(await response.json().catch(() => null))
+    out(
+      `probe ${service}: GET ${url} -> HTTP ${response.status}${reasons === '' ? '' : ` (${reasons})`}, expected ${expected}`,
+    )
     if (response.status !== expected) {
       ok = false
       fail(`The ${service} probe answered ${response.status}, not the expected ${expected}.`)
