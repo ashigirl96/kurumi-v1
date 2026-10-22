@@ -117,10 +117,10 @@ flowchart LR
 
 ### 実機で確かめられている事実（Bun 1.4.3、Docker Desktop 29.6.1）
 
-- Bun の `node:http` server の `'connect'` event に `tls.TLSSocket({ isServer: true })` を載せると MITM が成り立つ。server 側の `SNICallback` は呼ばれないので、leaf cert は CONNECT の host で選んで `secureContext` に渡す。この方式で host ごとに別の証明書が出て、curl の検証が通った（2026-10-22 の試作）。
+- CONNECT の socket に server 側の `TLSSocket` を被せる試作は、証明書の検証には通ったが、遅い client への応答の背圧を伝えず、応答全体を memory に溜めた。P04 は host ごとの `tls.createServer` を `127.0.0.1:0` で起こし、CONNECT の socket と loopback の接続を `stream.pipeline` でつなぐ。復号した接続は `node:http` に渡す（2026-10-22 の `proto-mitm` の試作）。
 - host の `127.0.0.1` だけに bind した listener に、container の中の curl から `host.docker.internal:PORT` で届いた。MITM 越しの HTTPS も通った（2026-10-22 の試作）。kurumi は起動のたびに probe container でも確かめる。
 - host の unix socket を bind mount しても container から connect できない。container の口は TCP に決まる。
-- HTTP/2、WebSocket、長い SSE の背圧は未確認。
+- 試作では `tls.createServer` の ALPN を `['http/1.1']` に固定すると、h2 を申し出る curl も h1 で通った。Bun の `https.createServer` はこの ALPN 設定を無視した。WebSocket と長い SSE も試作では通っており、製品コードでの回帰試験は P05 が持つ。
 
 ## Feature Inventory → 置き場所
 
