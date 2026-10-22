@@ -12,6 +12,7 @@ import {
   type ServiceId,
   type VendorId,
 } from './catalog.ts'
+import { referenceSelection, referenceSelector } from './select.reference.ts'
 import {
   accountHandle,
   readSelector,
@@ -437,6 +438,7 @@ const groupOf = (vendor: VendorId): GrantedCandidate[] => [
   ...[
     'a',
     'b',
+    'a b',
     'Acme',
     'Acme, Inc.',
     'Acme, token team',
@@ -446,6 +448,9 @@ const groupOf = (vendor: VendorId): GrantedCandidate[] => [
     'a+tag@x.example',
   ].map((label) => grant(accountHandle(vendor, label))),
 ]
+
+const b64 = (text: string) => Buffer.from(text).toString('base64')
+const b64url = (text: string) => Buffer.from(text).toString('base64url')
 
 function decide(
   { vendor, service, slot, shape }: Target,
@@ -500,13 +505,14 @@ function rowsOf({ vendor, shape }: Target, { wrap }: Placement): Row[] {
       [`form ${i}: a placeholder before`, joined(placeholder, wrap(form('a'))), 'refused'],
       [`form ${i}: a placeholder after`, joined(wrap(form('a')), placeholder), 'refused'],
     ]),
-    ...forms
-      .slice(1)
-      .map((form): Row => [
-        'a comma in a label of the vendor shape',
-        wrap(form('Acme, Inc.')),
-        handle('Acme, Inc.'),
-      ]),
+    ...forms.slice(1).flatMap((form): Row[] => [
+      ['a comma in a label of the vendor shape', wrap(form('Acme, Inc.')), handle('Acme, Inc.')],
+      [
+        'capitals in the prefix of the vendor shape',
+        wrap(form('b').replace(/^[a-z-]+-/, (prefix) => prefix.toUpperCase())),
+        handle('b'),
+      ],
+    ]),
     ['capitals in the prefix', wrap(`KURUMI:${handle('b')}`), handle('b')],
     ['a comma and a space in the label', wrap(written('Acme, Inc.')), handle('Acme, Inc.')],
     [
@@ -535,18 +541,15 @@ function rowsOf({ vendor, shape }: Target, { wrap }: Placement): Row[] {
 
 function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
   const selector = `kurumi:${vendor}/a`
-  const hidden = (place: (secret: string) => string): Row[] => [
+  const escaped = `%6Burumi:${vendor}/a`
+  const unseen = (place: (secret: string) => string): Row[] => [
+    ['a base64 token that decodes to a selector is no mention', place(b64(selector)), 'default'],
+    ['a base64 token after a colon is no mention', place(`x:${b64(selector)}`), 'default'],
     [
-      'a base64 token that decodes to a selector',
-      place(Buffer.from(selector).toString('base64')),
-      'refused',
+      'an escaped letter of the word beside a bad escape is no mention',
+      place(`${escaped}%E0`),
+      'default',
     ],
-    [
-      'a base64 token after a colon',
-      place(`x:${Buffer.from(selector).toString('base64')}`),
-      'refused',
-    ],
-    ['an escaped letter of the word and a bad escape', place(`%6Burumi:${vendor}/a%E0`), 'refused'],
   ]
   if (slot.kind === 'header') {
     return [
@@ -556,16 +559,23 @@ function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
         `Bearer ${shape.format(`${vendor}/a`)}`,
         'refused',
       ],
-      ...hidden((secret) => secret),
+      ['the word as the first word', `kurumi ${vendor}/a`, 'refused'],
+      ...unseen((secret) => secret),
     ]
   }
   return [
     ['a quoted selector', `Bearer "${selector}"`, 'refused'],
     ['a scheme that is not a bearer', `Digest ${selector}`, 'refused'],
     ['an unknown scheme', `OAuth ${selector}`, 'refused'],
+    ['the word as the scheme', `Kurumi ${vendor}/a`, 'refused'],
     ['no scheme', selector, 'refused'],
     ['a colon for the space', `Bearer:${selector}`, 'refused'],
     ['a word before the selector', `Bearer x ${selector}`, 'refused'],
+    [
+      'the anthropic shape in the slot of another vendor',
+      `Bearer ${selectorShapeOf('anthropic').format(`${vendor}/a`)}`,
+      'refused',
+    ],
     ['the selector as the Basic user (git token-as-user)', basic(selector, ''), 'refused'],
     ['the selector as the whole Basic credential', basic('kurumi', `${vendor}/a`), 'refused'],
     [
@@ -580,12 +590,30 @@ function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
     ],
     [
       'a Basic credential split by a space',
-      `Basic ${Buffer.from(`x:${selector}`)
-        .toString('base64')
-        .replace(/^(.{8})/, '$1 ')}`,
+      basic('x', selector).replace(/^(Basic .{8})/, '$1 '),
+      `${vendor}/a`,
+    ],
+    [
+      'a Basic credential without its padding',
+      basic('x', selector).replace(/=+$/, ''),
+      `${vendor}/a`,
+    ],
+    [
+      'a Basic credential in the url-safe alphabet hiding the word behind an escape',
+      `Basic ${b64url(`~~?1:${escaped}`)}`,
       'refused',
     ],
-    ...hidden((secret) => `Bearer ${secret}`),
+    [
+      'an over-padded Basic credential hiding the word behind an escape',
+      `${basic('x', escaped)}===`,
+      'refused',
+    ],
+    [
+      'a Basic credential with a trailing dot hiding the word behind an escape',
+      `${basic('x', escaped)}.`,
+      'refused',
+    ],
+    ...unseen((secret) => `Bearer ${secret}`),
   ]
 }
 
@@ -637,6 +665,11 @@ describe('the Authorization header of a service whose slot is another header', (
   test.each([
     ['names the account', { authorization: 'Bearer kurumi:anthropic/b' }, 'anthropic/b'],
     [
+      'names the account through a Basic password',
+      { authorization: basic('x', 'kurumi:anthropic/b') },
+      'anthropic/b',
+    ],
+    [
       'is refused beside an x-api-key selector',
       { authorization: `Bearer ${apiKey}`, 'x-api-key': apiKey },
       'refused',
@@ -647,6 +680,16 @@ describe('the Authorization header of a service whose slot is another header', (
       'refused',
     ],
     ['is refused when it is a look-alike', { authorization: 'Bearer kurumi:' }, 'refused'],
+    [
+      'is refused when the Basic password hides the word behind an escape',
+      { authorization: basic('x', '%6Burumi:anthropic/b') },
+      'refused',
+    ],
+    [
+      'is refused when the Basic credential has no colon',
+      { authorization: `Basic ${b64(apiKey)}` },
+      'refused',
+    ],
     [
       'is none when it holds an SDK placeholder',
       { authorization: 'Bearer placeholder' },
@@ -709,9 +752,18 @@ describe('a selector written into the query slot', () => {
     ['a malformed escape', '?key=kurumi:%E0', 'refused'],
     ['a label that mentions the word', '?key=kurumi:google/kurumi-x', 'refused'],
     ['a parameter name with an escape', '?k%65y=kurumi:google/a', 'google/a'],
-    ['a bad escape beside an escaped letter', '?key=%6Burumi%3Agoogle%2Fa%ZZ', 'refused'],
-    ['a base64 token after an escaped space', '?key=x%20a3VydW1pOmdvb2dsZS9h', 'refused'],
-    ['a Kelvin sign for the k', '?key=%E2%84%AAurumi%3Agoogle%2Fa', 'refused'],
+    ['a plus for a space in a re-encoded value', '?key=kurumi%3Agoogle%2Fa+b', 'google/a b'],
+    [
+      'an escaped letter of the word beside a bad escape is no mention',
+      '?key=%6Burumi%3Agoogle%2Fa%ZZ',
+      'default',
+    ],
+    [
+      'a base64 token after an escaped space is no mention',
+      '?key=x%20a3VydW1pOmdvb2dsZS9h',
+      'default',
+    ],
+    ['a Kelvin sign for the k is no mention', '?key=%E2%84%AAurumi%3Agoogle%2Fa', 'default'],
     ['a real-looking key', '?key=AIzaPlaceholder', 'default'],
     ['an empty key', '?key=', 'default'],
     ['no key', '?alt=json', 'default'],
@@ -722,6 +774,16 @@ describe('a selector written into the query slot', () => {
 
     expect(outcome).toBe(expected)
     expect(stripped.url.searchParams.has('key')).toBe(false)
+  })
+
+  test('a refusal names only the values that mention the word', () => {
+    const { selector } = readSelector(
+      defaultSelectorShape,
+      slot,
+      search('?key=AIzaPlaceholder&key=kurumi%3Agoogle%2Fa'),
+    )
+
+    expect(selector).toEqual({ kind: 'unreadable', written: 'kurumi%3Agoogle%2Fa' })
   })
 
   test('only the key parameter is removed and the rest stays as written', () => {
@@ -844,21 +906,29 @@ describe('awkward handles through every slot', () => {
   })
 })
 
-const base64Edge = /(^|[^A-Za-z0-9+/=_-])a3VydW1p($|[^A-Za-z0-9+/=_-])/
-const mentions = (text: string) =>
-  /kurumi/i.test(text.replace(/%6b/gi, 'k')) || base64Edge.test(text)
+function seededRandom(seed: number) {
+  let state = seed
+  const next = () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+    return state / 2 ** 32
+  }
+  const pick = <T>(from: readonly T[]): T => from[Math.floor(next() * from.length)]!
+  return { next, pick }
+}
+
+const decodedOnce = (text: string): string | null => {
+  try {
+    return decodeURIComponent(text)
+  } catch {
+    return null
+  }
+}
+
+const mentions = (text: string) => /kurumi/i.test(text) || /kurumi/i.test(decodedOnce(text) ?? '')
 
 function handleThatTextNames(text: string): string | null {
   const prefix = /^kurumi:/i.exec(text)
-  if (prefix) {
-    try {
-      return decodeURIComponent(text.slice(prefix[0].length))
-    } catch {
-      return null
-    }
-  }
-  const anthropic = /^sk-ant-kurumi-/i.exec(text)
-  return anthropic ? Buffer.from(text.slice(anthropic[0].length), 'base64url').toString() : null
+  return prefix ? decodedOnce(text.slice(prefix[0].length)) : null
 }
 
 describe('whatever a slot holds', () => {
@@ -896,7 +966,7 @@ describe('whatever a slot holds', () => {
     'a3VydW1p',
     '.',
   ]
-  const candidates = [
+  const several = [
     'google/a',
     'google/Acme',
     'google/Acme, Inc.',
@@ -904,6 +974,7 @@ describe('whatever a slot holds', () => {
     'anthropic/a',
     'google/kurumi-x',
   ].map((h, i) => grant(h as AccountHandle, { isDefault: i === 0 }))
+  const single = [grant('google/a' as AccountHandle)]
   const slots: [string, CredentialSlot, (text: string) => string][] = [
     ['bearer', { kind: 'bearer' }, (text) => `Bearer ${text}`],
     ['basic', { kind: 'basic' }, (text) => basic('x', text)],
@@ -911,56 +982,253 @@ describe('whatever a slot holds', () => {
   ]
 
   function* texts(count: number): Generator<string> {
-    let seed = 20260101
-    const next = () => {
-      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
-      return seed / 2 ** 32
-    }
-    const pick = <T>(from: readonly T[]): T => from[Math.floor(next() * from.length)]!
-    const leads = ['kurumi:', 'KURUMI:', 'sk-ant-kurumi-']
-    const handles = [
-      'google/a',
-      'google/Acme',
-      'notion/b',
-      'google/Acme, Inc.',
-      'anthropic/a',
-      'google/kurumi-x',
-    ]
+    const { next, pick } = seededRandom(20260101)
     for (let i = 0; i < count; i++) {
-      const random = Array.from({ length: 1 + Math.floor(next() * 6) }, () => pick(fragments))
-      yield next() < 0.3
-        ? pick(leads) + pick(handles) + (next() < 0.3 ? pick(fragments) : '')
-        : (next() < 0.5 ? pick(leads) : '') + random.join('')
+      const length = 1 + Math.floor(next() * 7)
+      yield Array.from({ length }, () => pick(fragments)).join('')
     }
   }
 
   test.each(slots)(
-    'the %s slot never names an account the text does not name alone',
+    'the %s slot never names an account the text does not name alone, nor falls back once it mentions the word',
     (_name, slot, place) => {
       let namedCount = 0
-      for (const text of texts(1200)) {
+      for (const text of texts(4000)) {
         const { selector } = readSelector(
           defaultSelectorShape,
           slot,
           request({ headers: { [headerOf(slot)]: place(text) } }),
         )
-        const selection = selectAccount('gmail', candidates, selector)
+        for (const candidates of [several, single]) {
+          const selection = selectAccount('gmail', candidates, selector)
 
-        if (!mentions(text)) {
-          if (!text.includes('a3VydW1p'))
-            expect(selection).toMatchObject({ ok: true, how: 'default' })
-          continue
+          if (!mentions(text)) {
+            expect(selection).toMatchObject({
+              ok: true,
+              how: candidates.length === 1 ? 'only' : 'default',
+            })
+            continue
+          }
+          if (!selection.ok) continue
+          expect(selection.how).toBe('named')
+          namedCount++
+          expect((decodedOnce(text) ?? text).match(/kurumi/gi)).toHaveLength(1)
+          expect<string>(selection.handle).toBe(
+            handleThatTextNames(slot.kind === 'basic' ? text : text.trim())!,
+          )
         }
-        if (!selection.ok) continue
-        expect(selection.how).toBe('named')
-        namedCount++
-        expect(text.replace(/%6b/gi, 'k').match(/kurumi/gi)).toHaveLength(1)
-        expect(text).not.toContain('a3VydW1p')
-        expect<string>(selection.handle).toBe(
-          handleThatTextNames(slot.kind === 'basic' ? text : text.trim())!,
-        )
       }
-      expect(namedCount).toBeGreaterThan(50)
+      expect(namedCount).toBeGreaterThan(0)
+    },
+  )
+})
+
+describe('readSelector and selectAccount agree with the reference rule', () => {
+  const labels = [
+    'a',
+    'b',
+    'bot',
+    'main',
+    'Acme',
+    'Acme, Inc.',
+    'a@x.example',
+    'a+b@x.example',
+    'a b',
+    'ünï',
+    '50%off',
+    'a%41',
+    'a%2Fb',
+    'kurumi-x',
+    'Kurumi',
+    'a, Bearer placeholder',
+  ]
+  const tokens = [
+    'ya29.a0AfH6SMBx',
+    'sk-ant-api03-placeholder',
+    'ghp_abcdefghijklmnop',
+    'AIzaPlaceholder',
+    'placeholder',
+    '',
+    b64url('{"name":"Kurumi Tanaka"}'),
+  ]
+  const users = ['x', 'git', 'kurumi', 'kur%75mi', '']
+
+  const spellings: ((shape: SelectorShape, handle: string) => string)[] = [
+    (shape, handle) => shape.format(handle),
+    (shape, handle) => shape.format(handle),
+    (_, handle) => `kurumi:${handle}`,
+    (_, handle) => `KURUMI:${handle}`,
+    (_, handle) => `Kurumi:${encodeURIComponent(handle)}`,
+    (_, handle) => encodeURIComponent(`kurumi:${handle}`),
+    (_, handle) => `kurumi:${handle}%ZZ`,
+    (_, handle) => `%6Burumi:${handle}`,
+    (_, handle) => `kurumi ${handle}`,
+    (_, handle) => `"kurumi:${handle}"`,
+    (_, handle) => b64(`kurumi:${handle}`),
+    (_, handle) => `sk-ant-kurumi-${b64url(handle)}`,
+    (_, handle) => `SK-ANT-KURUMI-${b64url(handle)}`,
+    (_, handle) => `kuru mi:${handle}`,
+    (_, handle) => `kurumj:${handle}`,
+    () => 'kurumi:',
+    () => 'kurumi:%E0',
+    () => 'sk-ant-kurumi-***',
+  ]
+  const inAuthorization: ((credential: string, user: string) => string)[] = [
+    (c) => `Bearer ${c}`,
+    (c) => `Bearer ${c}`,
+    (c) => `token ${c}`,
+    (c) => `bearer\t${c}`,
+    (c) => `Digest ${c}`,
+    (c) => c,
+    (c, user) => basic(user, c),
+    (c, user) => basic(user, c),
+    (c) => basic(c, ''),
+    (c, user) => basic(user, c).replace(/=+$/, ''),
+    (c, user) => `Basic ${b64url(`${user}:${c}`)}`,
+    (c, user) => `${basic(user, c)}===`,
+    (c, user) => `${basic(user, c)}.`,
+    (c, user) => basic(user, c).replace(/^(Basic .{6})/, '$1 '),
+    (c) => `Basic ${b64(c)}`,
+  ]
+  const inQuery: ((credential: string) => string)[] = [
+    (c) => encodeURIComponent(c),
+    (c) => encodeURIComponent(c),
+    (c) => c,
+    (c) => encodeURI(c),
+    (c) => new URLSearchParams({ v: c }).toString().slice(2),
+    (c) => encodeURIComponent(encodeURIComponent(c)),
+  ]
+
+  type Slot = { vendor: VendorId; service: ServiceId; slot: CredentialSlot; url: string }
+  const slots: Slot[] = [
+    {
+      vendor: 'notion',
+      service: 'notion',
+      slot: { kind: 'bearer' },
+      url: 'https://api.notion.com/v1/pages',
+    },
+    {
+      vendor: 'github',
+      service: 'github',
+      slot: { kind: 'basic' },
+      url: 'https://api.github.com/user',
+    },
+    {
+      vendor: 'anthropic',
+      service: 'anthropic-api',
+      slot: { kind: 'header', header: 'x-api-key' },
+      url: 'https://api.anthropic.com/v1/messages',
+    },
+    {
+      vendor: 'google',
+      service: 'gmail',
+      slot: { kind: 'query', param: 'key' },
+      url: 'https://gmail.googleapis.com/gmail/v1/users/me/messages',
+    },
+  ]
+
+  type Case = { headers: [string, string][]; url: string; candidates: GrantedCandidate[] }
+
+  function generate({ vendor, slot, url }: Slot, random: ReturnType<typeof seededRandom>): Case {
+    const shape = selectorShapeOf(vendor)
+    const label = random.pick(labels)
+    const handle = `${vendor}/${label}`
+    const credential = () =>
+      random.next() < 0.6 ? random.pick(spellings)(shape, handle) : random.pick(tokens)
+    const authorization = () => random.pick(inAuthorization)(credential(), random.pick(users))
+    const headers: [string, string][] = [['accept', 'application/json']]
+    const query = random.next() < 0.5 ? ['alt=json'] : []
+    const count = random.next() < 0.85 ? 1 : random.next() < 0.7 ? 2 : 0
+    for (let i = 0; i < count; i++) {
+      if (slot.kind === 'query') {
+        const name = random.pick(['key', 'key', 'k%65y', 'KEY'])
+        const at = Math.floor(random.next() * (query.length + 1))
+        query.splice(at, 0, `${name}=${random.pick(inQuery)(credential())}`)
+      } else if (slot.kind === 'header') {
+        headers.push([slot.header, random.next() < 0.8 ? credential() : `Bearer ${credential()}`])
+      } else {
+        headers.push(['authorization', authorization()])
+      }
+    }
+    if (slot.kind === 'header' && random.next() < 0.4)
+      headers.push(['authorization', authorization()])
+    const lookalikes = [
+      `${vendor}/${label.split(',')[0]}`,
+      `${vendor}/${label.toLowerCase()}`,
+      `${vendor}/${encodeURIComponent(label)}`,
+      `${vendor}/${decodedOnce(label) ?? label}`,
+      `${vendor}/main`,
+      `${vendor}/${random.pick(labels)}`,
+    ]
+    const pool = [
+      ...new Set([
+        ...(random.next() < 0.8 ? [handle] : []),
+        ...lookalikes.slice(0, Math.floor(random.next() * 5)),
+      ]),
+    ]
+    const defaultAt = random.next() < 0.8 ? Math.floor(random.next() * pool.length) : -1
+    const candidates = pool.map((h, i) =>
+      grant(accountHandle(vendor, h.slice(vendor.length + 1)), {
+        isDefault: i === defaultAt,
+        status: random.next() < 0.05 ? 'needs_reauth' : 'active',
+      }),
+    )
+    return { headers, url: `${url}${query.length > 0 ? `?${query.join('&')}` : ''}`, candidates }
+  }
+
+  const requestOf = ({ headers, url }: Case) => {
+    const built = new Headers()
+    for (const [name, value] of headers) built.append(name, value)
+    return { headers: built, url: new URL(url) }
+  }
+
+  type Outcome = { selector: string; decision: string; headers: [string, string][]; url: string }
+  type Request = ReturnType<typeof requestOf>
+
+  function observed({ vendor, service, slot }: Slot, c: Case, req: Request): Outcome {
+    const { selector, stripped } = readSelector(selectorShapeOf(vendor), slot, req)
+    const selection = selectAccount(service, c.candidates, selector)
+    return {
+      selector:
+        selector.kind === 'handle'
+          ? `handle ${selector.handle}`
+          : selector.kind === 'unreadable'
+            ? 'refused'
+            : 'none',
+      decision: selection.ok ? `${selection.how} ${selection.accountId}` : selection.refusal.code,
+      headers: [...stripped.headers.entries()],
+      url: stripped.url.href,
+    }
+  }
+
+  function expected({ vendor, slot }: Slot, c: Case, req: Request): Outcome {
+    const { selector, stripped } = referenceSelector(selectorShapeOf(vendor), slot, req)
+    const decision = referenceSelection(c.candidates, selector)
+    return {
+      selector: selector.kind === 'handle' ? `handle ${selector.handle}` : selector.kind,
+      decision: decision.ok ? `${decision.how} ${decision.accountId}` : decision.code,
+      headers: [...stripped.headers.entries()],
+      url: stripped.url.href,
+    }
+  }
+
+  test.each(slots.map((target) => [target.slot.kind, target] as const))(
+    'the %s slot, over 4000 seeded cases with single-grant and default groups',
+    (_kind, target) => {
+      const random = seededRandom(20261022)
+      const seen = { named: 0, refused: 0, none: 0, single: 0 }
+      for (let i = 0; i < 4000; i++) {
+        const c = generate(target, random)
+        const req = requestOf(c)
+        const want = expected(target, c, req)
+        const got = observed(target, c, req)
+        if (!Bun.deepEquals(got, want)) expect({ case: c, got }).toEqual({ case: c, got: want })
+        if (want.selector.startsWith('handle')) seen.named++
+        else if (want.selector === 'refused') seen.refused++
+        else seen.none++
+        if (c.candidates.length === 1) seen.single++
+      }
+      for (const count of Object.values(seen)) expect(count).toBeGreaterThan(200)
     },
   )
 })

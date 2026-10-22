@@ -49,9 +49,6 @@ function parseAnthropicForm(value: string): string | null {
   return decoded !== '' && Buffer.from(decoded).toString('base64url') === payload ? decoded : null
 }
 
-const parseSelector = (value: string): string | null =>
-  parseAnthropicForm(value) ?? parseDefaultForm(value)
-
 /**
  * Percent-encoded because an HTTP header value cannot carry non-Latin1 characters and a query value cannot carry
  * `&`, `#` or `+`. `/`, `@` and `:` stay readable.
@@ -59,7 +56,7 @@ const parseSelector = (value: string): string | null =>
 export const defaultSelectorShape: SelectorShape = {
   format: (handle) =>
     `kurumi:${encodeURIComponent(handle.toWellFormed()).replaceAll('%2F', '/').replaceAll('%40', '@').replaceAll('%3A', ':')}`,
-  parse: parseSelector,
+  parse: parseDefaultForm,
 }
 
 export type VendorSpec = {
@@ -75,7 +72,7 @@ export const catalog = {
     connect: { kind: 'key' },
     selectorShape: {
       format: (handle) => `${anthropicPrefix}${Buffer.from(handle).toString('base64url')}`,
-      parse: parseSelector,
+      parse: (value) => parseAnthropicForm(value) ?? parseDefaultForm(value),
     },
     services: {
       'anthropic-api': {

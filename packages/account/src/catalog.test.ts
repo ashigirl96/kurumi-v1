@@ -376,11 +376,10 @@ describe('selectorShapeOf', () => {
     },
   )
 
-  test('every shape reads the default form as well as the anthropic one', () => {
-    for (const shape of shapes) {
-      expect(shape.parse('kurumi:anthropic/b')).toBe('anthropic/b')
-      expect(shape.parse(anthropic.format('anthropic/b'))).toBe('anthropic/b')
-    }
+  test('every shape reads the default form, and only the anthropic shape reads its own', () => {
+    for (const shape of shapes) expect(shape.parse('kurumi:anthropic/b')).toBe('anthropic/b')
+    expect(anthropic.parse(anthropic.format('anthropic/b'))).toBe('anthropic/b')
+    expect(defaultSelectorShape.parse(anthropic.format('anthropic/b'))).toBeNull()
   })
 
   test('the default form is typed by hand without regard to case', () => {
@@ -420,6 +419,7 @@ describe('selectorShapeOf', () => {
     expect(defaultSelectorShape.format('github/a b&c#d+e=f')).toBe(
       'kurumi:github/a%20b%26c%23d%2Be%3Df',
     )
+    expect(defaultSelectorShape.format('github/a:b/c')).toBe('kurumi:github/a:b/c')
   })
 
   test('format survives a label with a lone surrogate', () => {
