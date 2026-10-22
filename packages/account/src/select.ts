@@ -104,9 +104,10 @@ const mentionsInQuery = mentionsIn(decodedQueryValue)
 // split after each run of `=`. A piece under 8 characters cannot hold the word, and a credential of more than 16
 // pieces is refused unread. Every pattern here is linear in a run of one character.
 const notOneBlob = /[^A-Za-z0-9+/=_-]|=[A-Za-z0-9+/_-]/
-const joinedScheme = /\sbasic\s/i
+const schemeWord = /\sbasic\s/i
+const fieldSeparator = new RegExp(`,(?:${schemeWord.source})?|${schemeWord.source}`, 'i')
 const piecesOf = (credential: string): string[] =>
-  credential.split(/,(?:\sbasic\s)?|\sbasic\s/i, 17).flatMap((field) =>
+  credential.split(fieldSeparator, 17).flatMap((field) =>
     field
       .replace(/^\s*basic\s+/i, '')
       .replaceAll(/\s+/g, '')
@@ -136,27 +137,30 @@ function writtenInAuthorization(header: string): Written {
     case 'bearer':
     case 'token':
       return { mentions: mentions(header), written: header, credential }
-    case 'basic': {
-      const blob = credential.replaceAll(/\s+/g, '')
-      const oneBlob = !notOneBlob.test(blob) && !joinedScheme.test(credential)
-      const userAndPassword = decodedBase64(blob)
-      const pieces = oneBlob ? [] : piecesOf(credential)
-      const long = pieces.slice(0, 16).filter((piece) => piece.length >= 8)
-      const decoded = oneBlob ? [userAndPassword] : long.map(decodedBase64)
-      const seen = decoded.find((text) => mentions(text))
-      const colon = userAndPassword.indexOf(':')
-      return {
-        mentions:
-          seen !== undefined || pieces.length > 16 || mentions(userAndPassword) || mentions(header),
-        written: seen ?? header,
-        credential:
-          oneBlob && colon !== -1 && !mentions(userAndPassword.slice(0, colon))
-            ? userAndPassword.slice(colon + 1)
-            : null,
-      }
-    }
+    case 'basic':
+      return writtenInBasic(header, credential)
   }
   return { mentions: mentions(header), written: header, credential: null }
+}
+
+function writtenInBasic(header: string, credential: string): Written {
+  const blob = credential.replaceAll(/\s+/g, '')
+  const oneBlob = !notOneBlob.test(blob) && !schemeWord.test(header)
+  const userAndPassword = decodedBase64(blob)
+  const pieces = oneBlob ? [] : piecesOf(credential)
+  const long = pieces.slice(0, 16).filter((piece) => piece.length >= 8)
+  const decoded = oneBlob ? [userAndPassword] : long.map(decodedBase64)
+  const seen = decoded.find((text) => mentions(text))
+  const colon = userAndPassword.indexOf(':')
+  return {
+    mentions:
+      seen !== undefined || pieces.length > 16 || mentions(userAndPassword) || mentions(header),
+    written: seen ?? header,
+    credential:
+      oneBlob && colon !== -1 && !mentions(userAndPassword.slice(0, colon))
+        ? userAndPassword.slice(colon + 1)
+        : null,
+  }
 }
 
 const alone =

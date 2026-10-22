@@ -105,6 +105,7 @@ const inAuthorization: ((credential: string, user: string) => string)[] = [
   (c, user) => `${basic(user, 'placeholder')}${', Basic '.repeat(17)}${basic(user, c)}`,
   (c, user) => `Basic ${b64url(`${user}:${c}`)}, ${basic(user, 'placeholder')}`,
   (c, user) => `Basic ${b64('abcdef')} ${basic(user, c)}`,
+  (c, user) => `Basic ${basic(user, c)}`,
   (c, user) => `Basic ${b64(`${user}:placeholder`).replace(/=+$/, '')}=.${b64(`${user}:${c}`)}`,
   (c, user) =>
     Array.from({ length: 16 }, (_, i) => (i === 15 ? basic(user, c) : basic(user, 'x'))).join(', '),
@@ -124,8 +125,8 @@ const pads = [
   'kuru%6D'.repeat(300),
   'QUFBQUFBQUE,'.repeat(200),
   '%25'.repeat(500),
-  ' '.repeat(3000),
-  '='.repeat(3000),
+  `${' '.repeat(3000)}x`,
+  `${'='.repeat(3000)}x`,
 ]
 
 type Slot = { vendor: VendorId; service: ServiceId; slot: CredentialSlot; url: string }

@@ -640,6 +640,12 @@ function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
     ],
     ['a long run of padding after a stray character', `Basic !${'='.repeat(8192)}`, 'default'],
     ['a long run of spaces after a stray character', `Basic !${' '.repeat(8192)}x`, 'default'],
+    ['a doubled scheme word', `Basic ${basic('x', selector)}`, 'refused'],
+    [
+      'a selector shifted off base64 alignment is not seen',
+      `Basic QUJ${b64(`x:${selector}`)}`,
+      'default',
+    ],
     [
       'a Basic selector joined after a bearer value is not seen',
       `Bearer placeholder, ${basic('x', selector)}`,
@@ -747,6 +753,24 @@ describe('the Authorization header of a service whose slot is another header', (
 
     expect(outcome).toBe(expected)
     expect(stripped.headers.has('authorization')).toBe(expected === 'default')
+  })
+})
+
+describe('a long run of one character in a Basic credential', () => {
+  test('is read in time linear in its length', () => {
+    const runs = [`Basic !${' '.repeat(16384)}x`, `Basic !${'='.repeat(16384)}`]
+    const started = performance.now()
+    for (let i = 0; i < 50; i++) {
+      for (const authorization of runs) {
+        readSelector(
+          defaultSelectorShape,
+          { kind: 'basic' },
+          request({ headers: { authorization } }),
+        )
+      }
+    }
+
+    expect(performance.now() - started).toBeLessThan(100)
   })
 })
 
