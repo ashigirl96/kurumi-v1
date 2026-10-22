@@ -296,6 +296,9 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 
 ## Implementation reconciliation
 
+- P05 `forward.ts`: upgrade は通常の request と宛先検査と注入の準備を共有する。WebSocket の GET だけを受け、body を指定する handshake は 400 にする。hop header を除いてから Connection と Upgrade を設定し、両側の head byte を送って pipeline につなぐ。upstream の拒否は status と body を返す。
+- P05 `testing.ts`: P04 の raw header と upload の fake を保ち、`startFakeStreamUpstream` を同じ testing entry に追加した。Bun の native WebSocket echo と close code、送信 byte を数える `/sse?bytes=N`、`/sse-idle?ms=N`、`setSseResponse(path, body)`、`/stats` を持つ。呼び手は upstream と gateway を別 process で起動でき、両方の helper が PID を出す。計画の 200 MB は 209,715,200 byte（200 MiB）として扱う。
+- P05 ALPN test: CI と host の `/usr/bin/curl` を使う。`--http2-prior-knowledge` でも h1 を許す curl の動作を固定する test であり、h2 専用の client を h1 に変換するものではない。container の curl lane は P04 と同じ digest の image を使う。
 - P04 `port.ts`: CONNECT の socket に `TLSSocket` を被せる sketch を、host ごとの loopback `tls.createServer` と `stream.pipeline` に替えた。TLS listener は host ごとに共有し、復号後の `http.Server` は tunnel ごとに作る。loopback の送信側と受信側で TCP の address と port の組を照合して元の token と CONNECT の行き先を結び、TLS の byte を送る前に登録する。各 request で同じ token を認証し直す。listener は停止まで保持し、24 時間後の新しい tunnel には更新した leaf を渡す。
 - P04 `forward.ts`: sketch の Fetch Request/Response を Node の request/response stream に替えた。`inject` は型を固定しない principal、CONNECT の host/port、method、正規化していない path、hop header を除いた `Headers`、元の `rawHeaders` を受け、path と headers を返す。`rawHeaders` は P12 の slot header の重複検査に残す。絶対 URL の request target と CONNECT に一致しない Host は 400 にする。`credentialFor`、service が null の拒否、slot の重複拒否、slot 外の selector、`/batch`、Basic piece rule の削除は P12 に残す。
 - P04 `forward.ts`: upload は `PassThrough` を介して pipeline に渡す。upstream の接続失敗で pipeline が client socket まで破棄し、502 の JSON を送れなくなるのを防ぐため。body の framing は元の request から再設定し、GET や DELETE の chunked body も保つ。client の Connection の指定は注入前に除き、注入後の credential を消させない。response も stream で返し、302 は追わない。upstream の接続は `agent: false` で request ごとに閉じ、idle socket を残さない。latency の判定は root の perf lane が行う。
@@ -353,7 +356,9 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 
 ## Open questions and risks
 
-- HTTP/2・WebSocket・長い SSE の背圧で Bun の MITM が崩れないか。崩れた場合、forward の engine だけを Node の子 process に出す必要があり、そのとき account との境界は `credentialFor` の RPC になる（unit 1）。
+- HTTP/2 は解決済み（P05）。loopback の `tls.createServer` は ALPN で `http/1.1` だけを返す。`port.sse.test.ts` は `curl --http2` と `curl --http2-prior-knowledge` が HTTP/1.1 の 200 を受けることを確かめる。HTTP/2 の frame 自体は処理しない。[curl 8.10.0 以降の prior-knowledge](https://curl.se/docs/manpage.html#--http2-prior-knowledge) は h2 だけを申し出るので接続できない。
+- WebSocket は解決済み（P05）。内側の HTTP server の upgrade ごとに token を認証し直し、通常の request と同じ宛先の検査と header 注入を行う。upstream の 101 の後は両向きの pipeline で frame をそのまま運ぶ。`port.ws.test.ts` は 100 通の順序、注入、両方向の close code、upgrade と同時に届く frame、認証の失効、拒否、停止時の切断を確かめる。
+- 長い SSE の背圧は解決済み（P05）。P04 の loopback の形を保ち、`port.sse.test.ts` は client の読み取りを止めた間の upstream 送信量と client 受信量の差が 32 MiB 以下で、再開後に 200 MiB 全部が届くことを確かめる。RSS はこの test の判定に使わない。root の live と perf lane は別 process の upstream と gateway で実行する。
 - leaf cert は CONNECT の host で選ぶので、SNI と CONNECT の host が違う client では名前が合わない。curl は一致した。食い違う client が見つかったら、Client Hello を自分で読んで SNI を取り出す。
 - Linux の Docker Engine で、container から host の 127.0.0.1 bind に届くか。macOS の Docker Desktop では届く（試作で確認）。Linux では docker0 の address に bind する必要があるかもしれない（未検証）。
 - Google の project を「本番環境」にした（2026-10-22）。Gmail（制限付き）と Calendar（機密性の高い）の scope があるので、Console は「アプリの検証が必要です」と表示する。審査には出していない。Google の文書「When is verification not needed」では、100 人未満の personal use は未審査のまま使え、ログインのたびに「未確認のアプリ」の警告を押し進める。警告を押し進めて token を得られることは、P02 の実際のログインで確かめた。refresh token が 7 日を超えて生きるかは未観察。refresh token は 1 つのアカウントと client の組で 100 本までで、超えると古いものが黙って無効になる（Google の文書）。prompt=consent で接続し直すたびに 1 本増えるので、接続し直しを繰り返す試験では上限に注意する。

@@ -5,7 +5,7 @@ import { pipeline, type Duplex } from 'node:stream'
 import { createServer as createTlsServer } from 'node:tls'
 
 import { createCertificateAuthority, type CertificateAuthority, type Leaf } from './ca.ts'
-import { forward, type ConnectTarget, type ForwardDeps } from './forward.ts'
+import { forward, forwardUpgrade, type ConnectTarget, type ForwardDeps } from './forward.ts'
 
 export type { ForwardDeps, Injection, InjectionInput, UpstreamDestination } from './forward.ts'
 
@@ -139,6 +139,26 @@ export async function startAgentPort<Principal extends object>(deps: {
             if (res.destroyed) return
             if (res.headersSent) res.destroy()
             else res.writeHead(500, { connection: 'close' }).end()
+          })
+        })
+        inner.on('upgrade', (req, client, head) => {
+          client.pause()
+          void (async () => {
+            const principal = await tunnel.authenticate()
+            if (client.destroyed || tunnel.signal.aborted) return
+            if (principal === null) {
+              rejectConnect(client, 407)
+              return
+            }
+            await forwardUpgrade(
+              { principal, target: tunnel.target, signal: tunnel.signal },
+              req,
+              client,
+              head,
+              deps.forward,
+            )
+          })().catch(() => {
+            if (!client.destroyed) rejectConnect(client, 502)
           })
         })
         inner.on('clientError', (_error, client) => client.destroy())
