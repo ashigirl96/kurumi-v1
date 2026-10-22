@@ -77,6 +77,7 @@ export async function startAgentPort<Principal extends object>(deps: {
   forward: ForwardDeps<Principal>
   ca?: CertificateAuthority
   onConnect?(target: ConnectTarget): void
+  probeNonce?(): string | null
 }): Promise<AgentPort> {
   const ca = deps.ca ?? (await createCertificateAuthority())
   const listeners = new Map<string, Promise<HostListener<Principal>>>()
@@ -251,7 +252,14 @@ export async function startAgentPort<Principal extends object>(deps: {
     pipeline(client, outbound, client, done)
   }
 
-  const outer = createServer((_req, res) => res.writeHead(404).end())
+  const outer = createServer((req, res) => {
+    const nonce = deps.probeNonce?.()
+    if (req.method === 'GET' && nonce && req.url === `/probe/${nonce}`) {
+      res.writeHead(200, { 'content-type': 'text/plain' }).end(nonce)
+      return
+    }
+    res.writeHead(404).end()
+  })
   outer.on('connection', track)
   outer.on('clientError', (_error, socket) => socket.destroy())
   outer.on('connect', (req, socket, head) => {
