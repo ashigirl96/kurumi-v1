@@ -1,10 +1,5 @@
-import type { CredentialSlot, SelectorShape } from './catalog.ts'
+import { wasReEncoded, type CredentialSlot, type SelectorShape } from './catalog.ts'
 import type { GrantedCandidate, Selection, SelectionRefusal } from './select.ts'
-
-/**
- * The selector rule of the design written as plainly as possible, so a test can compare `readSelector` and
- * `selectAccount` with it. Test-only: nothing outside a test imports this file.
- */
 
 export type ReferenceSelector =
   | { kind: 'handle'; handle: string }
@@ -25,15 +20,10 @@ const mentions = (text: string): boolean => word.test(text) || word.test(decoded
 
 const asQueryWrites = (value: string): string => value.replaceAll('+', ' ')
 
-/**
- * Two Basic headers arrive joined by a comma, so every base64 run of the credential is decoded to see the word.
- * The password is read only from a credential that is one base64 blob, whitespace aside, in either alphabet and
- * with any padding.
- */
+// Two Basic headers arrive joined by a comma, so every base64 run of the credential is decoded to see the word.
 const notBase64 = /[^A-Za-z0-9+/=_-]+/
 const decodedBase64 = (text: string): string => Buffer.from(text, 'base64').toString()
 
-/** Whether any view of a slot value holds the word, and the text in its credential place if it has one. */
 type Value = { mentions: boolean; credential: string | null }
 
 function valueInAuthorization(header: string): Value {
@@ -102,13 +92,9 @@ function takeValues(slot: CredentialSlot, headers: Headers, url: URL): Value[] {
   }
 }
 
-/**
- * The query read order is the documented `encodeURI` lookalike limit: a value with `%2F` was re-encoded by a
- * component encoder and is decoded before it is read, any other value is read as `format` wrote it first.
- */
 function parseQueryValue(shape: SelectorShape, value: string): string | null {
   const decoded = decodedOnce(asQueryWrites(value))
-  const order = /%2f/i.test(value) ? [decoded, value] : [value, decoded]
+  const order = wasReEncoded(value) ? [decoded, value] : [value, decoded]
   for (const text of order) {
     const handle = text === null ? null : shape.parse(text)
     if (handle !== null) return handle
@@ -126,7 +112,8 @@ export function referenceSelector(
   const values = takeValues(slot, headers, url)
   const stripped = { headers, url }
   if (!values.some((value) => value.mentions)) return { selector: { kind: 'none' }, stripped }
-  const credential = values.length === 1 ? (values[0]?.credential ?? null) : null
+  const [only] = values
+  const credential = only && values.length === 1 ? only.credential : null
   const handle =
     credential === null
       ? null

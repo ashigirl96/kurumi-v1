@@ -51,13 +51,15 @@ function parseAnthropicForm(value: string): string | null {
 
 /**
  * Percent-encoded because an HTTP header value cannot carry non-Latin1 characters and a query value cannot carry
- * `&`, `#` or `+`. `/`, `@` and `:` stay readable.
+ * `&`, `#` or `+`.
  */
 export const defaultSelectorShape: SelectorShape = {
   format: (handle) =>
     `kurumi:${encodeURIComponent(handle.toWellFormed()).replaceAll('%2F', '/').replaceAll('%40', '@').replaceAll('%3A', ':')}`,
   parse: parseDefaultForm,
 }
+
+export const wasReEncoded = (value: string): boolean => /%2f/i.test(value)
 
 export type VendorSpec = {
   displayName: string

@@ -1183,9 +1183,9 @@ describe('readSelector and selectAccount agree with the reference rule', () => {
   }
 
   type Outcome = { selector: string; decision: string; headers: [string, string][]; url: string }
-  type Request = ReturnType<typeof requestOf>
+  type Probe = ReturnType<typeof requestOf>
 
-  function observed({ vendor, service, slot }: Slot, c: Case, req: Request): Outcome {
+  function observed({ vendor, service, slot }: Slot, c: Case, req: Probe): Outcome {
     const { selector, stripped } = readSelector(selectorShapeOf(vendor), slot, req)
     const selection = selectAccount(service, c.candidates, selector)
     return {
@@ -1201,7 +1201,7 @@ describe('readSelector and selectAccount agree with the reference rule', () => {
     }
   }
 
-  function expected({ vendor, slot }: Slot, c: Case, req: Request): Outcome {
+  function expected({ vendor, slot }: Slot, c: Case, req: Probe): Outcome {
     const { selector, stripped } = referenceSelector(selectorShapeOf(vendor), slot, req)
     const decision = referenceSelection(c.candidates, selector)
     return {

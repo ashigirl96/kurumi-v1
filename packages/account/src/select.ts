@@ -1,4 +1,10 @@
-import type { CredentialSlot, SelectorShape, ServiceId, VendorId } from './catalog.ts'
+import {
+  wasReEncoded,
+  type CredentialSlot,
+  type SelectorShape,
+  type ServiceId,
+  type VendorId,
+} from './catalog.ts'
 
 export type AccountHandle = `${VendorId}/${string}` & { readonly __brand: 'AccountHandle' }
 
@@ -48,7 +54,7 @@ function use(
 
 /**
  * `candidates` are the grants of the calling group for `service` and nothing else, so an ungranted account cannot
- * come out of here. A named handle wins, then the only grant, then the one default; never the first row.
+ * come out of here.
  */
 export function selectAccount(
   service: ServiceId,
@@ -90,12 +96,10 @@ const decodedOnce = (text: string): string | null => {
 const decodedQueryValue = (value: string): string | null => decodedOnce(value.replaceAll('+', ' '))
 
 const word = /kurumi/i
-/** A percent-decode can show the word only where a letter of it is escaped, so the decode is skipped otherwise. */
-const escapedLetter = /%(?:6b|4b|75|55|72|52|6d|4d|69|49)/i
+const escapedLetterOfWord = /%(?:6b|4b|75|55|72|52|6d|4d|69|49)/i
 
-/** A value is seen as received and after one percent-decode; a bad escape leaves only the received view. */
 const mentions = (text: string, decode = decodedOnce): boolean =>
-  word.test(text) || (escapedLetter.test(text) && word.test(decode(text) ?? ''))
+  word.test(text) || (escapedLetterOfWord.test(text) && word.test(decode(text) ?? ''))
 
 const notBase64 = /[^A-Za-z0-9+/=_-]+/
 const decodedBase64 = (text: string): string => Buffer.from(text, 'base64').toString()
@@ -113,8 +117,7 @@ function takeQueryParam(url: URL, param: string): string[] {
   return values
 }
 
-/** `text` is what the agent wrote; `credential` is the text in its credential place, null when it has none. */
-type Written = { mentions: boolean; text: string; credential: string | null }
+type Written = { mentions: boolean; written: string; credential: string | null }
 
 function writtenInAuthorization(header: string): Written {
   const match = /^(\w+)\s+/.exec(header)
@@ -122,7 +125,7 @@ function writtenInAuthorization(header: string): Written {
   switch (match?.[1]?.toLowerCase()) {
     case 'bearer':
     case 'token':
-      return { mentions: mentions(header), text: header, credential }
+      return { mentions: mentions(header), written: header, credential }
     // Two Basic headers arrive joined by a comma, so every base64 run of the credential is decoded to see the word.
     case 'basic': {
       const blob = credential.replaceAll(/\s+/g, '')
@@ -132,7 +135,7 @@ function writtenInAuthorization(header: string): Written {
       const colon = userAndPassword.indexOf(':')
       return {
         mentions: [header, userAndPassword, ...runs].some((text) => mentions(text)),
-        text: userAndPassword,
+        written: userAndPassword,
         credential:
           !joined && colon !== -1 && !mentions(userAndPassword.slice(0, colon))
             ? userAndPassword.slice(colon + 1)
@@ -140,12 +143,12 @@ function writtenInAuthorization(header: string): Written {
       }
     }
   }
-  return { mentions: mentions(header), text: header, credential: null }
+  return { mentions: mentions(header), written: header, credential: null }
 }
 
 const alone = (value: string, decode = decodedOnce): Written => ({
   mentions: mentions(value, decode),
-  text: value,
+  written: value,
   credential: value,
 })
 
@@ -182,7 +185,6 @@ function takeWritten(slot: CredentialSlot, headers: Headers, url: URL): Written[
   }
 }
 
-/** Once the word appears the result is never `none`, which would fall back to the default account. */
 function selectorIn(
   values: readonly Written[],
   parse: (credential: string) => string | null,
@@ -193,13 +195,12 @@ function selectorIn(
   const handle = values.length === 1 && only.credential !== null ? parse(only.credential) : null
   return handle !== null && !mentions(handle)
     ? { kind: 'handle', handle }
-    : { kind: 'unreadable', written: naming.map(({ text }) => text).join(' | ') }
+    : { kind: 'unreadable', written: naming.map(({ written }) => written).join(' | ') }
 }
 
-/** A value with `%2F` was re-encoded, so it is decoded before it is read; any other is read as `format` wrote it first. */
 function parseQueryValue(shape: SelectorShape, value: string): string | null {
   const decoded = decodedQueryValue(value)
-  const [first, second] = /%2f/i.test(value) ? [decoded, value] : [value, decoded]
+  const [first, second] = wasReEncoded(value) ? [decoded, value] : [value, decoded]
   const parsed = (text: string | null) => (text === null ? null : shape.parse(text))
   return parsed(first) ?? parsed(second)
 }
