@@ -388,6 +388,7 @@ test.each(['permission denied', 'removal already in progress'])(
     const outcome = observe(driver.probe(url))
     const create = await call(cli, 0)
     const name = create.args[create.args.indexOf('--name') + 1]
+    if (!name) throw new Error('probe has no container name')
     create.proc.complete()
     ;(await call(cli, 1)).proc.complete({ stdout: 'fresh-nonce' })
     cli.responses.push({ match: /^ps /, result: { stdout: `${name}\n` } })
