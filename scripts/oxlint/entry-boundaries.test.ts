@@ -77,8 +77,11 @@ const boundaryCodes = new Set([
   'kurumi(no-relative-package-import)',
 ])
 
-async function refusedFiles(files: Record<string, string>): Promise<Set<string>> {
-  const diagnostics = await lintProbes(files)
+async function refusedFiles(
+  files: Record<string, string>,
+  links: Record<string, string> = {},
+): Promise<Set<string>> {
+  const diagnostics = await lintProbes(files, links)
   return new Set(diagnostics.filter(({ code }) => boundaryCodes.has(code)).map((d) => d.filename))
 }
 
@@ -130,6 +133,61 @@ describe('a relative import that leaves its package', () => {
     expect(Object.keys(files).filter((path) => !refused.has(path))).toEqual([])
   })
 
+  test('is refused whatever it reaches outside the package', async () => {
+    const files = importing({
+      'packages/probe/src/to-scripts.ts': '../../../scripts/oxlint/kurumi.js',
+      'packages/probe/src/to-root-module.ts': '../../../probe-root.ts',
+      'packages/probe/src/to-root-manifest.ts': '../../../package.json',
+      'packages/probe/src/to-root-modules.ts': '../../../node_modules/oxlint/package.json',
+      'packages/probe/src/to-outside.ts': '../../../../../../../../../etc/hosts',
+      'apps/probe/src/to-root.ts': '../../../probe-root.ts',
+      'scripts/oxlint/to-package.ts': `../../packages/${account}`,
+      'probe-root-tool.ts': `./packages/${account}`,
+    })
+
+    const refused = await refusedFiles(files)
+
+    expect(Object.keys(files).filter((path) => !refused.has(path))).toEqual([])
+  })
+
+  test('is refused through a symlink that exists on disk', async () => {
+    const files = {
+      ...importing({
+        'packages/probe/src/through-link.ts': './linked/catalog.ts',
+        'packages/probe/src/through-workspace-link.ts':
+          '../node_modules/@kurumi/account/src/catalog.ts',
+      }),
+      'packages/account/src/catalog.ts': 'export const catalog = 1\n',
+    }
+    const links = {
+      'packages/probe/src/linked': '../../account/src',
+      'packages/probe/node_modules/@kurumi/account': '../../../account',
+    }
+
+    const refused = await refusedFiles(files, links)
+
+    expect(
+      Object.keys(files).filter(
+        (path) => path.startsWith('packages/probe/src') && !refused.has(path),
+      ),
+    ).toEqual([])
+  })
+
+  test('is refused from a template literal, require and import-equals as well', async () => {
+    const specifier = '../../../../account/src/catalog.ts'
+    const files = {
+      'packages/probe/src/a/b/template.ts': `export const load = () => import(\`${specifier}\`)\n`,
+      'packages/probe/src/a/b/require.ts': `export const m = require('${specifier}')\n`,
+      'packages/probe/src/a/b/require-template.ts': `export const m = require(\`${specifier}\`)\n`,
+      'packages/probe/src/a/b/equals.ts': `import m = require('${specifier}')\nexport const used = m\n`,
+      'packages/probe/src/a/b/type-template.ts': `export type Rule = import('${specifier}').HostRule\n`,
+    }
+
+    const refused = await refusedFiles(files)
+
+    expect(Object.keys(files).filter((path) => !refused.has(path))).toEqual([])
+  })
+
   test('inside the package is still allowed', async () => {
     const files = importing({
       'packages/probe/src/main.ts': './other.ts',
@@ -141,9 +199,30 @@ describe('a relative import that leaves its package', () => {
       'tools/main.ts': './other.ts',
       'packages/probe/src/apps/foo/x.ts': '../../lib.ts',
       'packages/probe/src/packages/util.ts': '../main.ts',
+      'packages/probe/src/leave-and-return.ts': '../../probe/src/other.ts',
+      'packages/probe/src/own-modules.ts': './node_modules/dep/index.js',
+      'scripts/oxlint/to-root-manifest.ts': '../../package.json',
+      'scripts/oxlint/to-sibling.ts': './kurumi.js',
+      'probe-root-tool.ts': './scripts/oxlint/kurumi.js',
     })
 
     const refused = await refusedFiles(files)
+
+    expect([...refused]).toEqual([])
+  })
+
+  test('inside the package is allowed from require, a template literal and a symlink of its own', async () => {
+    const files = {
+      'packages/probe/src/require.ts': "export const m = require('./other.ts')\n",
+      'packages/probe/src/template.ts': 'export const load = () => import(`./other.ts`)\n',
+      'packages/probe/src/computed.ts': 'export const load = (n: string) => import(`./${n}.ts`)\n',
+      'packages/probe/src/aliased.ts':
+        "import * as m from './alias/other.ts'\nexport const used = m\n",
+      'packages/probe/src/other.ts': 'export const other = 1\n',
+    }
+    const links = { 'packages/probe/src/alias': '.' }
+
+    const refused = await refusedFiles(files, links)
 
     expect([...refused]).toEqual([])
   })

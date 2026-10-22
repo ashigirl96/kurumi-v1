@@ -13,15 +13,23 @@ export function cleanUpLintProbes() {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 }
 
-export async function lintProbes(files: Record<string, string>): Promise<Diagnostic[]> {
+export async function lintProbes(
+  files: Record<string, string>,
+  links: Record<string, string> = {},
+): Promise<Diagnostic[]> {
   const dir = mkdtempSync(join(tmpdir(), 'kurumi-lint-probes-'))
   dirs.push(dir)
   copyFileSync(join(repo, '.oxlintrc.json'), join(dir, '.oxlintrc.json'))
-  symlinkSync(join(repo, 'scripts'), join(dir, 'scripts'))
+  mkdirSync(join(dir, 'scripts/oxlint'), { recursive: true })
+  copyFileSync(join(repo, 'scripts/oxlint/kurumi.js'), join(dir, 'scripts/oxlint/kurumi.js'))
   symlinkSync(join(repo, 'node_modules'), join(dir, 'node_modules'))
   for (const [path, source] of Object.entries(files)) {
     mkdirSync(join(dir, dirname(path)), { recursive: true })
     writeFileSync(join(dir, path), source)
+  }
+  for (const [path, target] of Object.entries(links)) {
+    mkdirSync(join(dir, dirname(path)), { recursive: true })
+    symlinkSync(target, join(dir, path))
   }
   const roots = [...new Set(Object.keys(files).map((path) => path.split('/')[0]!))]
   const oxlint = Bun.spawn([join(repo, 'node_modules/.bin/oxlint'), '-f', 'json', ...roots], {

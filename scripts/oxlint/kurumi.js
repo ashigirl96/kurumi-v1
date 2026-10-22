@@ -1,11 +1,40 @@
 // oxlint は node で動き、node の版によっては TS の plugin を読めないので JS で書く。
 
-import { dirname, relative, resolve } from 'node:path'
+import { realpathSync } from 'node:fs'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 const TESTING_ENTRY = /^@kurumi\/[^/]+\/testing$/
 const PACKAGE_DIR = /^((?:packages|apps)\/[^/]+)\//
+const ROOT_PACKAGE = '.'
+const OUTSIDE_REPOSITORY = '(outside the repository)'
 
-const packageOf = (path, root) => PACKAGE_DIR.exec(`${relative(root, path)}/`)?.[1] ?? null
+function realPathOf(path) {
+  const missing = []
+  for (let existing = path; ; existing = dirname(existing)) {
+    try {
+      return join(realpathSync(existing), ...missing)
+    } catch {
+      if (dirname(existing) === existing) return path
+      missing.unshift(basename(existing))
+    }
+  }
+}
+
+function packageOf(path, root) {
+  const fromRoot = relative(root, path)
+  if (fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+    return OUTSIDE_REPOSITORY
+  }
+  return PACKAGE_DIR.exec(`${fromRoot}/`)?.[1] ?? ROOT_PACKAGE
+}
+
+function specifierOf(node) {
+  if (node?.type === 'Literal') return typeof node.value === 'string' ? node.value : undefined
+  if (node?.type === 'TemplateLiteral' && node.expressions.length === 0) {
+    return node.quasis[0]?.value.cooked
+  }
+  return undefined
+}
 
 export default {
   meta: { name: 'kurumi' },
@@ -30,26 +59,35 @@ export default {
     },
     'no-relative-package-import': {
       create(context) {
-        const root = context.cwd
-        const ownPackage = packageOf(context.filename, root)
+        const root = realPathOf(context.cwd)
+        const file = realPathOf(context.filename)
+        const ownPackage = packageOf(file, root)
         const check = (node, specifier) => {
           if (typeof specifier !== 'string' || !specifier.startsWith('.')) return
-          const target = packageOf(resolve(dirname(context.filename), specifier), root)
-          if (target === null || target === ownPackage) return
+          const target = realPathOf(resolve(dirname(file), specifier))
+          if (packageOf(target, root) === ownPackage) return
           context.report({
             node,
             message:
-              '相対 path で他の package の file を import しない。entry は @kurumi/<package>/<entry> で import する（docs/design/module-map.md）',
+              '相対 path で package の外の file を import しない。他の package の entry は @kurumi/<package>/<entry> で import する（docs/design/module-map.md）',
           })
         }
-        const checkSource = (node) => check(node, node.source?.value)
+        const checkSource = (node) => check(node, specifierOf(node.source))
         return {
           ImportDeclaration: checkSource,
           ExportNamedDeclaration: checkSource,
           ExportAllDeclaration: checkSource,
           ImportExpression: checkSource,
+          CallExpression: (node) => {
+            if (node.callee.type === 'Identifier' && node.callee.name === 'require') {
+              check(node, specifierOf(node.arguments[0]))
+            }
+          },
           Literal: (node) => {
-            if (node.parent?.type === 'TSImportType') check(node, node.value)
+            const { type } = node.parent ?? {}
+            if (type === 'TSImportType' || type === 'TSExternalModuleReference') {
+              check(node, specifierOf(node))
+            }
           },
         }
       },
