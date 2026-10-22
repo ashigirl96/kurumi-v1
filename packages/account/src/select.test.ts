@@ -3,9 +3,13 @@ import { describe, expect, test } from 'bun:test'
 import {
   defaultSelectorShape,
   selectorShapeOf,
+  serviceIds,
+  serviceSpec,
   vendorIds,
+  vendorOf,
   type CredentialSlot,
   type ServiceId,
+  type VendorId,
 } from './catalog.ts'
 import {
   accountHandle,
@@ -823,5 +827,113 @@ describe('readSelector', () => {
         }
       })
     })
+  })
+})
+
+type Carrier = {
+  name: string
+  header: string
+  wrap: (secret: string) => string
+  placeholder: string
+}
+
+const authorization = (scheme: string): Carrier => ({
+  name: scheme,
+  header: 'authorization',
+  wrap: (secret) => `${scheme} ${secret}`,
+  placeholder: `${scheme} placeholder`,
+})
+
+type HeaderSlot = { vendor: VendorId; service: ServiceId; slot: CredentialSlot }
+
+const headerSlots = [
+  ...new Map(
+    serviceIds.flatMap((service) => {
+      const { slot } = serviceSpec(service)
+      const vendor = vendorOf(service)
+      return slot.kind === 'query' ? [] : [[`${vendor} ${slot.kind}`, { vendor, service, slot }]]
+    }),
+  ).values(),
+] as HeaderSlot[]
+
+const carriersOf = (slot: CredentialSlot): Carrier[] => {
+  switch (slot.kind) {
+    case 'bearer':
+      return [authorization('Bearer'), authorization('token')]
+    case 'basic':
+      return [
+        {
+          name: 'Basic',
+          header: 'authorization',
+          wrap: (secret) => basic('x', secret),
+          placeholder: basic('x', 'placeholder'),
+        },
+        authorization('Bearer'),
+      ]
+    case 'header':
+      return [
+        {
+          name: slot.header,
+          header: slot.header,
+          wrap: (secret) => secret,
+          placeholder: 'sk-ant-placeholder',
+        },
+      ]
+    case 'query':
+      return []
+  }
+}
+
+const outcomeOf = (
+  { vendor, service, slot }: HeaderSlot,
+  { header }: Carrier,
+  value: string,
+): string => {
+  const label = (name: string) => accountHandle(vendor, name)
+  const candidates = [
+    grant(label('main'), { isDefault: true }),
+    ...['a', 'b', 'Acme', 'Acme, Inc.'].map((name) => grant(label(name))),
+  ]
+  const { selector } = readSelector(
+    selectorShapeOf(vendor),
+    slot,
+    request({ headers: { [header]: value } }),
+  )
+  const selection = selectAccount(service, candidates, selector)
+  if (!selection.ok) return 'refused'
+  return selection.how === 'named' ? selection.handle : `not named, ${selection.how}`
+}
+
+describe('a selector written into every header slot of the catalog', () => {
+  describe.each(headerSlots)('$vendor $slot.kind', (target) => {
+    const { vendor, slot } = target
+    const handle = (name: string) => `${vendor}/${name}`
+    const forms: [string, (name: string) => string][] = [
+      ['the default form', (name) => `kurumi:${handle(name)}`],
+      ['the vendor shape', (name) => selectorShapeOf(vendor).format(handle(name))],
+      ['the default form in capitals', (name) => `KURUMI:${handle(name)}`],
+    ]
+
+    describe.each(carriersOf(slot).map((carrier) => [carrier.name, carrier] as const))(
+      'as %s',
+      (_shape, carrier) => {
+        const outcome = (value: string) => outcomeOf(target, carrier, value)
+
+        test.each(forms)('%s names the account', (_form, selectorOf) => {
+          expect(outcome(carrier.wrap(selectorOf('b')))).toBe(handle('b'))
+        })
+
+        test.each([['sk-ant-kurumi-***'], ['sk-ant-kurumi-'], ['sk-ant-kurumi-YQ=='], ['kurumi:']])(
+          'a look-alike %s that cannot be read is refused',
+          (lookAlike) => {
+            expect(outcome(carrier.wrap(lookAlike))).toBe('refused')
+          },
+        )
+
+        test('a value that is no selector falls back to the default', () => {
+          expect(outcome(carrier.wrap('ya29.placeholder'))).toBe('not named, default')
+        })
+      },
+    )
   })
 })

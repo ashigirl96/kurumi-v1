@@ -382,6 +382,21 @@ describe('selectorShapeOf', () => {
     },
   )
 
+  test.each(vendorIds)('%s selector shape reads the default form as well as its own', (vendor) => {
+    const shape = selectorShapeOf(vendor)
+
+    expect(shape.parse('kurumi:anthropic/b')).toBe('anthropic/b')
+    expect(shape.parse(shape.format('anthropic/b'))).toBe('anthropic/b')
+  })
+
+  test.each(vendorIds)('%s selector shape refuses a look-alike of either form', (vendor) => {
+    const shape = selectorShapeOf(vendor)
+
+    for (const value of ['sk-ant-kurumi-***', 'SK-ANT-KURUMI-YQ==', 'sk-ant-kurumi-']) {
+      expect(shape.parse(value)).toBe(value)
+    }
+  })
+
   test('the default shape accepts a handle typed by hand', () => {
     expect(defaultSelectorShape.parse('kurumi:google/alice@work.example')).toBe(
       'google/alice@work.example',

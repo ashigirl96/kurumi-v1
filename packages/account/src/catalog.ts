@@ -25,8 +25,8 @@ export type OAuthSpec = {
 }
 
 /**
- * `parse` returns null for a slot value that carries no selector (the SDK's own placeholder). A value that carries
- * the vendor's prefix but is malformed is returned whole: it names no granted account, so the caller refuses it
+ * `parse` returns null for a slot value that carries no selector (the SDK's own placeholder). A value that looks like
+ * a selector of either form but is malformed is returned whole: it names no granted account, so the caller refuses it
  * instead of falling back to the default.
  */
 export type SelectorShape = {
@@ -43,6 +43,22 @@ const decodeIfEncoded = (value: string): string => {
 }
 
 const defaultPrefix = /^kurumi:/i
+const anthropicPrefix = 'sk-ant-kurumi-'
+const anthropicPrefixPattern = /^sk-ant-kurumi-/i
+
+function parseDefaultForm(value: string): string | null {
+  return defaultPrefix.test(value) ? decodeIfEncoded(value.slice('kurumi:'.length)) : null
+}
+
+function parseAnthropicForm(value: string): string | null {
+  if (!anthropicPrefixPattern.test(value)) return null
+  const payload = value.slice(anthropicPrefix.length)
+  const decoded = Buffer.from(payload, 'base64url').toString()
+  return decoded !== '' && Buffer.from(decoded).toString('base64url') === payload ? decoded : value
+}
+
+const parseSelector = (value: string): string | null =>
+  parseAnthropicForm(value) ?? parseDefaultForm(value)
 
 /**
  * Percent-encoded because an HTTP header value cannot carry non-Latin1 characters and a query value cannot carry
@@ -51,11 +67,8 @@ const defaultPrefix = /^kurumi:/i
 export const defaultSelectorShape: SelectorShape = {
   format: (handle) =>
     `kurumi:${encodeURIComponent(handle.toWellFormed()).replaceAll('%2F', '/').replaceAll('%40', '@').replaceAll('%3A', ':')}`,
-  parse: (slotValue) =>
-    defaultPrefix.test(slotValue) ? decodeIfEncoded(slotValue.slice('kurumi:'.length)) : null,
+  parse: parseSelector,
 }
-
-const anthropicPrefix = 'sk-ant-kurumi-'
 
 export type VendorSpec = {
   displayName: string
@@ -70,14 +83,7 @@ export const catalog = {
     connect: { kind: 'key' },
     selectorShape: {
       format: (handle) => `${anthropicPrefix}${Buffer.from(handle).toString('base64url')}`,
-      parse: (value) => {
-        if (!value.startsWith(anthropicPrefix)) return null
-        const payload = value.slice(anthropicPrefix.length)
-        const decoded = Buffer.from(payload, 'base64url').toString()
-        return decoded !== '' && Buffer.from(decoded).toString('base64url') === payload
-          ? decoded
-          : value
-      },
+      parse: parseSelector,
     },
     services: {
       'anthropic-api': {
