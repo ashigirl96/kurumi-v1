@@ -1,0 +1,18 @@
+{
+  "name": "codex",
+  "version": "0.4.5",
+  "description": "OpenAI Codex as native Claude Code subagents: the Agent tool starts one and the mod drives codex app-server in its place, no model in between",
+  "author": {
+    "name": "alex2481kobe",
+    "url": "https://github.com/alex2481kobe"
+  },
+  "homepage": "https://github.com/alex2481kobe/claude-mods",
+  "repository": "https://github.com/alex2481kobe/claude-mods",
+  "license": "Apache-2.0",
+  "keywords": [
+    "codex",
+    "subagent",
+    "mod"
+  ],
+  "types": "./types/index.d.ts"
+}
