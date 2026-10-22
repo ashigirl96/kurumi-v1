@@ -159,6 +159,13 @@ describe('readCallback', () => {
     expect(readCallback(callback('state=other&code=abc'), 's1')).toMatchObject({ kind: 'invalid' })
   })
 
+  test('rejects a callback whose state is not ours, even when it carries an error', () => {
+    expect(readCallback(callback('state=other&error=access_denied'), 's1')).toMatchObject({
+      kind: 'invalid',
+    })
+    expect(readCallback(callback('error=access_denied'), 's1')).toMatchObject({ kind: 'invalid' })
+  })
+
   test('rejects a callback with neither a code nor an error', () => {
     expect(readCallback(callback('state=s1'), 's1')).toMatchObject({ kind: 'invalid' })
   })
