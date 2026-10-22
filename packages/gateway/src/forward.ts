@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { request } from 'node:https'
+import { request, type RequestOptions } from 'node:https'
 import { isIP } from 'node:net'
-import { PassThrough, pipeline } from 'node:stream'
+import { PassThrough, pipeline, type Duplex } from 'node:stream'
 
 export type ConnectTarget = { host: string; port: number }
 
@@ -69,12 +69,11 @@ export function authority(target: ConnectTarget): string {
   return target.port === 443 ? host : `${host}:${target.port}`
 }
 
-export async function forward<Principal>(
+async function prepareRequest<Principal>(
   context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
   req: IncomingMessage,
-  res: ServerResponse,
   deps: ForwardDeps<Principal>,
-): Promise<void> {
+): Promise<(Omit<RequestOptions, 'headers'> & { headers: Record<string, string> }) | null> {
   const { target } = context
   const path = req.url ?? '/'
   const host = req.headers.host?.toLowerCase()
@@ -84,8 +83,7 @@ export async function forward<Principal>(
     !host ||
     (host !== authority(target) && !(target.port === 443 && host === `${authority(target)}:443`))
   ) {
-    res.writeHead(400, { connection: 'close' }).end()
-    return
+    return null
   }
   const injection = await deps.inject({
     principal: context.principal,
@@ -95,7 +93,6 @@ export async function forward<Principal>(
     headers: withoutHopHeaders(requestHeaders(req)),
     rawHeaders: [...req.rawHeaders],
   })
-  if (context.signal.aborted || res.destroyed) return
   const headers = withoutHopHeaders(injection.headers)
   headers.set('host', authority(target))
   headers.delete('content-length')
@@ -105,8 +102,7 @@ export async function forward<Principal>(
     headers.set('content-length', req.headers['content-length'])
   }
   const destination = deps.upstream?.host === target.host ? deps.upstream : undefined
-  const body = new PassThrough()
-  const upstream = request({
+  return {
     hostname: destination?.address ?? target.host,
     port: destination?.port ?? target.port,
     servername: isIP(target.host) ? undefined : target.host,
@@ -115,7 +111,23 @@ export async function forward<Principal>(
     path: injection.path,
     headers: Object.fromEntries(headers),
     agent: false,
-  })
+  }
+}
+
+export async function forward<Principal>(
+  context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: ForwardDeps<Principal>,
+): Promise<void> {
+  const options = await prepareRequest(context, req, deps)
+  if (context.signal.aborted || res.destroyed) return
+  if (!options) {
+    res.writeHead(400, { connection: 'close' }).end()
+    return
+  }
+  const body = new PassThrough()
+  const upstream = request(options)
 
   const cancel = () => {
     upstream.destroy()
@@ -143,7 +155,7 @@ export async function forward<Principal>(
       return
     }
     res.writeHead(502, { 'content-type': 'application/json', connection: 'close' })
-    res.end(JSON.stringify({ error: 'upstream_unreachable', host: target.host }))
+    res.end(JSON.stringify({ error: 'upstream_unreachable', host: context.target.host }))
   })
   upstream.once('response', (response) => {
     const responseHeaders = withoutHopHeaders(requestHeaders(response))
@@ -159,4 +171,90 @@ export async function forward<Principal>(
   pipeline(body, upstream, (error) => {
     if (error) body.destroy()
   })
+}
+
+export async function forwardUpgrade<Principal>(
+  context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
+  req: IncomingMessage,
+  client: Duplex,
+  head: Buffer,
+  deps: ForwardDeps<Principal>,
+): Promise<void> {
+  if (
+    req.method !== 'GET' ||
+    req.headers.upgrade?.toLowerCase() !== 'websocket' ||
+    req.headers['transfer-encoding'] !== undefined ||
+    (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0')
+  ) {
+    client.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+    return
+  }
+  const options = await prepareRequest(context, req, deps)
+  if (context.signal.aborted || client.destroyed) return
+  if (!options) {
+    client.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+    return
+  }
+  const upstream = request({
+    ...options,
+    headers: { ...options.headers, connection: 'Upgrade', upgrade: 'websocket' },
+  })
+  let upgraded: Duplex | undefined
+  const cancel = () => {
+    upstream.destroy()
+    upgraded?.destroy()
+  }
+  const cleanup = () => {
+    cancel()
+    context.signal.removeEventListener('abort', cancel)
+  }
+  context.signal.addEventListener('abort', cancel, { once: true })
+  upstream.once('close', () => {
+    if (!upgraded) cleanup()
+  })
+  upstream.once('error', () => {
+    if (client.destroyed) return
+    if (upgraded) client.destroy()
+    else client.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+  })
+  upstream.once('response', (response) => {
+    const headers = withoutHopHeaders(requestHeaders(response))
+    headers.set('connection', 'close')
+    client.write(upgradeResponse(response.statusCode ?? 502, headers))
+    pipeline(response, client, () => cancel())
+  })
+  upstream.once('upgrade', (response, socket, upstreamHead) => {
+    upgraded = socket
+    if (context.signal.aborted || client.destroyed) {
+      cleanup()
+      return
+    }
+    if (response.headers.upgrade?.toLowerCase() !== 'websocket') {
+      cleanup()
+      client.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+      return
+    }
+    const headers = withoutHopHeaders(requestHeaders(response))
+    headers.set('connection', 'Upgrade')
+    headers.set('upgrade', 'websocket')
+    client.write(upgradeResponse(101, headers))
+    if (upstreamHead.length) client.write(upstreamHead)
+    if (head.length) socket.write(head)
+    const done = () => {
+      client.destroy()
+      cleanup()
+    }
+    pipeline(socket, client, done)
+    pipeline(client, socket, done)
+  })
+  upstream.end()
+}
+
+function upgradeResponse(status: number, headers: Headers): string {
+  let response = `HTTP/1.1 ${status} ${status === 101 ? 'Switching Protocols' : 'Upstream Response'}\r\n`
+  for (const [name, value] of headers) {
+    if (name !== 'set-cookie') response += `${name}: ${value}\r\n`
+  }
+  for (const cookie of headers.getSetCookie()) response += `set-cookie: ${cookie}\r\n`
+  return response + '\r\n'
 }

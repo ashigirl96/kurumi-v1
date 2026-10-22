@@ -143,6 +143,148 @@ export async function startFakeUpstream({
   }
 }
 
+export type SseTransfer = { path: string; written: number; closed: boolean }
+
+type WebSocketSession = { headers: Headers; messages: number; closeCode: number | null }
+
+export async function startFakeStreamUpstream({
+  host = 'fake.test',
+  port = 0,
+  bindHost = '127.0.0.1',
+}: { host?: string; port?: number; bindHost?: string } = {}) {
+  const ca = await createCertificateAuthority()
+  const leaf = await ca.leafFor(host)
+  const streams: SseTransfer[] = []
+  const webSockets: WebSocketSession[] = []
+  const replays = new Map<string, string>()
+  const server = Bun.serve<{ session: WebSocketSession; closeCode: number | null }>({
+    hostname: bindHost,
+    port,
+    idleTimeout: 0,
+    tls: { key: leaf.keyPem, cert: leaf.certPem },
+    fetch(req, listener) {
+      const url = new URL(req.url)
+      if (url.pathname === '/stats') {
+        return Response.json({
+          pid: process.pid,
+          streams,
+          webSockets: webSockets.map((entry) => ({
+            headers: Object.fromEntries(entry.headers),
+            messages: entry.messages,
+            closeCode: entry.closeCode,
+          })),
+          pendingWebSockets: listener.pendingWebSockets,
+        })
+      }
+      if (url.pathname === '/ws') {
+        const closeCode = url.searchParams.has('closeCode')
+          ? Number(url.searchParams.get('closeCode'))
+          : null
+        if (
+          closeCode !== null &&
+          (!Number.isInteger(closeCode) || closeCode < 3000 || closeCode > 4999)
+        ) {
+          return new Response('Invalid close code', { status: 400 })
+        }
+        const session: WebSocketSession = { headers: req.headers, messages: 0, closeCode: null }
+        if (listener.upgrade(req, { data: { session, closeCode } })) {
+          webSockets.push(session)
+          return
+        }
+        return new Response('WebSocket upgrade required', { status: 400 })
+      }
+      const replay = replays.get(url.pathname)
+      if (replay !== undefined)
+        return new Response(replay, { headers: { 'content-type': 'text/event-stream' } })
+      if (url.pathname === '/sse' || url.pathname === '/sse-idle') {
+        const total = Number(url.searchParams.get('bytes') ?? 200 * 1024 * 1024)
+        const idleMs = Number(url.searchParams.get('ms') ?? 120_000)
+        if (
+          !Number.isSafeInteger(total) ||
+          total < 0 ||
+          !Number.isSafeInteger(idleMs) ||
+          idleMs < 0
+        ) {
+          return new Response('Invalid stream size or delay', { status: 400 })
+        }
+        const entry: SseTransfer = { path: url.pathname + url.search, written: 0, closed: false }
+        streams.push(entry)
+        const chunk = Buffer.from(('data: ' + 'x'.repeat(1016) + '\n\n').repeat(64))
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const body = new ReadableStream<Uint8Array>(
+          {
+            start(controller) {
+              if (url.pathname !== '/sse-idle') return
+              timer = setTimeout(() => {
+                const event = Buffer.from('data: awake\n\n')
+                entry.written += event.length
+                controller.enqueue(event)
+                controller.close()
+                entry.closed = true
+              }, idleMs)
+            },
+            pull(controller) {
+              if (url.pathname === '/sse-idle') return
+              const left = total - entry.written
+              if (left === 0) {
+                entry.closed = true
+                controller.close()
+                return
+              }
+              const bytes = chunk.subarray(0, Math.min(left, chunk.length))
+              entry.written += bytes.length
+              controller.enqueue(bytes)
+            },
+            cancel() {
+              clearTimeout(timer)
+              entry.closed = true
+            },
+          },
+          { highWaterMark: 0 },
+        )
+        return new Response(body, { headers: { 'content-type': 'text/event-stream' } })
+      }
+      return Response.json({
+        path: url.pathname + url.search,
+        headers: Object.fromEntries(req.headers),
+      })
+    },
+    websocket: {
+      idleTimeout: 0,
+      open(socket) {
+        if (socket.data.closeCode !== null) socket.close(socket.data.closeCode, 'upstream close')
+      },
+      message(socket, message) {
+        socket.data.session.messages++
+        socket.send(message)
+      },
+      close(socket, code) {
+        socket.data.session.closeCode = code
+      },
+    },
+  })
+  console.info(JSON.stringify({ event: 'upstream.started', pid: process.pid, port: server.port }))
+  return {
+    pid: process.pid,
+    port: server.port,
+    caPem: ca.certPem,
+    destination: {
+      host,
+      address: '127.0.0.1',
+      port: server.port,
+      caPem: ca.certPem,
+    } satisfies UpstreamDestination,
+    streams,
+    webSockets,
+    setSseResponse: (path: string, body: string) => {
+      replays.set(path, body)
+    },
+    stop: async () => {
+      await server.stop(true)
+    },
+  }
+}
+
 export async function startTestGateway({
   port,
   token,
