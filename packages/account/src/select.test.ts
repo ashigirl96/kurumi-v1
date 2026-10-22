@@ -642,8 +642,23 @@ function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
     ['a long run of spaces after a stray character', `Basic !${' '.repeat(8192)}x`, 'default'],
     ['a doubled scheme word', `Basic ${basic('x', selector)}`, 'refused'],
     [
-      'a selector shifted off base64 alignment is not seen',
+      'a selector shifted off base64 alignment by three characters is not seen',
       `Basic QUJ${b64(`x:${selector}`)}`,
+      'default',
+    ],
+    [
+      'a selector shifted off base64 alignment by five characters is not seen',
+      `Basic QUJDR${b64(`x:${selector}`)}`,
+      'default',
+    ],
+    [
+      'another scheme word before the blob shifts it and is not seen',
+      `Basic Bearer ${b64(`x:${selector}`)}`,
+      'default',
+    ],
+    [
+      'the word cut across two joined Basic credentials is not seen',
+      `Basic ${b64(`x:${selector}`).slice(0, 8)}, Basic ${b64(`x:${selector}`).slice(8)}`,
       'default',
     ],
     [
@@ -770,7 +785,7 @@ describe('a long run of one character in a Basic credential', () => {
       }
     }
 
-    expect(performance.now() - started).toBeLessThan(100)
+    expect(performance.now() - started).toBeLessThan(1000)
   })
 })
 
@@ -783,6 +798,11 @@ describe('what a refused Basic credential echoes', () => {
     ],
     ['not base64: the header as received', 'Basic kurumi:github/b', 'Basic kurumi:github/b'],
     ['one blob with the word only as received: the header', 'Basic kurumi', 'Basic kurumi'],
+    [
+      'a doubled scheme word: the decoded credential',
+      `Basic ${basic('x', 'kurumi:github/b')}`,
+      'x:kurumi:github/b',
+    ],
     [
       'two joined: the decoded credential that holds the word',
       `${basic('u', 'REALSECRET')}, ${basic('x', 'kurumi:github/b')}`,

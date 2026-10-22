@@ -27,7 +27,10 @@ const mentionsInQuery = (value: string): boolean => mentions(asQueryWrites(value
 // pieces is refused unread. Every pattern here is linear in a run of one character.
 const notOneBlob = /[^A-Za-z0-9+/=_-]|=[A-Za-z0-9+/_-]/
 const schemeWord = /\sbasic\s/i
-const fieldSeparator = new RegExp(`,(?:${schemeWord.source})?|${schemeWord.source}`, 'i')
+const fieldSeparator = new RegExp(
+  `,(?:${schemeWord.source})?|${schemeWord.source}`,
+  schemeWord.flags,
+)
 const decodedBase64 = (text: string): string => Buffer.from(text, 'base64').toString()
 
 type Value = { mentions: boolean; credential: string | null }

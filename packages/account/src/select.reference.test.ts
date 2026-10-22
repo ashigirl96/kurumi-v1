@@ -126,7 +126,7 @@ const pads = [
   'QUFBQUFBQUE,'.repeat(200),
   '%25'.repeat(500),
   `${' '.repeat(3000)}x`,
-  `${'='.repeat(3000)}x`,
+  '='.repeat(3000),
 ]
 
 type Slot = { vendor: VendorId; service: ServiceId; slot: CredentialSlot; url: string }

@@ -105,7 +105,10 @@ const mentionsInQuery = mentionsIn(decodedQueryValue)
 // pieces is refused unread. Every pattern here is linear in a run of one character.
 const notOneBlob = /[^A-Za-z0-9+/=_-]|=[A-Za-z0-9+/_-]/
 const schemeWord = /\sbasic\s/i
-const fieldSeparator = new RegExp(`,(?:${schemeWord.source})?|${schemeWord.source}`, 'i')
+const fieldSeparator = new RegExp(
+  `,(?:${schemeWord.source})?|${schemeWord.source}`,
+  schemeWord.flags,
+)
 const piecesOf = (credential: string): string[] =>
   credential.split(fieldSeparator, 17).flatMap((field) =>
     field
