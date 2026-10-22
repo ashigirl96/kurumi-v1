@@ -24,8 +24,7 @@ export type Selection =
 
 /**
  * Every refusal names the next step for the agent and none lists accounts outside the caller's group: an agent
- * learns about other groups' accounts only through a human-facing Connect Card. For `account_not_granted`, `named`
- * is the handle the agent wrote, or the text it wrote where no single selector could be read from it.
+ * learns about other groups' accounts only through a human-facing Connect Card. `named` is the text the agent wrote.
  */
 export type SelectionRefusal =
   | { code: 'account_not_connected'; service: ServiceId }
@@ -101,26 +100,25 @@ function takeQueryParam(url: URL, param: string): string[] {
   return values
 }
 
-/** What a slot value holds beside the one place its credential goes. */
-type Written = { beside: string; credential: string }
+type Written = { around: string; credential: string }
 
 function writtenInAuthorization(header: string): Written {
   const [, scheme = '', credential = ''] = /^(\w+\s+)(.+)$/.exec(header) ?? []
   switch (scheme.trim().toLowerCase()) {
     case 'bearer':
     case 'token':
-      return { beside: scheme, credential }
+      return { around: scheme, credential }
     case 'basic': {
       if (!/^[A-Za-z0-9+/]+={0,2}$/.test(credential)) break
       const userAndPassword = Buffer.from(credential, 'base64').toString()
       const separator = userAndPassword.indexOf(':') + 1
       return {
-        beside: userAndPassword.slice(0, separator),
+        around: userAndPassword.slice(0, separator),
         credential: userAndPassword.slice(separator),
       }
     }
   }
-  return { beside: header, credential: '' }
+  return { around: header, credential: '' }
 }
 
 function takeHeader(headers: Headers, name: string): string[] {
@@ -129,7 +127,7 @@ function takeHeader(headers: Headers, name: string): string[] {
   return value === null ? [] : [value]
 }
 
-const alone = (credential: string): Written => ({ beside: '', credential })
+const alone = (credential: string): Written => ({ around: '', credential })
 
 function takeWritten(slot: CredentialSlot, headers: Headers, url: URL): Written[] {
   switch (slot.kind) {
@@ -149,40 +147,27 @@ function mentionsKurumi(text: string): boolean {
   return [text, decodeQueryComponent(text), ...base64Tokens].some((view) => /kurumi/i.test(view))
 }
 
-/**
- * Every value in the slot gets one of two readings. With no value mentioning kurumi there is no selector and the
- * result is `none`, which is how the SDK's own placeholder passes. Once any value mentions it the request names an
- * account, and it is read only when the slot holds one value that is one selector where the credential goes and
- * names a label that does not mention the word. Everything else is refused, never `none` and never another account.
- */
+/** Once the word appears the result is never `none`, which would fall back to the default account. */
 function selectorIn(
   values: readonly Written[],
   parse: (credential: string) => string | null,
 ): Selector {
-  const texts = values.map(({ beside, credential }) => beside + credential)
+  const texts = values.map(({ around, credential }) => around + credential)
   if (!texts.some(mentionsKurumi)) return { kind: 'none' }
   const [only, ...more] = values
   const handle =
-    only && more.length === 0 && !mentionsKurumi(only.beside) ? parse(only.credential) : null
+    only && more.length === 0 && !mentionsKurumi(only.around) ? parse(only.credential) : null
   return handle !== null && !mentionsKurumi(handle)
     ? { kind: 'handle', handle }
     : { kind: 'unreadable', written: texts.join(' | ') }
 }
 
-/**
- * Every handle holds a `/`, which a component encoder writes as `%2F` and `format` never does. A value with `%2F`
- * was encoded again and is decoded first. Any other value is the shape's own text, read as written.
- */
 function parseAsWrittenThenDecoded(shape: SelectorShape, value: string): string | null {
   const decoded = decodeQueryComponent(value)
   const [first, second] = /%2f/i.test(value) ? [decoded, value] : [value, decoded]
   return shape.parse(first) ?? shape.parse(second)
 }
 
-/**
- * Reads the handle the agent wrote where the real credential would go, and returns the request with that slot
- * emptied whether or not it held a selector.
- */
 export function readSelector(
   shape: SelectorShape,
   slot: CredentialSlot,

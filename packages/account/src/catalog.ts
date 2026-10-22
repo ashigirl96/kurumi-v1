@@ -24,11 +24,6 @@ export type OAuthSpec = {
   pkce: boolean
 }
 
-/**
- * `parse` returns the handle of a value that is exactly one selector in either form, and null for anything else:
- * the SDK's own placeholder, a look-alike that cannot be read, or text around a selector. The reader decides which
- * of those is a placeholder to ignore and which is a refusal.
- */
 export type SelectorShape = {
   format: (handle: string) => string
   parse: (slotValue: string) => string | null
