@@ -17,11 +17,30 @@ export type ServiceSpec = {
   containerEnv?: (selector: string) => Readonly<Record<string, string>>
 }
 
+export type TokenResponse = Readonly<{
+  accessToken: string
+  tokenType: string
+  expiresIn: number
+  scope: string | null
+  refreshToken: string | null
+  idToken: string | null
+}>
+
+export type Identity = Readonly<{
+  subject: string
+  label: string
+  grantedScopes: readonly string[]
+}>
+
+export class IdentifyError extends Error {}
+
 export type OAuthSpec = {
   authorizeUrl: string
   tokenUrl: string
   authorizeParams?: Readonly<Record<string, string>>
   pkce: boolean
+  identityScopes: readonly string[]
+  identify: (tokens: TokenResponse) => Identity
 }
 
 export type SelectorShape = {
@@ -57,6 +76,48 @@ export const defaultSelectorShape: SelectorShape = {
   format: (handle) =>
     `kurumi:${encodeURIComponent(handle.toWellFormed()).replaceAll('%2F', '/').replaceAll('%40', '@').replaceAll('%3A', ':')}`,
   parse: parseDefaultForm,
+}
+
+export const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
+function parseJsonOrNull(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
+function unverifiedJwtClaims(jwt: string): Readonly<Record<string, unknown>> {
+  const [, payload, signature, ...rest] = jwt.split('.')
+  if (payload === undefined || signature === undefined || rest.length > 0) {
+    throw new IdentifyError('Google sent an id_token that is not a JWT')
+  }
+  const claims = parseJsonOrNull(Buffer.from(payload, 'base64url').toString())
+  if (isRecord(claims)) return claims
+  throw new IdentifyError('Google sent an id_token whose payload is not a JSON object')
+}
+
+function googleIdentify(tokens: TokenResponse): Identity {
+  if (tokens.scope === null) {
+    throw new IdentifyError('Google sent no scope, so the grant is unknown')
+  }
+  if (tokens.idToken === null) {
+    throw new IdentifyError('Google sent no id_token, so the account cannot be named')
+  }
+  const { sub, email } = unverifiedJwtClaims(tokens.idToken)
+  if (typeof sub !== 'string' || sub === '') {
+    throw new IdentifyError('The Google id_token has no sub claim')
+  }
+  if (typeof email !== 'string' || email === '') {
+    throw new IdentifyError('The Google id_token has no email claim')
+  }
+  return {
+    subject: sub,
+    label: email,
+    grantedScopes: tokens.scope.split(' ').filter((scope) => scope !== ''),
+  }
 }
 
 export type VendorSpec = {
@@ -98,6 +159,8 @@ export const catalog = {
           include_granted_scopes: 'true',
         },
         pkce: true,
+        identityScopes: ['openid', 'email'],
+        identify: googleIdentify,
       },
     },
     services: {
@@ -133,6 +196,10 @@ export const catalog = {
         tokenUrl: 'https://api.notion.com/v1/oauth/token',
         authorizeParams: { owner: 'user' },
         pkce: false,
+        identityScopes: [],
+        identify: () => {
+          throw new IdentifyError('Notion accounts cannot be identified yet')
+        },
       },
     },
     services: {
