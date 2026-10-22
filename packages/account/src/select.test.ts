@@ -576,6 +576,8 @@ describe('readSelector', () => {
       'github/a b',
       'google/日本語+ @x.example',
       'github/100%',
+      'google/a%41b',
+      'github/a%2Fb',
     ]
     const slots: [
       string,
@@ -600,21 +602,46 @@ describe('readSelector', () => {
       ],
     ]
 
-    test.each(['google/a&b@x.example', 'google/a+b@x.example', 'notion/a#b=c d', 'github/a;b'])(
-      'the selector %s can be pasted into the query slot as it is',
-      (label) => {
-        const raw = `https://h.example/x?alt=json&key=${defaultSelectorShape.format(label)}&q=1`
+    test.each([
+      'google/a&b@x.example',
+      'google/a+b@x.example',
+      'notion/a#b=c d',
+      'github/a;b',
+      'google/a%41b',
+      'github/a%2Fb',
+      'github/%41',
+      'notion/50%25off',
+      'google/a%2Bb@x.example',
+      'github/100%',
+    ])('the selector %s can be pasted into the query slot as it is', (label) => {
+      const raw = `https://h.example/x?alt=json&key=${defaultSelectorShape.format(label)}&q=1`
 
-        const { selector, stripped } = readSelector(
-          defaultSelectorShape,
-          { kind: 'query', param: 'key' },
-          request({ url: raw }),
-        )
+      const { selector, stripped } = readSelector(
+        defaultSelectorShape,
+        { kind: 'query', param: 'key' },
+        request({ url: raw }),
+      )
 
-        expect(selector).toEqual(named(label))
-        expect(stripped.url.href).toBe('https://h.example/x?alt=json&q=1')
-      },
-    )
+      expect(selector).toEqual(named(label))
+      expect(stripped.url.href).toBe('https://h.example/x?alt=json&q=1')
+    })
+
+    test('a pasted selector names the account it was formatted from, not a lookalike', () => {
+      const formatted = defaultSelectorShape.format('google/a%41b')
+      const { selector } = readSelector(
+        defaultSelectorShape,
+        { kind: 'query', param: 'key' },
+        request({ url: `https://h.example/x?key=${formatted}` }),
+      )
+
+      expect(
+        selectAccount(
+          'gmail',
+          [grant(accountHandle('google', 'aAb')), grant(accountHandle('google', 'a%41b'))],
+          selector,
+        ),
+      ).toMatchObject({ ok: true, handle: 'google/a%41b', how: 'named' })
+    })
 
     describe.each(vendorIds)('%s shape', (vendor) => {
       const shape = selectorShapeOf(vendor)

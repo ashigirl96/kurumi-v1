@@ -89,31 +89,28 @@ const decodeQueryComponent = (value: string): string => {
   }
 }
 
-function takeQueryParam(url: URL, param: string): string | null {
-  let found: string | null = null
+function takeQueryParam(url: URL, param: string): string[] {
+  const values: string[] = []
   const kept: string[] = []
   for (const pair of url.search.slice(1).split('&')) {
     const separator = pair.indexOf('=')
     const name = decodeQueryComponent(separator === -1 ? pair : pair.slice(0, separator))
-    if (name !== param) {
-      kept.push(pair)
-      continue
-    }
-    found ??= decodeQueryComponent(separator === -1 ? '' : pair.slice(separator + 1))
+    if (name === param) values.push(separator === -1 ? '' : pair.slice(separator + 1))
+    else kept.push(pair)
   }
-  if (found !== null) url.search = kept.join('&')
-  return found
+  if (values.length > 0) url.search = kept.join('&')
+  return values
 }
 
-function takeHeader(headers: Headers, name: string): string | null {
+function takeHeader(headers: Headers, name: string): string[] {
   const value = headers.get(name)
   headers.delete(name)
-  return value?.trim() ?? null
+  return value === null ? [] : [value.trim()]
 }
 
 /** `Bearer` and `token` carry the secret itself, `Basic` carries it as the password. */
-function secretOfAuthorization(authorization: string | null): string | null {
-  const [, scheme = '', value = ''] = /^(\w+)\s+(.+)$/.exec(authorization ?? '') ?? []
+function secretOfAuthorization(authorization: string): string | null {
+  const [, scheme = '', value = ''] = /^(\w+)\s+(.+)$/.exec(authorization) ?? []
   switch (scheme.toLowerCase()) {
     case 'bearer':
     case 'token':
@@ -128,11 +125,14 @@ function secretOfAuthorization(authorization: string | null): string | null {
   }
 }
 
-function takeCredential(slot: CredentialSlot, headers: Headers, url: URL): string | null {
+function takeCredentials(slot: CredentialSlot, headers: Headers, url: URL): string[] {
   switch (slot.kind) {
     case 'bearer':
     case 'basic':
-      return secretOfAuthorization(takeHeader(headers, 'authorization'))
+      return takeHeader(headers, 'authorization').flatMap((authorization) => {
+        const secret = secretOfAuthorization(authorization)
+        return secret === null ? [] : [secret]
+      })
     case 'header':
       return takeHeader(headers, slot.header)
     case 'query':
@@ -141,9 +141,22 @@ function takeCredential(slot: CredentialSlot, headers: Headers, url: URL): strin
 }
 
 /**
+ * A value written in a query is either the shape's own text pasted as it is, or that text percent-encoded again
+ * by a URL builder. Reading the pasted form first keeps a `%` the shape wrote from being decoded twice.
+ */
+function parseQueryValue(shape: SelectorShape, value: string): string | null {
+  return shape.parse(value) ?? shape.parse(decodeQueryComponent(value))
+}
+
+function selectorOf(handles: readonly string[]): Selector {
+  const [first] = handles
+  return first === undefined ? { kind: 'none' } : { kind: 'handle', handle: first }
+}
+
+/**
  * Reads the handle the agent wrote where the real credential would go, and returns the request with that slot
  * emptied whether or not it held a selector. A value the shape does not recognize (the SDK's own placeholder)
- * is `none`.
+ * is `none`, unless another value in the same slot carries a selector.
  */
 export function readSelector(
   shape: SelectorShape,
@@ -152,10 +165,8 @@ export function readSelector(
 ): { selector: Selector; stripped: { headers: Headers; url: URL } } {
   const headers = new Headers(req.headers)
   const url = new URL(req.url)
-  const credential = takeCredential(slot, headers, url)
-  const handle = credential === null ? null : shape.parse(credential)
-  return {
-    selector: handle === null ? { kind: 'none' } : { kind: 'handle', handle },
-    stripped: { headers, url },
-  }
+  const parse = (value: string) =>
+    slot.kind === 'query' ? parseQueryValue(shape, value) : shape.parse(value)
+  const handles = takeCredentials(slot, headers, url).flatMap((value) => parse(value) ?? [])
+  return { selector: selectorOf(handles), stripped: { headers, url } }
 }
