@@ -150,9 +150,15 @@ export function createDockerDriver(options: {
     if (!owned) return
     const { name, kind } = owned
     let removed = false
+    let removing = false
     let removalError: unknown
     try {
       const exit = await cli.start(['rm', '--force', name]).result
+      removing =
+        exit.code !== 0 &&
+        /^(?:Error response from daemon: )?removal (?:of container [^\r\n]+ is )?already in progress\s*$/.test(
+          exit.stderr,
+        )
       if (
         exit.code !== 0 &&
         /^(?:Error response from daemon: )?No such container(?:: [^\r\n]+)?\s*$/.test(exit.stderr)
@@ -167,15 +173,21 @@ export function createDockerDriver(options: {
     }
     if (!removed) {
       try {
-        const names = await run([
-          'ps',
-          '-a',
-          '--filter',
-          `name=^/${name}$`,
-          '--format',
-          '{{.Names}}',
-        ])
-        if (names.trim() !== '') throw error(`container ${name} still exists`)
+        const deadline = performance.now() + timeoutMs
+        while (true) {
+          const names = await run([
+            'ps',
+            '-a',
+            '--filter',
+            `name=^/${name}$`,
+            '--format',
+            '{{.Names}}',
+          ])
+          if (names.trim() === '') break
+          const remaining = deadline - performance.now()
+          if (!removing || remaining <= 0) throw error(`container ${name} still exists`)
+          await new Promise((resolve) => setTimeout(resolve, Math.min(25, remaining)))
+        }
       } catch (absenceError) {
         throw new CleanupError(
           `Docker (${options.image}): cleanup of ${name} failed: ${String(removalError ?? 'removal unconfirmed')}; ${String(absenceError)}`,

@@ -13,7 +13,8 @@ function setup() {
 }
 
 async function call(cli: FakeCli, index: number) {
-  for (let turn = 0; turn < 30; turn++) {
+  const deadline = performance.now() + 1000
+  while (performance.now() < deadline) {
     const result = cli.started[index]
     if (result) return result
     await Bun.sleep(5)
