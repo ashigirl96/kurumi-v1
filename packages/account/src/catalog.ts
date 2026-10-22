@@ -46,6 +46,11 @@ const defaultPrefix = /^kurumi:/i
 const anthropicPrefix = 'sk-ant-kurumi-'
 const anthropicPrefixPattern = /^sk-ant-kurumi-/i
 
+export const startsSelector = (value: string): boolean =>
+  defaultPrefix.test(value) || anthropicPrefixPattern.test(value)
+
+export const selectorMayHoldComma = (value: string): boolean => defaultPrefix.test(value)
+
 function parseDefaultForm(value: string): string | null {
   return defaultPrefix.test(value) ? decodeIfEncoded(value.slice('kurumi:'.length)) : null
 }

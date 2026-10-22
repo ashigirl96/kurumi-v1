@@ -933,6 +933,54 @@ describe('a selector written into every header slot of the catalog', () => {
         test('a value that is no selector falls back to the default', () => {
           expect(outcome(carrier.wrap('ya29.placeholder'))).toBe('not named, default')
         })
+
+        test('a label with a comma is the account it names, not a lookalike', () => {
+          expect(outcome(carrier.wrap(`kurumi:${handle('Acme, Inc.')}`))).toBe(handle('Acme, Inc.'))
+        })
+
+        test('a label with a comma written as %2C is the same account', () => {
+          expect(outcome(carrier.wrap(`kurumi:${handle('Acme%2C%20Inc.')}`))).toBe(
+            handle('Acme, Inc.'),
+          )
+        })
+
+        describe.each(forms.slice(0, 2))('with %s', (_form, selectorOf) => {
+          const a = carrier.wrap(selectorOf('a'))
+          const b = carrier.wrap(selectorOf('b'))
+
+          test('a placeholder before the selector is ignored', () => {
+            expect(outcome(`${carrier.placeholder}, ${a}`)).toBe(handle('a'))
+          })
+
+          const readsAsLabel = slot.kind === 'header' && selectorOf('a').startsWith('kurumi:')
+
+          test.if(!readsAsLabel)('a placeholder after the selector is ignored', () => {
+            expect(outcome(`${a}, ${carrier.placeholder}`)).toBe(handle('a'))
+          })
+
+          test.if(readsAsLabel)(
+            'a placeholder after the selector reads as part of the label',
+            () => {
+              expect(outcome(`${a}, ${carrier.placeholder}`)).toBe('refused')
+            },
+          )
+
+          test('two different selectors are refused', () => {
+            expect(outcome(`${a}, ${b}`)).toBe('refused')
+          })
+
+          test('the same selector twice names the account', () => {
+            expect(outcome(`${a}, ${a}`)).toBe(handle('a'))
+          })
+
+          test('two selectors in one value are refused, never the first', () => {
+            expect(outcome(carrier.wrap(`${selectorOf('a')},${selectorOf('b')}`))).toBe('refused')
+          })
+
+          test('a trailing auth-param with a comma never names another account', () => {
+            expect([handle('a'), 'refused']).toContain(outcome(`${a}, realm="x,y"`))
+          })
+        })
       },
     )
   })

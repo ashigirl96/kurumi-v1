@@ -1,4 +1,11 @@
-import type { CredentialSlot, SelectorShape, ServiceId, VendorId } from './catalog.ts'
+import {
+  selectorMayHoldComma,
+  startsSelector,
+  type CredentialSlot,
+  type SelectorShape,
+  type ServiceId,
+  type VendorId,
+} from './catalog.ts'
 
 export type AccountHandle = `${VendorId}/${string}` & { readonly __brand: 'AccountHandle' }
 
@@ -117,15 +124,40 @@ function takeQueryParam(url: URL, param: string): string[] {
   return values
 }
 
-/** A header sent twice reaches us as one value joined with commas, which no selector contains. */
-function takeHeader(headers: Headers, name: string): string[] {
-  const value = headers.get(name)
-  headers.delete(name)
-  return value === null ? [] : value.split(',').map((part) => part.trim())
+type HeaderGrammar = {
+  holdsCommas: (value: string) => boolean
+  startsValue: (rest: string) => boolean
+  secretOf: (value: string) => string | null
 }
 
-/** `Bearer` and `token` carry the secret itself, `Basic` carries it as the password. */
+/** A label may hold a comma, so a comma ends a value only where the next value starts. */
+function splitValues(joined: string, grammar: HeaderGrammar): string[] {
+  const values: string[] = []
+  for (let rest = joined.trim(); rest !== '';) {
+    const end = endOfValue(rest, grammar)
+    values.push(rest.slice(0, end).trim())
+    rest = rest.slice(end + 1).trim()
+  }
+  return values
+}
+
+function endOfValue(rest: string, { holdsCommas, startsValue }: HeaderGrammar): number {
+  const open = holdsCommas(rest)
+  for (let comma = rest.indexOf(','); comma !== -1; comma = rest.indexOf(',', comma + 1)) {
+    if (!open || startsValue(rest.slice(comma + 1).trimStart())) return comma
+  }
+  return rest.length
+}
+
+function takeHeader(headers: Headers, name: string, grammar: HeaderGrammar): string[] {
+  const joined = headers.get(name)
+  headers.delete(name)
+  if (joined === null) return []
+  return splitValues(joined, grammar).flatMap((value) => grammar.secretOf(value) ?? [])
+}
+
 function secretOfAuthorization(authorization: string): string | null {
+  if (startsSelector(authorization)) return authorization
   const [, scheme = '', value = ''] = /^(\w+)\s+(.+)$/.exec(authorization) ?? []
   switch (scheme.toLowerCase()) {
     case 'bearer':
@@ -141,16 +173,25 @@ function secretOfAuthorization(authorization: string): string | null {
   }
 }
 
+const authorizationGrammar: HeaderGrammar = {
+  holdsCommas: (value) => selectorMayHoldComma(value.replace(/^(?:bearer|token)\s+/i, '')),
+  startsValue: (rest) => /^(?:bearer|token|basic)\s/i.test(rest) || startsSelector(rest),
+  secretOf: secretOfAuthorization,
+}
+
+const plainGrammar: HeaderGrammar = {
+  holdsCommas: selectorMayHoldComma,
+  startsValue: startsSelector,
+  secretOf: (value) => value,
+}
+
 function takeCredentials(slot: CredentialSlot, headers: Headers, url: URL): string[] {
   switch (slot.kind) {
     case 'bearer':
     case 'basic':
-      return takeHeader(headers, 'authorization').flatMap((authorization) => {
-        const secret = secretOfAuthorization(authorization)
-        return secret === null ? [] : [secret]
-      })
+      return takeHeader(headers, 'authorization', authorizationGrammar)
     case 'header':
-      return takeHeader(headers, slot.header)
+      return takeHeader(headers, slot.header, plainGrammar)
     case 'query':
       return takeQueryParam(url, slot.param)
   }
