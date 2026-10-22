@@ -521,8 +521,17 @@ describe('readSelector', () => {
       expect(stripped.url.search).toBe('?apikey=1&key2=2&Key=3')
     })
 
-    test('a repeated key parameter is all removed and the first one names the account', () => {
-      const { selector, stripped } = readSelector(
+    const selection = (search: string, candidates: GrantedCandidate[]) => {
+      const { selector } = readSelector(
+        defaultSelectorShape,
+        slot,
+        request({ url: `https://h.example/x${search}` }),
+      )
+      return selectAccount('gmail', candidates, selector)
+    }
+
+    test('a repeated key parameter is all removed', () => {
+      const { stripped } = readSelector(
         defaultSelectorShape,
         slot,
         request({
@@ -530,8 +539,66 @@ describe('readSelector', () => {
         }),
       )
 
-      expect(selector).toEqual(named('google/a@x'))
       expect(stripped.url.search).toBe('?k=1')
+    })
+
+    describe('a key parameter that appears more than once', () => {
+      const only = grant(accountHandle('google', 'only@x.example'))
+      const preferred = grant(accountHandle('google', 'default@x.example'), { isDefault: true })
+      const wanted = grant(accountHandle('google', 'a@x.example'))
+      const other = grant(accountHandle('google', 'b@x.example'))
+
+      test.each([
+        ['placeholder first', '?key=AIzaPlaceholder&alt=json&key=kurumi%3Agoogle%2Fa%40x.example'],
+        ['placeholder last', '?key=kurumi%3Agoogle%2Fa%40x.example&key=AIzaPlaceholder'],
+        ['empty first', '?key=&key=kurumi%3Agoogle%2Fa%40x.example'],
+        [
+          'the same selector twice',
+          '?key=kurumi:google/a@x.example&key=kurumi%3Agoogle%2Fa%40x.example',
+        ],
+      ])('the selector is read when it comes %s', (_where, search) => {
+        expect(selection(search, [wanted, other])).toMatchObject({
+          ok: true,
+          accountId: wanted.accountId,
+          how: 'named',
+        })
+      })
+
+      test.each([
+        ['one grant', [only]],
+        ['a default', [preferred, wanted]],
+      ])('a selector later in the query does not fall back to %s', (_name, candidates) => {
+        const search = '?key=AIzaPlaceholder&key=kurumi%3Agoogle%2Fgone%40x.example'
+
+        expect(selection(search, candidates)).toMatchObject({
+          ok: false,
+          refusal: { code: 'account_not_granted' },
+        })
+      })
+
+      test.each([
+        [
+          'two grants named',
+          [wanted, other],
+          '?key=kurumi:google/a@x.example&key=kurumi:google/b@x.example',
+        ],
+        ['one grant', [only], '?key=kurumi:google/only@x.example&key=kurumi:google/b@x.example'],
+        [
+          'a default',
+          [preferred, wanted],
+          '?key=kurumi:google/default@x.example&key=kurumi:google/a@x.example',
+        ],
+        [
+          'either order',
+          [wanted, other],
+          '?key=kurumi:google/b@x.example&key=kurumi:google/a@x.example',
+        ],
+      ])('two selectors that disagree are refused (%s)', (_name, candidates, search) => {
+        expect(selection(search, candidates)).toMatchObject({
+          ok: false,
+          refusal: { code: 'account_not_granted' },
+        })
+      })
     })
 
     test('no key parameter is none and leaves the url alone', () => {

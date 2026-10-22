@@ -148,9 +148,16 @@ function parseQueryValue(shape: SelectorShape, value: string): string | null {
   return shape.parse(value) ?? shape.parse(decodeQueryComponent(value))
 }
 
+/**
+ * Two selectors that disagree name a handle that cannot be granted, because a granted handle starts with a vendor
+ * id and a slash. They are refused the way a malformed selector is, never settled by taking one of them.
+ */
 function selectorOf(handles: readonly string[]): Selector {
-  const [first] = handles
-  return first === undefined ? { kind: 'none' } : { kind: 'handle', handle: first }
+  const distinct = [...new Set(handles)]
+  const [only] = distinct
+  if (only === undefined) return { kind: 'none' }
+  if (distinct.length === 1) return { kind: 'handle', handle: only }
+  return { kind: 'handle', handle: `conflicting selectors: ${distinct.join(' | ')}` }
 }
 
 /**
