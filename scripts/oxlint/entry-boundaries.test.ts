@@ -132,3 +132,77 @@ describe('a relative import that leaves its package', () => {
     expect([...refused]).toEqual([])
   })
 })
+
+type OxlintConfig = {
+  rules: Record<string, unknown>
+  overrides?: { files: string[]; rules?: Record<string, unknown> }[]
+}
+
+const readConfig = (): OxlintConfig =>
+  Bun.JSONC.parse(readFileSync(join(repo, '.oxlintrc.json'), 'utf8')) as OxlintConfig
+
+const restrictedImportsOf = (rules: Record<string, unknown> = {}): unknown[] =>
+  Object.entries(rules)
+    .filter(([name]) => name.split('/').at(-1) === 'no-restricted-imports')
+    .map(([, entry]) => entry)
+
+function restrictionsOf(entry: unknown): unknown[] {
+  if (!Array.isArray(entry) || (entry[0] !== 'error' && entry[0] !== 2)) return []
+  const options = (entry[1] ?? {}) as { patterns?: unknown[]; paths?: unknown[] }
+  return [...(options.patterns ?? []), ...(options.paths ?? [])]
+}
+
+function overridesDroppingBoundary(config: OxlintConfig): string[] {
+  const boundary = restrictedImportsOf(config.rules).flatMap(restrictionsOf)
+  return (config.overrides ?? [])
+    .filter(({ rules }) =>
+      restrictedImportsOf(rules).some((entry) => {
+        const kept = restrictionsOf(entry)
+        return boundary.some((restriction) => !kept.some((r) => Bun.deepEquals(r, restriction)))
+      }),
+    )
+    .map(({ files }) => files.join(', '))
+}
+
+describe('an override that sets no-restricted-imports', () => {
+  const config = readConfig()
+  const [boundaryRule] = restrictedImportsOf(config.rules)
+
+  const withOverride = (rules: Record<string, unknown>): OxlintConfig => ({
+    rules: config.rules,
+    overrides: [{ files: ['packages/other/**'], rules }],
+  })
+
+  test('the top-level rule carries the entry boundary', () => {
+    expect(restrictionsOf(boundaryRule).length).toBeGreaterThan(0)
+  })
+
+  test('repeats the boundary patterns of the top-level rule, which the override replaces for its files', () => {
+    expect(overridesDroppingBoundary(config)).toEqual([])
+  })
+
+  test.each([
+    ['other patterns', ['error', { patterns: [{ group: ['@kurumi/*/server'], message: 'm' }] }]],
+    ['no options', ['error']],
+    ['turned off', 'off'],
+    ['warning only', ['warn', ...(boundaryRule as unknown[]).slice(1)]],
+  ])('is noticed when it replaces the boundary with %s', (_name, entry) => {
+    expect(overridesDroppingBoundary(withOverride({ 'no-restricted-imports': entry }))).toEqual([
+      'packages/other/**',
+    ])
+  })
+
+  test('is noticed under the plugin-qualified rule name', () => {
+    const override = withOverride({ 'eslint/no-restricted-imports': ['error'] })
+
+    expect(overridesDroppingBoundary(override)).toEqual(['packages/other/**'])
+  })
+
+  test('may add its own restrictions beside the boundary', () => {
+    const [severity, options] = boundaryRule as [string, { patterns: unknown[] }]
+    const extra = { group: ['@kurumi/*/cli'], message: 'm' }
+    const entry = [severity, { ...options, patterns: [...options.patterns, extra] }]
+
+    expect(overridesDroppingBoundary(withOverride({ 'no-restricted-imports': entry }))).toEqual([])
+  })
+})
