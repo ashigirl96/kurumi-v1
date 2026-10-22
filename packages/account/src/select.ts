@@ -100,25 +100,26 @@ function takeQueryParam(url: URL, param: string): string[] {
   return values
 }
 
-type Written = { around: string; credential: string }
+type Written = { raw: string; around: string; credential: string }
 
 function writtenInAuthorization(header: string): Written {
   const [, scheme = '', credential = ''] = /^(\w+\s+)(.+)$/.exec(header) ?? []
   switch (scheme.trim().toLowerCase()) {
     case 'bearer':
     case 'token':
-      return { around: scheme, credential }
+      return { raw: header, around: scheme, credential }
     case 'basic': {
       if (!/^[A-Za-z0-9+/]+={0,2}$/.test(credential)) break
       const userAndPassword = Buffer.from(credential, 'base64').toString()
       const separator = userAndPassword.indexOf(':') + 1
       return {
+        raw: header,
         around: userAndPassword.slice(0, separator),
         credential: userAndPassword.slice(separator),
       }
     }
   }
-  return { around: header, credential: '' }
+  return { raw: header, around: header, credential: '' }
 }
 
 function takeHeader(headers: Headers, name: string): string[] {
@@ -136,7 +137,7 @@ function takeNamingAuthorization(headers: Headers): Written[] {
   return value !== null && mentionsKurumi(value) ? takeAuthorization(headers) : []
 }
 
-const alone = (credential: string): Written => ({ around: '', credential })
+const alone = (credential: string): Written => ({ raw: credential, around: '', credential })
 
 function takeWritten(slot: CredentialSlot, headers: Headers, url: URL): Written[] {
   switch (slot.kind) {
@@ -150,10 +151,31 @@ function takeWritten(slot: CredentialSlot, headers: Headers, url: URL): Written[
   }
 }
 
-/** Real third-party credentials do not hold the word, so a value that does is the agent naming an account. */
+const escapesDecoded = (text: string): string =>
+  text.replace(/%([0-9a-f]{2})/gi, (_, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16)),
+  )
+
+const base64Views = (text: string): string[] =>
+  [text.replace(/\s+/g, ''), ...text.split(/[^A-Za-z0-9+/=_-]+/)].map((token) =>
+    Buffer.from(token, 'base64').toString(),
+  )
+
+const escapeViews = (text: string): string[] => [
+  text,
+  text.replace(/^\w+\s+/, ''),
+  escapesDecoded(text),
+  decodeQueryComponent(text),
+]
+
+/**
+ * Real third-party credentials do not hold the word, so a value that does is the agent naming an account. The word
+ * is looked for as written, past a scheme, with percent escapes decoded, and inside base64 tokens of those.
+ */
 function mentionsKurumi(text: string): boolean {
-  const base64Tokens = text.split(/[\s,]+/).map((token) => Buffer.from(token, 'base64').toString())
-  return [text, decodeQueryComponent(text), ...base64Tokens].some((view) => /kurumi/i.test(view))
+  const views = escapeViews(text)
+  const decoded = views.flatMap(base64Views).flatMap(escapeViews)
+  return [...views, ...decoded].some((view) => /kurumi/iu.test(view))
 }
 
 /** Once the word appears the result is never `none`, which would fall back to the default account. */
@@ -161,14 +183,14 @@ function selectorIn(
   values: readonly Written[],
   parse: (credential: string) => string | null,
 ): Selector {
-  const texts = values.map(({ around, credential }) => around + credential)
-  if (!texts.some(mentionsKurumi)) return { kind: 'none' }
-  const [only, ...more] = values
-  const handle =
-    only && more.length === 0 && !mentionsKurumi(only.around) ? parse(only.credential) : null
+  const naming = values.filter(({ raw }) => mentionsKurumi(raw))
+  const [only] = values
+  if (!only) return { kind: 'none' }
+  if (naming.length === 0) return { kind: 'none' }
+  const handle = values.length === 1 && !mentionsKurumi(only.around) ? parse(only.credential) : null
   return handle !== null && !mentionsKurumi(handle)
     ? { kind: 'handle', handle }
-    : { kind: 'unreadable', written: texts.join(' | ') }
+    : { kind: 'unreadable', written: naming.map((v) => v.around + v.credential).join(' | ') }
 }
 
 function parseAsWrittenThenDecoded(shape: SelectorShape, value: string): string | null {

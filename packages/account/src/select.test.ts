@@ -440,6 +440,7 @@ const groupOf = (vendor: VendorId): GrantedCandidate[] => [
     'Acme',
     'Acme, Inc.',
     'Acme, token team',
+    'kurumi-team',
     'a@x.example',
     'a+b@x.example',
     'a+tag@x.example',
@@ -534,6 +535,19 @@ function rowsOf({ vendor, shape }: Target, { wrap }: Placement): Row[] {
 
 function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
   const selector = `kurumi:${vendor}/a`
+  const hidden = (place: (secret: string) => string): Row[] => [
+    [
+      'a base64 token that decodes to a selector',
+      place(Buffer.from(selector).toString('base64')),
+      'refused',
+    ],
+    [
+      'a base64 token after a colon',
+      place(`x:${Buffer.from(selector).toString('base64')}`),
+      'refused',
+    ],
+    ['an escaped letter of the word and a bad escape', place(`%6Burumi:${vendor}/a%E0`), 'refused'],
+  ]
   if (slot.kind === 'header') {
     return [
       ['a bearer scheme before the selector', `Bearer ${selector}`, 'refused'],
@@ -542,6 +556,7 @@ function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
         `Bearer ${shape.format(`${vendor}/a`)}`,
         'refused',
       ],
+      ...hidden((secret) => secret),
     ]
   }
   return [
@@ -558,6 +573,19 @@ function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
       basic('kurumi', selector),
       'refused',
     ],
+    [
+      'the word in a Basic credential that is no selector once decoded',
+      'Basic kurumiAAAA',
+      'refused',
+    ],
+    [
+      'a Basic credential split by a space',
+      `Basic ${Buffer.from(`x:${selector}`)
+        .toString('base64')
+        .replace(/^(.{8})/, '$1 ')}`,
+      'refused',
+    ],
+    ...hidden((secret) => `Bearer ${secret}`),
   ]
 }
 
@@ -680,6 +708,10 @@ describe('a selector written into the query slot', () => {
     ['an empty handle', '?key=kurumi:', 'refused'],
     ['a malformed escape', '?key=kurumi:%E0', 'refused'],
     ['a label that mentions the word', '?key=kurumi:google/kurumi-x', 'refused'],
+    ['a parameter name with an escape', '?k%65y=kurumi:google/a', 'google/a'],
+    ['a bad escape beside an escaped letter', '?key=%6Burumi%3Agoogle%2Fa%ZZ', 'refused'],
+    ['a base64 token after an escaped space', '?key=x%20a3VydW1pOmdvb2dsZS9h', 'refused'],
+    ['a Kelvin sign for the k', '?key=%E2%84%AAurumi%3Agoogle%2Fa', 'refused'],
     ['a real-looking key', '?key=AIzaPlaceholder', 'default'],
     ['an empty key', '?key=', 'default'],
     ['no key', '?alt=json', 'default'],
@@ -812,7 +844,9 @@ describe('awkward handles through every slot', () => {
   })
 })
 
-const mentions = (text: string) => /kurumi/i.test(text)
+const base64Edge = /(^|[^A-Za-z0-9+/=_-])a3VydW1p($|[^A-Za-z0-9+/=_-])/
+const mentions = (text: string, base64Counts: boolean) =>
+  /kurumi/i.test(text.replace(/%6b/gi, 'k')) || (base64Counts && base64Edge.test(text))
 
 function handleThatTextNames(text: string): string | null {
   const prefix = /^kurumi:/i.exec(text)
@@ -857,6 +891,10 @@ describe('whatever a slot holds', () => {
     '*',
     '=',
     'ya29.',
+    '%6Burumi:',
+    '%6burumi',
+    'a3VydW1p',
+    '.',
   ]
   const candidates = [
     'google/a',
@@ -864,6 +902,7 @@ describe('whatever a slot holds', () => {
     'google/Acme, Inc.',
     'notion/b',
     'anthropic/a',
+    'google/kurumi-x',
   ].map((h, i) => grant(h as AccountHandle, { isDefault: i === 0 }))
   const slots: [string, CredentialSlot, (text: string) => string][] = [
     ['bearer', { kind: 'bearer' }, (text) => `Bearer ${text}`],
@@ -895,14 +934,16 @@ describe('whatever a slot holds', () => {
         )
         const selection = selectAccount('gmail', candidates, selector)
 
-        if (!mentions(text)) {
-          expect(selection).toMatchObject({ ok: true, how: 'default' })
+        if (!mentions(text, slot.kind !== 'basic')) {
+          if (!text.includes('a3VydW1p') || slot.kind === 'basic')
+            expect(selection).toMatchObject({ ok: true, how: 'default' })
           continue
         }
         if (!selection.ok) continue
         expect(selection.how).toBe('named')
         namedCount++
-        expect(text.match(/kurumi/gi)).toHaveLength(1)
+        expect(text.replace(/%6b/gi, 'k').match(/kurumi/gi)).toHaveLength(1)
+        expect(text).not.toContain('a3VydW1p')
         expect<string>(selection.handle).toBe(handleThatTextNames(text)!)
       }
       expect(namedCount).toBeGreaterThan(0)
