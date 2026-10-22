@@ -62,7 +62,6 @@ beforeEach(() => {
   insertAccount(db, { id: 'acc-n', vendor: 'notion', label: 'team', services: ['notion'] })
 })
 
-// Group 1 holds Gmail of A, B and C with A as the default. Group 2 holds Gmail of B and Calendar of A.
 function seedGroups() {
   for (const account of ['acc-a', 'acc-b', 'acc-c']) grant('g1', account, 'gmail')
   setDefault('g1', 'acc-a', 'gmail')
@@ -150,6 +149,14 @@ describe('granting', () => {
     const result = grant('g1', 'acc-c', 'google-calendar')
 
     expect(result).toEqual({ ok: false, refusal: 'service_not_covered' })
+    expect(grantRows()).toEqual([])
+  })
+
+  test('an agent group that does not exist is refused', () => {
+    expect(grant('g-missing', 'acc-a', 'gmail')).toEqual({
+      ok: false,
+      refusal: 'agent_group_not_found',
+    })
     expect(grantRows()).toEqual([])
   })
 

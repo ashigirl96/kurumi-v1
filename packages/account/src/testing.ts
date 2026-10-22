@@ -1,6 +1,7 @@
 import { Database } from 'bun:sqlite'
 
 import { migrations as agentMigrations } from '@kurumi/agent/server'
+import type { Db } from '@kurumi/rpc/server'
 import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
@@ -19,7 +20,7 @@ export function inMemoryDb() {
   return db
 }
 
-type TestDb = ReturnType<typeof inMemoryDb>
+type TestDb = Pick<Db, 'run' | 'insert'>
 
 export function insertAgentGroup(db: TestDb, id: string) {
   db.run(

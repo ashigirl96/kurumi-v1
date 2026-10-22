@@ -1,3 +1,4 @@
+import { agentGroup } from '@kurumi/agent/schema'
 import type { Db, Tx } from '@kurumi/rpc/server'
 import { and, eq, sql } from 'drizzle-orm'
 
@@ -16,27 +17,23 @@ export type {
 } from './select.ts'
 export type { ServiceId, VendorId }
 
-export type GrantRefusal = 'account_not_found' | 'service_not_covered' | 'grant_not_found'
+export type GrantKey = { agentGroupId: string; accountId: string; service: ServiceId }
+
+export type GrantInput = GrantKey & { grantedBy: string }
+
+export type GrantRefusal = 'agent_group_not_found' | 'account_not_found' | 'service_not_covered'
 
 export type GrantResult = { ok: true } | { ok: false; refusal: GrantRefusal }
 
-export type GrantInput = {
-  agentGroupId: string
-  accountId: string
-  service: ServiceId
-  grantedBy: string
-}
-
-export type DefaultInput = Pick<GrantInput, 'agentGroupId' | 'accountId' | 'service'>
+export type SetDefaultResult = { ok: true } | { ok: false; refusal: 'grant_not_found' }
 
 export type AccountLedger = {
-  /** Idempotent. Refuses a service the account's credential does not cover. */
+  /** Idempotent. */
   grant(tx: Tx, input: GrantInput): GrantResult
-  /** Drops the grant and, through the FK, the default that rested on it. Idempotent. */
-  revoke(tx: Tx, input: DefaultInput): void
-  /** The account must already hold a grant for the service. Replaces the previous default. */
-  setDefault(tx: Tx, input: DefaultInput): GrantResult
-  /** The grants of one group for one service, in label order. Live and uncached. */
+  /** Idempotent, and also drops the default that rested on this grant. */
+  revoke(tx: Tx, input: GrantKey): void
+  setDefault(tx: Tx, input: GrantKey): SetDefaultResult
+  /** Sorted by label. */
   candidates(agentGroupId: string, service: ServiceId): GrantedCandidate[]
 }
 
@@ -73,6 +70,12 @@ export function createAccountLedger(deps: { db: Db }): AccountLedger {
 
   return {
     grant(tx, { agentGroupId, accountId, service, grantedBy }) {
+      const group = tx
+        .select({ id: agentGroup.id })
+        .from(agentGroup)
+        .where(eq(agentGroup.id, agentGroupId))
+        .get()
+      if (!group) return { ok: false, refusal: 'agent_group_not_found' }
       const held = tx
         .select({ vendor: account.vendor, services: account.services })
         .from(account)
