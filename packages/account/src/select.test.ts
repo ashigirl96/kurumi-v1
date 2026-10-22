@@ -916,9 +916,21 @@ describe('whatever a slot holds', () => {
       seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
       return seed / 2 ** 32
     }
+    const pick = <T>(from: readonly T[]): T => from[Math.floor(next() * from.length)]!
+    const leads = ['kurumi:', 'KURUMI:', 'sk-ant-kurumi-']
+    const handles = [
+      'google/a',
+      'google/Acme',
+      'notion/b',
+      'google/Acme, Inc.',
+      'anthropic/a',
+      'google/kurumi-x',
+    ]
     for (let i = 0; i < count; i++) {
-      const length = 1 + Math.floor(next() * 7)
-      yield Array.from({ length }, () => fragments[Math.floor(next() * fragments.length)]!).join('')
+      const random = Array.from({ length: 1 + Math.floor(next() * 6) }, () => pick(fragments))
+      yield next() < 0.3
+        ? pick(leads) + pick(handles) + (next() < 0.3 ? pick(fragments) : '')
+        : (next() < 0.5 ? pick(leads) : '') + random.join('')
     }
   }
 
@@ -926,7 +938,7 @@ describe('whatever a slot holds', () => {
     'the %s slot never names an account the text does not name alone',
     (_name, slot, place) => {
       let namedCount = 0
-      for (const text of texts(4000)) {
+      for (const text of texts(1200)) {
         const { selector } = readSelector(
           defaultSelectorShape,
           slot,
@@ -944,9 +956,11 @@ describe('whatever a slot holds', () => {
         namedCount++
         expect(text.replace(/%6b/gi, 'k').match(/kurumi/gi)).toHaveLength(1)
         expect(text).not.toContain('a3VydW1p')
-        expect<string>(selection.handle).toBe(handleThatTextNames(text)!)
+        expect<string>(selection.handle).toBe(
+          handleThatTextNames(slot.kind === 'basic' ? text : text.trim())!,
+        )
       }
-      expect(namedCount).toBeGreaterThan(0)
+      expect(namedCount).toBeGreaterThan(50)
     },
   )
 })
