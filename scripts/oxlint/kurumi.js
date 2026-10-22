@@ -128,11 +128,16 @@ export default {
           },
           CallExpression(node) {
             const { callee } = node
-            if (callee.type !== 'MemberExpression' || callee.property.name !== 'transaction') return
+            if (callee.type !== 'MemberExpression' || callee.computed) return
+            if (callee.property.name !== 'transaction') return
             const [callback] = node.arguments
             if (isAsyncFunction(callback)) report(node)
             else if (callback?.type === 'Identifier')
               passedByName.push({ node, name: callback.name })
+            else if (isFunction(callback) && callback.body.type === 'CallExpression') {
+              const called = callback.body.callee
+              if (called.type === 'Identifier') passedByName.push({ node, name: called.name })
+            }
           },
           'Program:exit'() {
             for (const { node, name } of passedByName) if (asyncNames.has(name)) report(node)
@@ -140,7 +145,6 @@ export default {
         }
       },
     },
-    // 別の domain の table を書けるのはその domain だけ。他の domain の schema entry から import した table への insert、update、delete を止める。
     'cross-domain-write': {
       create(context) {
         const own = /\/packages\/([^/]+)\/src\//.exec(context.filename)?.[1]

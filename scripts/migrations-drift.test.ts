@@ -32,7 +32,6 @@ const migrationFiles = (copy: string) =>
     .map((entry) => join(entry.parentPath, entry.name).slice(copy.length + 1))
     .toSorted()
 
-// The copy keeps the package's own migrations, so `generate` writes a new file only when the schema moved on.
 async function generateInCopy(name: string, edit?: (copy: string) => void) {
   const root = mkdtempSync(join(tmpdir(), 'kurumi-drift-'))
   dirs.push(root)
@@ -49,6 +48,7 @@ async function generateInCopy(name: string, edit?: (copy: string) => void) {
   const generate = Bun.spawn([process.execPath, 'run', 'generate'], {
     cwd: copy,
     env: process.env,
+    stdin: 'ignore',
     stdout: 'ignore',
     stderr: 'inherit',
   })
@@ -75,11 +75,20 @@ test.each(packagesWithMigrations)(
 test('a service added to the catalog without generating is caught', async () => {
   const { added, exitCode } = await generateInCopy('account', (copy) => {
     const catalog = join(copy, 'src/catalog.ts')
+    const source = readFileSync(catalog, 'utf8')
+    const marker = "'google-calendar': {"
+    expect(source).toContain(marker)
     writeFileSync(
       catalog,
-      readFileSync(catalog, 'utf8').replace(
-        "      'google-calendar': {",
-        "      'google-drive': {\n        displayName: 'Google Drive',\n        hosts: [{ host: 'www.googleapis.com', pathPrefix: '/drive/' }],\n        slot: { kind: 'bearer' },\n        scopes: ['https://www.googleapis.com/auth/drive'],\n      },\n      'google-calendar': {",
+      source.replace(
+        marker,
+        `'google-drive': {
+          displayName: 'Google Drive',
+          hosts: [{ host: 'www.googleapis.com', pathPrefix: '/drive/' }],
+          slot: { kind: 'bearer' },
+          scopes: ['https://www.googleapis.com/auth/drive'],
+        },
+        ${marker}`,
       ),
     )
   })
