@@ -196,6 +196,22 @@ describe('selectAccount over the Group 1 and Group 2 grants', () => {
     })
   })
 
+  test('a conflict between selectors is refused whatever the grants, naming what was written', () => {
+    const conflict: Selector = { kind: 'conflict', handles: ['google/a@work.example', 'google/b'] }
+
+    for (const candidates of [[grantA], group1Gmail, []]) {
+      expect(selectAccount('gmail', candidates, conflict)).toEqual({
+        ok: false,
+        refusal: {
+          code: 'account_not_granted',
+          service: 'gmail',
+          named: 'google/a@work.example | google/b',
+          granted: candidates.map(({ handle }) => handle),
+        },
+      })
+    }
+  })
+
   test('a handle is matched exactly', () => {
     const selection = selectAccount('gmail', group1Gmail, named(handleA.toUpperCase()))
 
