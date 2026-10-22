@@ -16,14 +16,20 @@ function internalModules(root = repo): { domain: string; module: string }[] {
   for (const manifest of new Bun.Glob('packages/*/package.json').scanSync({ cwd: root })) {
     const domain = manifest.split('/')[1]!
     const { exports } = JSON.parse(readFileSync(join(root, manifest), 'utf8')) as {
-      exports?: Record<string, string>
+      exports?: Record<string, unknown> | string
     }
     if (!exports) {
       throw new Error(
         `${manifest} has no "exports" field. Declare it, as {} for a package with no entry yet.`,
       )
     }
-    const exported = new Set(Object.values(exports).map((target) => basename(target)))
+    if (
+      typeof exports === 'string' ||
+      Object.values(exports).some((target) => typeof target !== 'string')
+    ) {
+      throw new Error(`${manifest} must map each entry of "exports" to one file path.`)
+    }
+    const exported = new Set(Object.values(exports).map((target) => basename(target as string)))
     for (const file of new Bun.Glob('src/*.ts').scanSync({ cwd: join(root, 'packages', domain) })) {
       const name = basename(file)
       if (name.endsWith('.test.ts') || exported.has(name)) continue
@@ -156,25 +162,41 @@ const restrictedImportsOf = (rules: Record<string, unknown> = {}): unknown[] =>
     .filter(([name]) => name.split('/').at(-1) === 'no-restricted-imports')
     .map(([, entry]) => entry)
 
+function isError(entry: unknown): boolean {
+  const level = Array.isArray(entry) ? entry[0] : entry
+  return level === 'error' || level === 2
+}
+
 function restrictionsOf(entry: unknown): unknown[] {
-  if (!Array.isArray(entry) || (entry[0] !== 'error' && entry[0] !== 2)) return []
+  if (!Array.isArray(entry) || !isError(entry)) return []
   const options = (entry[1] ?? {}) as { patterns?: unknown[]; paths?: unknown[] }
   return [...(options.patterns ?? []), ...(options.paths ?? [])]
 }
 
+const relativeImportRule = 'kurumi/no-relative-package-import'
+
+const dropsRelativeRule = (rules: Record<string, unknown> | undefined) =>
+  rules !== undefined && relativeImportRule in rules && !isError(rules[relativeImportRule])
+
 function overridesDroppingBoundary(config: OxlintConfig): string[] {
   const boundary = restrictedImportsOf(config.rules).flatMap(restrictionsOf)
+  const dropsEntryBoundary = (rules: Record<string, unknown> | undefined) =>
+    restrictedImportsOf(rules).some((entry) => {
+      const kept = restrictionsOf(entry)
+      return boundary.some((restriction) => !kept.some((r) => Bun.deepEquals(r, restriction)))
+    })
   return (config.overrides ?? [])
-    .filter(({ rules }) =>
-      restrictedImportsOf(rules).some((entry) => {
-        const kept = restrictionsOf(entry)
-        return boundary.some((restriction) => !kept.some((r) => Bun.deepEquals(r, restriction)))
-      }),
-    )
+    .filter(({ rules }) => dropsEntryBoundary(rules) || dropsRelativeRule(rules))
     .map(({ files }) => files.join(', '))
 }
 
-describe('an override that sets no-restricted-imports', () => {
+function nestedOxlintConfigs(root: string): string[] {
+  return [...new Bun.Glob('{apps,packages}/**/.oxlintrc.json').scanSync({ cwd: root, dot: true })]
+    .filter((path) => !path.includes('node_modules/'))
+    .toSorted()
+}
+
+describe('an override of the import boundary', () => {
   const config = readConfig()
   const [boundaryRule] = restrictedImportsOf(config.rules)
 
@@ -208,6 +230,26 @@ describe('an override that sets no-restricted-imports', () => {
     expect(overridesDroppingBoundary(override)).toEqual(['packages/other/**'])
   })
 
+  test('the relative-import rule is an error at the top level', () => {
+    expect(isError(config.rules['kurumi/no-relative-package-import'])).toBe(true)
+  })
+
+  test.each([
+    ['off', 'off'],
+    ['a warning', 'warn'],
+    ['an array that is off', ['off']],
+  ])('is noticed when it sets the relative-import rule to %s', (_name, entry) => {
+    const override = withOverride({ 'kurumi/no-relative-package-import': entry })
+
+    expect(overridesDroppingBoundary(override)).toEqual(['packages/other/**'])
+  })
+
+  test('may restate the relative-import rule as an error', () => {
+    const override = withOverride({ 'kurumi/no-relative-package-import': 'error' })
+
+    expect(overridesDroppingBoundary(override)).toEqual([])
+  })
+
   test('may add its own restrictions beside the boundary', () => {
     const [severity, options] = boundaryRule as [string, { patterns: unknown[] }]
     const extra = { group: ['@kurumi/*/cli'], message: 'm' }
@@ -231,5 +273,42 @@ describe('a package that does not declare exports', () => {
     writeFileSync(join(root, 'packages/bare/src/inner.ts'), 'export {}\n')
 
     expect(() => internalModules(root)).toThrow('packages/bare/package.json')
+  })
+})
+
+describe('a nested oxlint config', () => {
+  const roots: string[] = []
+  afterAll(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true })
+  })
+
+  test('does not exist, because it replaces the root config for its folder', () => {
+    expect(nestedOxlintConfigs(repo)).toEqual([])
+  })
+
+  test('is found under a package', () => {
+    const root = mkdtempSync(join(tmpdir(), 'kurumi-nested-'))
+    roots.push(root)
+    mkdirSync(join(root, 'packages/x/src'), { recursive: true })
+    writeFileSync(join(root, 'packages/x/src/.oxlintrc.json'), '{}')
+
+    expect(nestedOxlintConfigs(root)).toEqual(['packages/x/src/.oxlintrc.json'])
+  })
+})
+
+describe('a package whose exports are not a map of entry files', () => {
+  test.each([
+    ['a string', '"./src/server.ts"'],
+    ['conditions', '{ ".": { "import": "./src/server.ts" } }'],
+  ])('is named in the failure when exports is %s', (_name, exports) => {
+    const root = mkdtempSync(join(tmpdir(), 'kurumi-exports-'))
+    try {
+      mkdirSync(join(root, 'packages/odd/src'), { recursive: true })
+      writeFileSync(join(root, 'packages/odd/package.json'), `{ "exports": ${exports} }`)
+
+      expect(() => internalModules(root)).toThrow('packages/odd/package.json')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })

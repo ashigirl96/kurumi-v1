@@ -675,6 +675,16 @@ describe('readSelector', () => {
       })
     })
 
+    test('a plus written by hand stays a plus', () => {
+      const { selector } = readSelector(
+        defaultSelectorShape,
+        slot,
+        request({ url: 'https://h.example/x?key=kurumi:google/a+b@x.example' }),
+      )
+
+      expect(selector).toEqual(named('google/a+b@x.example'))
+    })
+
     test('no key parameter is none and leaves the url alone', () => {
       const { selector, stripped } = readSelector(
         defaultSelectorShape,
