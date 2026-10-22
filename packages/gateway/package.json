@@ -1,0 +1,13 @@
+{
+  "name": "@kurumi/gateway",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./server": "./src/port.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "dependencies": {
+    "@peculiar/x509": "catalog:",
+    "reflect-metadata": "catalog:"
+  }
+}
