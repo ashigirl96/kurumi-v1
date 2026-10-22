@@ -93,11 +93,20 @@ const importing = (imports: Record<string, string>): Record<string, string> =>
     ]),
   )
 
+const lazily = <T>(make: () => Promise<T>) => {
+  let made: Promise<T> | undefined
+  return () => (made ??= make())
+}
+
+const merged = (groups: Record<string, string>[]): Record<string, string> =>
+  Object.assign({}, ...groups)
+
 describe('a relative import that leaves its package', () => {
   const account = 'account/src/catalog.ts'
+  const deep = '../../../../account/src/catalog.ts'
 
-  test('is refused from any depth and from any file of the package', async () => {
-    const files = importing({
+  const refusing = {
+    depth: importing({
       'packages/probe/src/main.ts': `../../${account}`,
       'packages/probe/src/a/main.ts': `../../../${account}`,
       'packages/probe/src/a/b/main.ts': `../../../../${account}`,
@@ -111,30 +120,19 @@ describe('a relative import that leaves its package', () => {
       'apps/probe/src/main.ts': `../../../packages/${account}`,
       'tools/main.ts': `../packages/${account}`,
       'packages/a/src/apps/foo/x.ts': '../../../../b/src/apps/foo/y.ts',
-    })
-
-    const refused = await refusedFiles(files)
-
-    expect(Object.keys(files).filter((path) => !refused.has(path))).toEqual([])
-  })
-
-  test('is refused whether it is imported, re-exported or loaded on demand', async () => {
-    const specifier = `../../../../account/src/catalog.ts`
-    const files = {
-      'packages/probe/src/a/b/import.ts': `import '${specifier}'\n`,
-      'packages/probe/src/a/b/export.ts': `export * from '${specifier}'\n`,
-      'packages/probe/src/a/b/named.ts': `export { catalog } from '${specifier}'\n`,
-      'packages/probe/src/a/b/dynamic.ts': `export const load = () => import('${specifier}')\n`,
-      'packages/probe/src/a/b/type.ts': `export type Rule = import('${specifier}').HostRule\n`,
-    }
-
-    const refused = await refusedFiles(files)
-
-    expect(Object.keys(files).filter((path) => !refused.has(path))).toEqual([])
-  })
-
-  test('is refused whatever it reaches outside the package', async () => {
-    const files = importing({
+    }),
+    forms: {
+      'packages/probe/src/a/b/import.ts': `import '${deep}'\n`,
+      'packages/probe/src/a/b/export.ts': `export * from '${deep}'\n`,
+      'packages/probe/src/a/b/named.ts': `export { catalog } from '${deep}'\n`,
+      'packages/probe/src/a/b/dynamic.ts': `export const load = () => import('${deep}')\n`,
+      'packages/probe/src/a/b/type.ts': `export type Rule = import('${deep}').HostRule\n`,
+      'packages/probe/src/a/b/template.ts': `export const load = () => import(\`${deep}\`)\n`,
+      'packages/probe/src/a/b/require.ts': `export const m = require('${deep}')\n`,
+      'packages/probe/src/a/b/require-template.ts': `export const m = require(\`${deep}\`)\n`,
+      'packages/probe/src/a/b/equals.ts': `import m = require('${deep}')\nexport const used = m\n`,
+    },
+    outside: importing({
       'packages/probe/src/to-scripts.ts': '../../../scripts/oxlint/kurumi.js',
       'packages/probe/src/to-root-module.ts': '../../../probe-root.ts',
       'packages/probe/src/to-root-manifest.ts': '../../../package.json',
@@ -143,53 +141,23 @@ describe('a relative import that leaves its package', () => {
       'apps/probe/src/to-root.ts': '../../../probe-root.ts',
       'scripts/oxlint/to-package.ts': `../../packages/${account}`,
       'probe-root-tool.ts': `./packages/${account}`,
-    })
-
-    const refused = await refusedFiles(files)
-
-    expect(Object.keys(files).filter((path) => !refused.has(path))).toEqual([])
-  })
-
-  test('is refused through a symlink that exists on disk', async () => {
-    const files = {
+    }),
+    symlinks: {
       ...importing({
         'packages/probe/src/through-link.ts': './linked/catalog.ts',
         'packages/probe/src/through-workspace-link.ts':
           '../node_modules/@kurumi/account/src/catalog.ts',
       }),
       'packages/account/src/catalog.ts': 'export const catalog = 1\n',
-    }
-    const links = {
-      'packages/probe/src/linked': '../../account/src',
-      'packages/probe/node_modules/@kurumi/account': '../../../account',
-    }
+    },
+  }
+  const refusingLinks = {
+    'packages/probe/src/linked': '../../account/src',
+    'packages/probe/node_modules/@kurumi/account': '../../../account',
+  }
 
-    const refused = await refusedFiles(files, links)
-
-    expect(
-      Object.keys(files).filter(
-        (path) => path.startsWith('packages/probe/src') && !refused.has(path),
-      ),
-    ).toEqual([])
-  })
-
-  test('is refused from a template literal, require and import-equals as well', async () => {
-    const specifier = '../../../../account/src/catalog.ts'
-    const files = {
-      'packages/probe/src/a/b/template.ts': `export const load = () => import(\`${specifier}\`)\n`,
-      'packages/probe/src/a/b/require.ts': `export const m = require('${specifier}')\n`,
-      'packages/probe/src/a/b/require-template.ts': `export const m = require(\`${specifier}\`)\n`,
-      'packages/probe/src/a/b/equals.ts': `import m = require('${specifier}')\nexport const used = m\n`,
-      'packages/probe/src/a/b/type-template.ts': `export type Rule = import('${specifier}').HostRule\n`,
-    }
-
-    const refused = await refusedFiles(files)
-
-    expect(Object.keys(files).filter((path) => !refused.has(path))).toEqual([])
-  })
-
-  test('inside the package is still allowed', async () => {
-    const files = importing({
+  const allowing = {
+    inside: importing({
       'packages/probe/src/main.ts': './other.ts',
       'packages/probe/src/to-migrations.ts': '../migrations/index.ts',
       'packages/probe/src/a/b/main.ts': '../../other.ts',
@@ -204,27 +172,50 @@ describe('a relative import that leaves its package', () => {
       'scripts/oxlint/to-root-manifest.ts': '../../package.json',
       'scripts/oxlint/to-sibling.ts': './kurumi.js',
       'probe-root-tool.ts': './scripts/oxlint/kurumi.js',
-    })
-
-    const refused = await refusedFiles(files)
-
-    expect([...refused]).toEqual([])
-  })
-
-  test('inside the package is allowed from require, a template literal and a symlink of its own', async () => {
-    const files = {
+    }),
+    forms: {
       'packages/probe/src/require.ts': "export const m = require('./other.ts')\n",
       'packages/probe/src/template.ts': 'export const load = () => import(`./other.ts`)\n',
       'packages/probe/src/computed.ts': 'export const load = (n: string) => import(`./${n}.ts`)\n',
       'packages/probe/src/aliased.ts':
         "import * as m from './alias/other.ts'\nexport const used = m\n",
       'packages/probe/src/other.ts': 'export const other = 1\n',
-    }
-    const links = { 'packages/probe/src/alias': '.' }
+    },
+  }
+  const allowingLinks = { 'packages/probe/src/alias': '.' }
 
-    const refused = await refusedFiles(files, links)
+  const refusedAmongRefusing = lazily(() =>
+    refusedFiles(merged(Object.values(refusing)), refusingLinks),
+  )
+  const refusedAmongAllowing = lazily(() =>
+    refusedFiles(merged(Object.values(allowing)), allowingLinks),
+  )
 
-    expect([...refused]).toEqual([])
+  const unrefused = async (files: Record<string, string>): Promise<string[]> => {
+    const refused = await refusedAmongRefusing()
+    return Object.keys(files).filter((path) => !refused.has(path))
+  }
+
+  test('is refused from any depth and from any file of the package', async () => {
+    expect(await unrefused(refusing.depth)).toEqual([])
+  })
+
+  test('is refused whether it is imported, re-exported, loaded on demand or required', async () => {
+    expect(await unrefused(refusing.forms)).toEqual([])
+  })
+
+  test('is refused whatever it reaches outside the package', async () => {
+    expect(await unrefused(refusing.outside)).toEqual([])
+  })
+
+  test('is refused through a symlink that exists on disk', async () => {
+    const { 'packages/account/src/catalog.ts': _target, ...probes } = refusing.symlinks
+
+    expect(await unrefused(probes)).toEqual([])
+  })
+
+  test('inside the package is still allowed', async () => {
+    expect([...(await refusedAmongAllowing())]).toEqual([])
   })
 })
 
