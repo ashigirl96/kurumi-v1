@@ -28,6 +28,15 @@ function packageOf(path, root) {
   return PACKAGE_DIR.exec(`${fromRoot}/`)?.[1] ?? ROOT_PACKAGE
 }
 
+function isRequire(callee) {
+  if (callee.type === 'Identifier') return callee.name === 'require'
+  return (
+    callee.type === 'MemberExpression' &&
+    callee.object.type === 'MetaProperty' &&
+    callee.property.name === 'require'
+  )
+}
+
 function specifierOf(node) {
   if (node?.type === 'Literal') return typeof node.value === 'string' ? node.value : undefined
   if (node?.type === 'TemplateLiteral' && node.expressions.length === 0) {
@@ -79,9 +88,7 @@ export default {
           ExportAllDeclaration: checkSource,
           ImportExpression: checkSource,
           CallExpression: (node) => {
-            if (node.callee.type === 'Identifier' && node.callee.name === 'require') {
-              check(node, specifierOf(node.arguments[0]))
-            }
+            if (isRequire(node.callee)) check(node, specifierOf(node.arguments[0]))
           },
           Literal: (node) => {
             const { type } = node.parent ?? {}

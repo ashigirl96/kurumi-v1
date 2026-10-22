@@ -130,6 +130,7 @@ describe('a relative import that leaves its package', () => {
       'packages/probe/src/a/b/template.ts': `export const load = () => import(\`${deep}\`)\n`,
       'packages/probe/src/a/b/require.ts': `export const m = require('${deep}')\n`,
       'packages/probe/src/a/b/require-template.ts': `export const m = require(\`${deep}\`)\n`,
+      'packages/probe/src/a/b/import-meta-require.ts': `export const m = import.meta.require('${deep}')\n`,
       'packages/probe/src/a/b/equals.ts': `import m = require('${deep}')\nexport const used = m\n`,
     },
     outside: importing({
@@ -175,6 +176,8 @@ describe('a relative import that leaves its package', () => {
     }),
     forms: {
       'packages/probe/src/require.ts': "export const m = require('./other.ts')\n",
+      'packages/probe/src/import-meta-require.ts':
+        "export const m = import.meta.require('./other.ts')\n",
       'packages/probe/src/template.ts': 'export const load = () => import(`./other.ts`)\n',
       'packages/probe/src/computed.ts': 'export const load = (n: string) => import(`./${n}.ts`)\n',
       'packages/probe/src/aliased.ts':
@@ -459,6 +462,22 @@ describe('an ignore pattern of the root config', () => {
     'scripts/packages/**',
   ])('may be %s', (pattern) => {
     expect(ignoresPackagesOrApps({ ignorePatterns: [pattern], rules: {} })).toEqual([])
+  })
+})
+
+describe('the root configs', () => {
+  const tsconfig = Bun.JSONC.parse(readFileSync(join(repo, 'tsconfig.json'), 'utf8')) as {
+    extends?: unknown
+    compilerOptions?: { paths?: unknown }
+  }
+
+  test('.oxlintrc.json extends no other config, which could switch the boundary off', () => {
+    expect(readConfig()).not.toHaveProperty('extends')
+  })
+
+  test('tsconfig.json has no paths alias or base config, which could aim a bare specifier past the boundary', () => {
+    expect(tsconfig.compilerOptions).not.toHaveProperty('paths')
+    expect(tsconfig).not.toHaveProperty('extends')
   })
 })
 
