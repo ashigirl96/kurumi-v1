@@ -22,9 +22,9 @@ const mentions = (text: string): boolean => word.test(text) || word.test(decoded
 const mentionsInQuery = (value: string): boolean => mentions(asQueryWrites(value))
 
 // Two Basic headers arrive joined by a comma, and Buffer stops at a `=`, so a credential that is not one base64 blob
-// has its first runs decoded to see the word. A run under 8 characters cannot hold the word; no client joins 16 headers.
+// is seen piece by piece: between commas, without the scheme word and whitespace, and split at padding. A piece under
+// 8 characters cannot hold the word, and a credential of more than 16 pieces is refused unread.
 const notOneBlob = /[^A-Za-z0-9+/=_-]|=[A-Za-z0-9+/_-]/
-const base64Run = /[A-Za-z0-9+/_-]{8,}/g
 const decodedBase64 = (text: string): string => Buffer.from(text, 'base64').toString()
 
 type Value = { mentions: boolean; credential: string | null }
@@ -38,14 +38,21 @@ function valueInAuthorization(header: string): Value {
     case 'basic': {
       const blob = credential.replaceAll(/\s+/g, '')
       const oneBlob = !notOneBlob.test(blob)
-      const runs = oneBlob ? [] : [...credential.matchAll(base64Run).take(16)]
       const userAndPassword = decodedBase64(blob)
+      const pieces: string[] = []
+      if (!oneBlob) {
+        for (const joined of credential.split(',', 17)) {
+          const bare = joined.replace(/^\s*basic\s+/i, '').replaceAll(/\s+/g, '')
+          for (const piece of bare.split('=')) if (piece !== '') pieces.push(piece)
+        }
+      }
       const [user = '', ...password] = userAndPassword.split(':')
       return {
         mentions:
           mentions(header) ||
           mentions(userAndPassword) ||
-          runs.some(([run]) => mentions(decodedBase64(run))),
+          pieces.length > 16 ||
+          pieces.slice(0, 16).some((piece) => piece.length >= 8 && mentions(decodedBase64(piece))),
         credential: oneBlob && password.length > 0 && !mentions(user) ? password.join(':') : null,
       }
     }

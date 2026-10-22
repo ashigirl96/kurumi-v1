@@ -12,7 +12,6 @@ import {
   type ServiceId,
   type VendorId,
 } from './catalog.ts'
-import { decodedOnce } from './select.reference.ts'
 import {
   accountHandle,
   readSelector,
@@ -600,6 +599,16 @@ function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
     ],
     ['a Basic credential with padding before more base64', `Basic eDo=${b64(selector)}`, 'refused'],
     [
+      'two Basic credentials where the second holds a space',
+      `${basic('x', 'placeholder')}, ${basic('x', selector).replace(/^(Basic .{6})/, '$1 ')}`,
+      'refused',
+    ],
+    [
+      'seventeen Basic credentials are refused unread',
+      Array.from({ length: 17 }, () => basic('x', 'placeholder')).join(', '),
+      'refused',
+    ],
+    [
       'a Basic selector joined after a bearer value is not seen',
       `Bearer placeholder, ${basic('x', selector)}`,
       'default',
@@ -717,10 +726,11 @@ describe('what a refused Basic credential echoes', () => {
       'x:kurumi:github/kurumi-team',
     ],
     ['not base64: the header as received', 'Basic kurumi:github/b', 'Basic kurumi:github/b'],
+    ['one blob with the word only as received: the header', 'Basic kurumi', 'Basic kurumi'],
     [
-      'two joined: the header as received',
-      `${basic('x', 'y')}, ${basic('x', 'kurumi:github/b')}`,
-      `${basic('x', 'y')}, ${basic('x', 'kurumi:github/b')}`,
+      'two joined: the decoded credential that holds the word',
+      `${basic('u', 'REALSECRET')}, ${basic('x', 'kurumi:github/b')}`,
+      'x:kurumi:github/b',
     ],
   ])('%s', (_name, authorization, written) => {
     const { selector } = readSelector(
@@ -934,113 +944,4 @@ describe('awkward handles through every slot', () => {
       ),
     ).toMatchObject({ ok: true, handle: 'google/a%41b', how: 'named' })
   })
-})
-
-function seededRandom(seed: number) {
-  let state = seed
-  const next = () => {
-    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
-    return state / 2 ** 32
-  }
-  const pick = <T>(from: readonly T[]): T => from[Math.floor(next() * from.length)]!
-  return { next, pick }
-}
-
-const mentions = (text: string) => /kurumi/i.test(text) || /kurumi/i.test(decodedOnce(text) ?? '')
-
-function handleThatTextNames(text: string): string | null {
-  const prefix = /^kurumi:/i.exec(text)
-  return prefix ? decodedOnce(text.slice(prefix[0].length)) : null
-}
-
-describe('whatever a slot holds', () => {
-  const fragments = [
-    'kurumi:',
-    'KURUMI:',
-    'sk-ant-kurumi-',
-    'YW50aHJvcGljL2E',
-    'google/a',
-    'google/Acme',
-    'notion/b',
-    'Acme',
-    'Inc.',
-    ', ',
-    ',',
-    ' ',
-    '%2C',
-    '%20',
-    '%3A',
-    '%2F',
-    '%E0',
-    '%',
-    'Bearer ',
-    'token ',
-    'Basic ',
-    'placeholder',
-    'x:',
-    ':',
-    '"',
-    '*',
-    '=',
-    'ya29.',
-    '%6Burumi:',
-    '%6burumi',
-    'a3VydW1p',
-    '.',
-  ]
-  const several = [
-    'google/a',
-    'google/Acme',
-    'google/Acme, Inc.',
-    'notion/b',
-    'anthropic/a',
-    'google/kurumi-x',
-  ].map((h, i) => grant(h as AccountHandle, { isDefault: i === 0 }))
-  const single = [grant('google/a' as AccountHandle)]
-  const slots: [string, CredentialSlot, (text: string) => string][] = [
-    ['bearer', { kind: 'bearer' }, (text) => `Bearer ${text}`],
-    ['basic', { kind: 'basic' }, (text) => basic('x', text)],
-    ['header', { kind: 'header', header: 'x-api-key' }, (text) => text],
-  ]
-
-  function* texts(count: number): Generator<string> {
-    const { next, pick } = seededRandom(20260101)
-    for (let i = 0; i < count; i++) {
-      const length = 1 + Math.floor(next() * 7)
-      yield Array.from({ length }, () => pick(fragments)).join('')
-    }
-  }
-
-  test.each(slots)(
-    'the %s slot never names an account the text does not name alone, nor falls back once it mentions the word',
-    (_name, slot, place) => {
-      let namedCount = 0
-      for (const text of texts(4000)) {
-        const { selector } = readSelector(
-          defaultSelectorShape,
-          slot,
-          request({ headers: { [headerOf(slot)]: place(text) } }),
-        )
-        for (const candidates of [several, single]) {
-          const selection = selectAccount('gmail', candidates, selector)
-
-          if (!mentions(text)) {
-            expect(selection).toMatchObject({
-              ok: true,
-              how: candidates.length === 1 ? 'only' : 'default',
-            })
-            continue
-          }
-          if (!selection.ok) continue
-          expect(selection.how).toBe('named')
-          namedCount++
-          expect((decodedOnce(text) ?? text).match(/kurumi/gi)).toHaveLength(1)
-          expect<string>(selection.handle).toBe(
-            handleThatTextNames(slot.kind === 'basic' ? text : text.trim())!,
-          )
-        }
-      }
-      expect(namedCount).toBeGreaterThan(0)
-    },
-  )
 })

@@ -94,6 +94,9 @@ const inAuthorization: ((credential: string, user: string) => string)[] = [
   (c, user) => `Basic ${b64(`${user}:placeholder`)}${b64(`${user}:${c}`)}`,
   (c, user) => `${basic(user, 'placeholder')}, ${basic(user, c)}`,
   (c, user) => `${basic(user, c)}, ${basic(user, 'placeholder')}`,
+  (c, user) => `${basic(user, 'placeholder')}, ${basic(user, c).replace(/^(Basic .{6})/, '$1 ')}`,
+  (c, user) =>
+    Array.from({ length: 17 }, (_, i) => (i === 16 ? basic(user, c) : basic(user, 'x'))).join(', '),
   (c, user) => `Bearer placeholder, ${basic(user, c)}`,
   (c) => `Basic ${b64(c)}`,
 ]

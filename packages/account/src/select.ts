@@ -100,9 +100,19 @@ const mentions = mentionsIn(decodedOnce)
 const mentionsInQuery = mentionsIn(decodedQueryValue)
 
 // Two Basic headers arrive joined by a comma, and Buffer stops at a `=`, so a credential that is not one base64 blob
-// has its first runs decoded to see the word. A run under 8 characters cannot hold the word; no client joins 16 headers.
+// is seen piece by piece: between commas, without the scheme word and whitespace, and split at padding. A piece under
+// 8 characters cannot hold the word, and a credential of more than 16 pieces is refused unread.
 const notOneBlob = /[^A-Za-z0-9+/=_-]|=[A-Za-z0-9+/_-]/
-const base64Run = /[A-Za-z0-9+/_-]{8,}/g
+const piecesOf = (credential: string): string[] =>
+  credential
+    .split(',', 17)
+    .flatMap((piece) =>
+      piece
+        .replace(/^\s*basic\s+/i, '')
+        .replaceAll(/\s+/g, '')
+        .split(/=+/),
+    )
+    .filter((piece) => piece !== '')
 const decodedBase64 = (text: string): string => Buffer.from(text, 'base64').toString()
 
 function takeQueryParam(url: URL, param: string): string[] {
@@ -130,15 +140,15 @@ function writtenInAuthorization(header: string): Written {
     case 'basic': {
       const blob = credential.replaceAll(/\s+/g, '')
       const oneBlob = !notOneBlob.test(blob)
-      const runs = oneBlob ? [] : [...credential.matchAll(base64Run).take(16)]
+      const pieces = oneBlob ? [] : piecesOf(credential)
       const userAndPassword = decodedBase64(blob)
+      const long = pieces.slice(0, 16).filter((piece) => piece.length >= 8)
+      const decoded = [userAndPassword, ...long.map(decodedBase64)]
+      const seen = decoded.find((text) => mentions(text))
       const colon = userAndPassword.indexOf(':')
       return {
-        mentions:
-          mentions(header) ||
-          mentions(userAndPassword) ||
-          runs.some(([run]) => mentions(decodedBase64(run))),
-        written: oneBlob ? userAndPassword : header,
+        mentions: seen !== undefined || pieces.length > 16 || mentions(header),
+        written: seen ?? header,
         credential:
           oneBlob && colon !== -1 && !mentions(userAndPassword.slice(0, colon))
             ? userAndPassword.slice(colon + 1)
