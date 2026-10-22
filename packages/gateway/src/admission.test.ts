@@ -336,6 +336,34 @@ test('ordinary probe failure with confirmed cleanup does not reject stop', async
   expect(admission.status().state).toEqual(stoppedState)
 })
 
+test('stop preserves both remembered cleanup failure and listener shutdown failure', async () => {
+  const cleanupFailure = Object.assign(new Error('Docker cleanup unconfirmed'), {
+    cleanupFailed: true,
+  })
+  const listenerFailure = new Error('Listener shutdown failed')
+  let closed = false
+  const admission = startAdmission({
+    bind: async () =>
+      port(async () => {
+        closed = true
+        throw listenerFailure
+      }),
+    probe: async () => {
+      throw cleanupFailure
+    },
+    schedule: retryClock().schedule,
+  })
+  await admission.retry()
+  const stopped = admission.stop()
+  const failure: unknown = await stopped.catch((error: unknown) => error)
+  expect(closed).toBe(true)
+  expect(admission.status().state).toEqual(stoppedState)
+  expect(admission.stop()).toBe(stopped)
+  expect(failure).toBeInstanceOf(AggregateError)
+  if (!(failure instanceof AggregateError)) throw new Error('Expected both shutdown failures')
+  expect(failure.errors).toEqual([cleanupFailure, listenerFailure])
+})
+
 test('reports readable probe timestamps, monotonic durations, exact open log, and isolated snapshots', async () => {
   const entered = Promise.withResolvers<string>()
   const response = Promise.withResolvers<string>()

@@ -168,12 +168,20 @@ export function startAdmission(deps: AdmissionDeps): Admission {
     cancelRetry = undefined
     state = { kind: 'unreachable', reason: { kind: 'stopped', message: 'Admission stopped' } }
     stopped = Promise.resolve().then(async () => {
+      const failures: unknown[] = []
       try {
         await active
-      } finally {
-        await listener?.stop()
+      } catch (error) {
+        failures.push(error)
       }
-      if (cleanupFailure !== undefined) throw cleanupFailure
+      if (cleanupFailure !== undefined) failures.push(cleanupFailure)
+      try {
+        await listener?.stop()
+      } catch (error) {
+        failures.push(error)
+      }
+      if (failures.length === 1) throw failures[0]
+      if (failures.length > 1) throw new AggregateError(failures, 'Admission shutdown failed')
     })
     controller?.abort()
     return stopped

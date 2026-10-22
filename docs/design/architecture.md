@@ -333,6 +333,7 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 - P06 `admission.ts`: gateway の system Jobs ができるまでは、controller がキャンセル可能な local timer で完了後から capped exponential backoff を数え、`retry()` を将来の Job と lane 8 の呼び出し口にする。実行中の `retry()` は同じ Promise を返すため、lane 8 は probe の途中に再試行を要求できる。
 - P06 live lane: `testing.ts`、gateway の exports、root の dependency metadata は Files box の外なので、lane script は一時的に `packages/gateway/src/admission.ts` と `packages/session/src/server.ts` を直接 import し、既存の `@kurumi/gateway/server` と組み合わせる。Docker Desktop から届く `0.0.0.0` を既定の bind にし、lane 1 の `127.0.0.1` bind も設定可能なままにする。
 - P06 `admission.ts`: stop 後は 5 状態の union を保ち、`unreachable` の `stopped` reason に `Admission stopped` を残す。最後の probe の時刻と所要時間も保持する。
+- P06 `docker.ts`: create の通信失敗後は、空の rm 応答や存在確認だけでは名前の所有を解除しない。成功した rm が同じ名前を返すまで再試行もその名前を保持し、stop は cleanup failure を返す。実際には作られなかった場合も、この不確実性は自動では解消しない。明確な No such image 応答と process の spawn failure は区別し、通常の再試行を許す。listener の停止も失敗した場合は、admission が両方の原因を AggregateError に残す。
 
 ## ユーザーが決めたこと（2026-10-22）
 

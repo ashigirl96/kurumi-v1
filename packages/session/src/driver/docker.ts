@@ -88,7 +88,7 @@ export function createDockerDriver(options: {
   if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
     throw error('timeoutMs must be a positive integer no greater than 2147483647')
   }
-  let ownedName: string | undefined
+  let owned: { name: string; kind: 'uncertain' | 'confirmed' | 'absent' } | undefined
   let active = false
 
   function normalize(operation: string, cause: unknown): Error {
@@ -102,6 +102,10 @@ export function createDockerDriver(options: {
     } catch (cause) {
       throw normalize(operation, cause)
     }
+    return output(exit, operation)
+  }
+
+  function output(exit: CliResult, operation: string): string {
     if (exit.code !== 0) {
       const status = exit.code === null ? 'terminated by signal' : `exit ${exit.code}`
       throw error(`${operation}: ${status}: ${exit.stderr.slice(0, diagnosticLimit)}`)
@@ -112,20 +116,39 @@ export function createDockerDriver(options: {
   }
 
   async function run(args: readonly string[]): Promise<string> {
+    const operation = args[0] ?? 'command'
     try {
-      return await result(cli.start(args), args[0] ?? 'command')
+      const exit = await cli.start(args).result
+      if (operation === 'create' && owned) {
+        if (exit.code === 0) owned.kind = 'confirmed'
+        else if (/^(?:Error response from daemon: )?No such image: [^\r\n]+\s*$/.test(exit.stderr))
+          owned.kind = 'absent'
+      }
+      return output(exit, operation)
     } catch (cause) {
+      if (
+        operation === 'create' &&
+        owned &&
+        cause instanceof Error &&
+        'code' in cause &&
+        typeof cause.code === 'string' &&
+        'syscall' in cause &&
+        cause.syscall === 'spawn docker'
+      )
+        owned.kind = 'absent'
       if (cause instanceof Error && cause.message.startsWith(`Docker (${options.image}):`))
         throw cause
-      throw normalize(args[0] ?? 'command', cause)
+      throw normalize(operation, cause)
     }
   }
 
   async function cleanup(): Promise<void> {
-    if (!ownedName) return
-    const name = ownedName
+    if (!owned) return
+    const { name, kind } = owned
+    let removed = false
     try {
-      await run(['rm', '--force', name])
+      const stdout = await run(['rm', '--force', name])
+      removed = stdout.trim() === name
     } catch (removalError) {
       try {
         const names = await run([
@@ -144,7 +167,12 @@ export function createDockerDriver(options: {
         )
       }
     }
-    ownedName = undefined
+    if (kind === 'uncertain' && !removed) {
+      throw new CleanupError(
+        `Docker (${options.image}): cleanup of ${name} unconfirmed: create outcome is uncertain; positive removal is required`,
+      )
+    }
+    owned = undefined
   }
 
   return {
@@ -164,13 +192,13 @@ export function createDockerDriver(options: {
         await cleanup()
         if (signal?.aborted) throw error('probe aborted')
         name = `kurumi-probe-${randomUUID()}`
-        ownedName = name
+        owned = { name, kind: 'uncertain' }
         await run([
           'create',
           '--rm',
           '--init',
           '--name',
-          ownedName,
+          name,
           '--label',
           `kurumi.install=${options.install}`,
           '--label',
@@ -190,7 +218,7 @@ export function createDockerDriver(options: {
         ])
         if (signal?.aborted) throw error('probe aborted')
         try {
-          attach = cli.start(['start', '--attach', ownedName])
+          attach = cli.start(['start', '--attach', name])
         } catch (cause) {
           throw normalize('start', cause)
         }

@@ -91,25 +91,49 @@ test.each([1, 125, 127, null])(
   },
 )
 
-test('create failure keeps useful daemon diagnostics and still removes the uncertain name', async () => {
-  const { cli, driver } = setup()
-  cli.responses.push(
-    { match: /^create /, result: { code: 125, stderr: 'No such image: kurumi-agent:test' } },
-    { match: /^rm /, result: {} },
-  )
-  expect(await rejection(driver.probe(url))).toContain('No such image')
-  expect(cli.started.map(({ args }) => args[0])).toEqual(['create', 'rm'])
-})
+test.each(['', 'Error response from daemon: '])(
+  'missing image rejection %s permits retry after the image is built',
+  async (prefix) => {
+    const { cli, driver } = setup()
+    cli.responses.push(
+      {
+        match: /^create /,
+        result: { code: 125, stderr: `${prefix}No such image: kurumi-agent:test\n` },
+      },
+      { match: /^rm /, result: {} },
+    )
+    expect(await rejection(driver.probe(url))).toContain('No such image')
+    expect(cli.started.map(({ args }) => args[0])).toEqual(['create', 'rm'])
+    cli.responses.splice(0, 1, { match: /^create /, result: {} })
+    cli.responses.push({ match: /^start /, result: { stdout: 'fresh-nonce' } })
+    expect(await driver.probe(url)).toBe('fresh-nonce')
+    expect(cli.started.map(({ args }) => args[0])).toEqual([
+      'create',
+      'rm',
+      'create',
+      'start',
+      'rm',
+    ])
+  },
+)
 
 test('spawn failure is normalized and cannot bypass cleanup', async () => {
   const { cli, driver } = setup()
   cli.responses.push(
-    { match: /^create /, error: new Error('spawn docker ENOENT') },
+    {
+      match: /^create /,
+      error: Object.assign(new Error('spawn docker ENOENT'), {
+        code: 'ENOENT',
+        syscall: 'spawn docker',
+      }),
+    },
     { match: /^rm /, result: {} },
   )
-  expect(await rejection(driver.probe(url))).toContain(
-    `Docker (${image}): create: spawn docker ENOENT`,
-  )
+  const outcome = await observe(driver.probe(url))
+  expect(outcome.kind).toBe('failure')
+  if (outcome.kind !== 'failure') throw new Error('probe unexpectedly succeeded')
+  expect(String(outcome.error)).toContain(`Docker (${image}): create: spawn docker ENOENT`)
+  expect(outcome.error).not.toHaveProperty('cleanupFailed')
   expect(cli.started.map(({ args }) => args[0])).toEqual(['create', 'rm'])
 })
 
@@ -249,6 +273,54 @@ test('an ambiguous create error and Docker outage retain the same owned name', a
   expect(cli.started.filter(({ args }) => args[0] === 'create')).toHaveLength(1)
 })
 
+test.each(['empty removal', 'empty query', 'different removal name'])(
+  'an ambiguous create retains ownership after %s until positive deletion',
+  async (absence) => {
+    const { cli, driver } = setup()
+    const first = observe(driver.probe(url))
+    const create = await call(cli, 0)
+    const name = create.args[create.args.indexOf('--name') + 1]
+    if (!name) throw new Error('probe has no container name')
+    create.proc.complete({ code: 1, stderr: 'error during connect: Post: EOF' })
+    const removal = await call(cli, 1)
+    removal.proc.complete({
+      code: absence === 'empty query' ? 1 : 0,
+      stdout: absence === 'different removal name' ? 'other-container\n' : '',
+    })
+    if (absence === 'empty query') (await call(cli, 2)).proc.complete()
+    const failed = await first
+    expect(failed.kind).toBe('failure')
+    if (failed.kind !== 'failure') throw new Error('probe unexpectedly succeeded')
+    expect(failed.error).toHaveProperty('cleanupFailed', true)
+    expect(String(failed.error)).toContain(name)
+
+    const retryIndex = cli.started.length
+    const retry = observe(driver.probe(url))
+    const retryRemoval = await call(cli, retryIndex)
+    expect(retryRemoval.args).toEqual(removal.args)
+    retryRemoval.proc.complete()
+    const retried = await retry
+    expect(retried.kind).toBe('failure')
+    if (retried.kind !== 'failure') throw new Error('probe unexpectedly succeeded')
+    expect(retried.error).toHaveProperty('cleanupFailed', true)
+    expect(String(retried.error)).toContain(name)
+    expect(cli.started.filter(({ args }) => args[0] === 'create')).toHaveLength(1)
+
+    const recoveryIndex = cli.started.length
+    const recovered = driver.probe(url)
+    const positiveRemoval = await call(cli, recoveryIndex)
+    expect(positiveRemoval.args).toEqual(removal.args)
+    positiveRemoval.proc.complete({ stdout: `${name}\n` })
+    const replacement = await call(cli, recoveryIndex + 1)
+    expect(replacement.args[0]).toBe('create')
+    expect(replacement.args).not.toContain(name)
+    replacement.proc.complete()
+    ;(await call(cli, recoveryIndex + 2)).proc.complete({ stdout: 'new-nonce' })
+    ;(await call(cli, recoveryIndex + 3)).proc.complete()
+    expect(await recovered).toBe('new-nonce')
+  },
+)
+
 test('a listed container cannot be mistaken for successful auto-removal', async () => {
   const { cli, driver } = setup()
   const outcome = observe(driver.probe(url))
@@ -288,15 +360,21 @@ test('synchronously failing process start is normalized and cleaned up', async (
     image,
     cli: {
       start(args) {
-        if (args[0] === 'create') throw new Error('cannot spawn docker')
+        if (args[0] === 'create')
+          throw Object.assign(new Error('cannot spawn docker'), {
+            code: 'ENOENT',
+            syscall: 'spawn docker',
+          })
         return cli.start(args)
       },
     },
   })
   cli.responses.push({ match: /^rm /, result: {} })
-  expect(await rejection(driver.probe(url))).toContain(
-    `Docker (${image}): create: cannot spawn docker`,
-  )
+  const outcome = await observe(driver.probe(url))
+  expect(outcome.kind).toBe('failure')
+  if (outcome.kind !== 'failure') throw new Error('probe unexpectedly succeeded')
+  expect(String(outcome.error)).toContain(`Docker (${image}): create: cannot spawn docker`)
+  expect(outcome.error).not.toHaveProperty('cleanupFailed')
   expect(cli.started[0]?.args[0]).toBe('rm')
 })
 
