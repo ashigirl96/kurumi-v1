@@ -954,14 +954,14 @@ describe('a selector written into every header slot of the catalog', () => {
 
           const readsAsLabel = slot.kind === 'header' && selectorOf('a').startsWith('kurumi:')
 
-          test.if(!readsAsLabel)('a placeholder after the selector is ignored', () => {
-            expect(outcome(`${a}, ${carrier.placeholder}`)).toBe(handle('a'))
-          })
-
-          test.if(readsAsLabel)(
-            'a placeholder after the selector reads as part of the label',
+          test(
+            readsAsLabel
+              ? 'a placeholder after the selector reads as part of the label'
+              : 'a placeholder after the selector is ignored',
             () => {
-              expect(outcome(`${a}, ${carrier.placeholder}`)).toBe('refused')
+              expect(outcome(`${a}, ${carrier.placeholder}`)).toBe(
+                readsAsLabel ? 'refused' : handle('a'),
+              )
             },
           )
 
