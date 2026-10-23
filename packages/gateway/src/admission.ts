@@ -153,7 +153,7 @@ export function startAdmission(deps: AdmissionDeps): Admission {
           delayMs = Math.min(maxRetryMs, delayMs * 2)
           cancelRetry = schedule(() => {
             cancelRetry = undefined
-            void retry()
+            retry().catch(() => {})
           }, nextDelay)
         }
       })
@@ -187,6 +187,6 @@ export function startAdmission(deps: AdmissionDeps): Admission {
     return stopped
   }
 
-  void retry()
+  retry().catch(() => {})
   return { status: () => structuredClone({ state, lastProbe }), retry, stop }
 }
