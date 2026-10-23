@@ -35,7 +35,10 @@
     "packages/agent": {
       "name": "@kurumi/agent",
       "dependencies": {
+        "@kurumi/rpc": "workspace:*",
+        "@orpc/server": "catalog:",
         "drizzle-orm": "catalog:",
+        "zod": "catalog:",
       },
       "devDependencies": {
         "drizzle-kit": "catalog:",
