@@ -1,7 +1,5 @@
 import { randomUUID } from 'node:crypto'
 
-import type { AgentPort } from './port.ts'
-
 export type AdmissionState =
   | { kind: 'binding' }
   | { kind: 'probing'; port: number }
@@ -25,7 +23,7 @@ export type Admission = {
 }
 
 type AdmissionDeps = {
-  bind(probeNonce: () => string | null): Promise<Pick<AgentPort, 'port' | 'stop'>>
+  bind(probeNonce: () => string | null): Promise<{ port: number; stop(): Promise<void> }>
   probe(url: string, options: { signal: AbortSignal }): Promise<string>
   retryMs?: number
   maxRetryMs?: number
