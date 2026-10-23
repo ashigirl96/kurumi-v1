@@ -1287,6 +1287,7 @@ test.each([
   ['a line with six fields', `["${'a'.repeat(64)}","x","running","","",""]`],
   ['a truncated ID', '["aaaaaaaaaaaa","x","running","","","",""]'],
   ['two names without a link', `["${'a'.repeat(64)}","x,y","running","","","",""]`],
+  ['an empty name', `["${'a'.repeat(64)}","","running","","","",""]`],
 ])(
   'a listing with %s fails the pass, keeps adoption closed and removes nothing until it parses',
   async (_case, line) => {
