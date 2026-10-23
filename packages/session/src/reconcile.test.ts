@@ -45,7 +45,7 @@ function plan(rows: ContainerRow[], containers: ListedContainer[] | null) {
 }
 
 const adopt = { kind: 'adopt', row: 'ctr-a', reason: 'running container matches its row' } as const
-const silent = (silentMs: number, toolPending = false) => ({ silentMs, toolPending })
+const silent = (awakeSilentMs: number, toolPending = false) => ({ awakeSilentMs, toolPending })
 
 test('a running container whose live row survived the restart is adopted', () => {
   expect(plan([row()], [listed()])).toEqual([adopt])
@@ -154,12 +154,12 @@ test('silence counts only the time the host was running, one gap at most a few i
   const liveness = createLiveness({ maxStepMs: 30, now: clock.now })
   liveness.begin('ctr-a')
   clock.advance(20)
-  expect(liveness.view('ctr-a')).toEqual({ silentMs: 20, toolPending: false })
+  expect(liveness.view('ctr-a')).toEqual({ awakeSilentMs: 20, toolPending: false })
   clock.advance(600_000)
-  expect(liveness.view('ctr-a')).toEqual({ silentMs: 50, toolPending: false })
+  expect(liveness.view('ctr-a')).toEqual({ awakeSilentMs: 50, toolPending: false })
   liveness.touch('ctr-a')
   clock.advance(10)
-  expect(liveness.view('ctr-a')?.silentMs).toBe(10)
+  expect(liveness.view('ctr-a')?.awakeSilentMs).toBe(10)
 })
 
 test('a host that stalls again and again still accumulates the silence it was awake for', () => {
@@ -174,7 +174,7 @@ test('a host that stalls again and again still accumulates the silence it was aw
     clock.advance(10)
     liveness.view('ctr-a')
   }
-  expect(liveness.view('ctr-a')?.silentMs).toBe(10 * (30 + 20))
+  expect(liveness.view('ctr-a')?.awakeSilentMs).toBe(10 * (30 + 20))
 })
 
 test('a declared tool deadline keeps a silent container alive until it passes', () => {
@@ -182,9 +182,9 @@ test('a declared tool deadline keeps a silent container alive until it passes', 
   const liveness = createLiveness({ maxStepMs: 1_000, now: clock.now })
   liveness.begin('ctr-a', 500)
   clock.advance(400)
-  expect(liveness.view('ctr-a')).toEqual({ silentMs: 400, toolPending: true })
+  expect(liveness.view('ctr-a')).toEqual({ awakeSilentMs: 400, toolPending: true })
   clock.advance(200)
-  expect(liveness.view('ctr-a')).toEqual({ silentMs: 600, toolPending: false })
+  expect(liveness.view('ctr-a')).toEqual({ awakeSilentMs: 600, toolPending: false })
   liveness.declareTool('ctr-a', 1_000)
   clock.advance(900)
   expect(liveness.view('ctr-a')?.toolPending).toBe(true)

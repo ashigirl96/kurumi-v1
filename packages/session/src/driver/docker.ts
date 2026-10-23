@@ -398,8 +398,8 @@ export function createDockerDriver(options: {
     } catch {
       throw error(`${args[0]} failed`)
     }
-    // A container's own commands, such as wait, last as long as it does; a lookup must not.
-    const deadline = operation ? undefined : setTimeout(() => proc.kill(), timeoutMs)
+    const lastsWithContainer = args[0] === 'wait' || args[0] === 'create'
+    const deadline = lastsWithContainer ? undefined : setTimeout(() => proc.kill(), timeoutMs)
     const tracked = operation?.processes ?? commands
     const create = args[0] === 'create' && operation ? settleCreate(proc) : undefined
     if (create && operation) operation.create = create

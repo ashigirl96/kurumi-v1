@@ -1,6 +1,6 @@
 import type { ContainerInventory, InventoryChange, ListedContainer } from './driver/docker.ts'
 
-export type LivenessView = { silentMs: number; toolPending: boolean }
+export type LivenessView = { awakeSilentMs: number; toolPending: boolean }
 export type ContainerRow = {
   id: string
   name: string
@@ -35,8 +35,17 @@ export type SupervisionLog =
   | { kind: 'session.events.subscribed'; attempt: number; monotonicMs: number }
   | { kind: 'session.events.lost'; code: number | null; retryMs: number; monotonicMs: number }
 
-// Silence is measured in time the host was running: one gap between observations counts for at
-// most maxStepMs, so a suspended or stalled host never makes its containers look silent.
+function createAwakeClock(maxStepMs: number, now: () => number): () => number {
+  let awake = 0
+  let seen = now()
+  return () => {
+    const current = now()
+    awake += Math.min(Math.max(0, current - seen), maxStepMs)
+    seen = current
+    return awake
+  }
+}
+
 export function createLiveness({
   maxStepMs,
   now = () => performance.now(),
@@ -44,15 +53,8 @@ export function createLiveness({
   maxStepMs: number
   now?: () => number
 }) {
-  let awake = 0
-  let seen = now()
+  const clock = createAwakeClock(maxStepMs, now)
   const entries = new Map<string, { last: number; toolDeadline: number | null }>()
-  function clock(): number {
-    const current = now()
-    awake += Math.min(Math.max(0, current - seen), maxStepMs)
-    seen = current
-    return awake
-  }
   return {
     begin(id: string, toolTimeoutMs: number | null = null) {
       const at = clock()
@@ -80,7 +82,7 @@ export function createLiveness({
       if (!entry) return null
       const at = clock()
       return {
-        silentMs: at - entry.last,
+        awakeSilentMs: at - entry.last,
         toolPending: entry.toolDeadline !== null && at <= entry.toolDeadline,
       }
     },
@@ -134,8 +136,8 @@ export function planReconciliation({
       continue
     }
     if (row.liveness) {
-      const { silentMs, toolPending } = row.liveness
-      if (row.status === 'running' && !toolPending && silentMs > staleAfterMs)
+      const { awakeSilentMs, toolPending } = row.liveness
+      if (row.status === 'running' && !toolPending && awakeSilentMs > staleAfterMs)
         decisions.push({ kind: 'reap', row, reason: 'stale' })
       continue
     }
