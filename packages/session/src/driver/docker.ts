@@ -366,6 +366,21 @@ export function createDockerDriver(options: {
   const detached = new Set<AgentContainer>()
   let stopping: Promise<void> | undefined
 
+  function record(
+    identity: Pick<AgentContainer, 'sessionId' | 'containerId' | 'name' | 'ownership' | 'phase'>,
+  ): AgentOperation {
+    return {
+      ...identity,
+      create: undefined,
+      processes: new Set(),
+      removal: undefined,
+      cancelled: false,
+      emitted: false,
+      pending: Promise.resolve({ ok: true }),
+      watch: undefined,
+    }
+  }
+
   function agentName(containerId: string): string {
     return `kurumi-agent-${createHash('sha256').update(options.install).update('\0').update(containerId).digest('hex').slice(0, 32)}`
   }
@@ -647,29 +662,12 @@ export function createDockerDriver(options: {
   }
 
   function removeListed(name: string, containerId: string): Promise<void> {
-    const listed: AgentContainer = residue.get(name) ?? {
-      sessionId: '',
-      containerId,
-      name,
-      ownership: 'confirmed',
-      phase: 'stopping',
-      create: undefined,
-      processes: new Set(),
-      removal: undefined,
+    const listed = residue.get(name) ?? {
+      ...record({ sessionId: '', containerId, name, ownership: 'confirmed', phase: 'stopping' }),
       cancelled: true,
-      emitted: false,
     }
     residue.set(name, listed)
     return removeAgent(listed)
-  }
-
-  function creations(): Creation[] {
-    return [
-      owned?.create,
-      ...[...agents.values(), ...replacements.values(), ...residue.values()].map(
-        (agent) => agent.create,
-      ),
-    ].filter((create) => create !== undefined)
   }
 
   const eventWindowMs = 60_000
@@ -807,20 +805,13 @@ export function createDockerDriver(options: {
           ok: false,
           reason: error('container id belongs to another session').message,
         })
-      const agent: AgentOperation = {
+      const agent = record({
         sessionId: spec.sessionId,
         containerId: spec.containerId,
         name: agentName(spec.containerId),
         ownership: 'uncertain',
         phase: 'starting',
-        create: undefined,
-        processes: new Set(),
-        pending: Promise.resolve({ ok: false, reason: 'not started' }),
-        removal: undefined,
-        watch: undefined,
-        cancelled: false,
-        emitted: false,
-      }
+      })
       if (existing) {
         const removal = removeAgent(existing)
         existing.phase = 'starting'
@@ -915,12 +906,9 @@ export function createDockerDriver(options: {
             timeoutMs,
           )
           const listed = requireSuccess(exit, 'list').split('\n').filter(Boolean).map(parseListing)
-          for (const create of creations())
-            if (
-              create.state === 'unconfirmed' &&
-              create.endedAt !== undefined &&
-              create.endedAt <= listedAt
-            )
+          const tracked = [...agents.values(), ...replacements.values(), ...residue.values()]
+          for (const create of [owned?.create, ...tracked.map((agent) => agent.create)])
+            if (create?.state === 'unconfirmed' && (create.endedAt ?? Infinity) <= listedAt)
               create.state = 'settled'
           return listed.filter(
             ({ name }) => name !== owned?.name && residue.get(name)?.removal === undefined,
@@ -937,20 +925,13 @@ export function createDockerDriver(options: {
         return existing.containerId === container.containerId && existing.phase === 'running'
           ? { ok: true }
           : { ok: false, reason: error('session already has a container').message }
-      const agent: AgentOperation = {
+      const agent = record({
         sessionId: container.sessionId,
         containerId: container.containerId,
         name: container.name,
         ownership: 'confirmed',
         phase: 'running',
-        create: undefined,
-        processes: new Set(),
-        pending: Promise.resolve({ ok: true }),
-        removal: undefined,
-        watch: undefined,
-        cancelled: false,
-        emitted: false,
-      }
+      })
       agents.set(agent.sessionId, agent)
       agent.watch = watchAgent(agent)
       endForeignWaits(agent.name)
