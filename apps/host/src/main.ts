@@ -30,6 +30,9 @@ export const initialGuard: Guard = ({ caller, meta }) =>
     : { kind: 'deny', reason: 'This procedure is not available to agents' }
 
 export async function startHost(config: HostConfig) {
+  process.stdout.write(
+    `${JSON.stringify({ kind: 'host.start', pid: process.pid, timeOrigin: performance.timeOrigin, monotonicMs: performance.now() })}\n`,
+  )
   mkdirSync(config.home, { recursive: true, mode: 0o700 })
   chmodSync(config.home, 0o700)
   const releaseLock = acquireLock(join(config.home, 'kurumi.lock'))
@@ -48,7 +51,7 @@ export async function startHost(config: HostConfig) {
       const results = await Promise.allSettled([
         sessions?.stop(),
         admission?.stop(),
-        driver?.stop(),
+        driver?.detach(),
         listener?.stop(true),
       ])
       try {
@@ -65,11 +68,14 @@ export async function startHost(config: HostConfig) {
     return stopped
   }
   try {
+    const milliseconds = z.coerce.number().int().max(2_147_483_647)
     const environment = z
       .object({
         KURUMI_AGENT_IMAGE: z.string().min(1).default('kurumi-agent:latest'),
         KURUMI_PROBE_IMAGE: z.string().min(1).optional(),
         KURUMI_DOCKER_NETWORK: z.string().min(1).default('bridge'),
+        KURUMI_STALE_AFTER_MS: milliseconds.min(30_000).default(1_800_000),
+        KURUMI_RECONCILE_INTERVAL_MS: milliseconds.min(100).default(10_000),
       })
       .parse(process.env)
     const install = createHash('sha256')
@@ -127,6 +133,11 @@ export async function startHost(config: HostConfig) {
             network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
           }),
         },
+        supervision: {
+          inventory: docker,
+          staleAfterMs: environment.KURUMI_STALE_AFTER_MS,
+          intervalMs: environment.KURUMI_RECONCILE_INTERVAL_MS,
+        },
       },
     })
     sessions = sessionLedger
@@ -166,6 +177,8 @@ export async function startHost(config: HostConfig) {
     })
     const rpc = createRpcFronts(router, contextFor)
     const agentHandler = new RPCHandler(router)
+    // A runner whose token is refused exits for good, so adoption finishes before the Agent Port binds.
+    await sessionLedger.start()
     admission = startAdmission({
       bind: (probeNonce) =>
         startAgentPort({
@@ -195,7 +208,6 @@ export async function startHost(config: HostConfig) {
         process.stdout.write(`${JSON.stringify({ kind: 'gateway.admission', message })}\n`)
       },
     })
-    await sessionLedger.start()
     const stale = lstatSync(socket, { throwIfNoEntry: false })
     if (stale && !stale.isSocket()) throw new Error(`${socket} exists and is not a socket`)
     rmSync(socket, { force: true })
