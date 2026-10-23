@@ -140,11 +140,15 @@ export async function startHost(config: HostConfig) {
       ],
       network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
     }
+    const contribution = ({ sessionToken }: { sessionToken: string }): ContainerEgress => ({
+      ...egress,
+      env: { ...egress.env, ...proxyEnv({ port: config.agentPort.port, sessionToken }) },
+    })
     const docker = createDockerDriver({
       install,
       revision: containerRevision({
         image: environment.KURUMI_AGENT_IMAGE,
-        egress,
+        contribution,
         runner: existsSync(runner) ? readFileSync(runner) : new Uint8Array(),
       }),
       image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
@@ -183,10 +187,7 @@ export async function startHost(config: HostConfig) {
               since: new Date(),
             }
           },
-          contribution: ({ sessionToken }) => ({
-            ...egress,
-            env: { ...egress.env, ...proxyEnv({ port: config.agentPort.port, sessionToken }) },
-          }),
+          contribution,
         },
         supervision: { staleAfterMs, intervalMs },
       },

@@ -20,6 +20,7 @@
     "zod": "catalog:"
   },
   "devDependencies": {
+    "@kurumi/gateway": "workspace:*",
     "drizzle-kit": "catalog:"
   }
 }
