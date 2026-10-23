@@ -110,6 +110,50 @@ test('diagnostic SQL reads a WAL snapshot without writing rows or changing the h
   }
 })
 
+test('diagnostic SQL cannot change the host SQLite process heap setting', () => {
+  const db = openKurumiDb(join(homeForTest(), 'kurumi.db'))
+  const before = db.$client.query<{ soft_heap_limit: number }, []>('pragma soft_heap_limit').get()
+  if (!before) throw new Error('Expected SQLite heap setting')
+  try {
+    queryReadOnly(db.$client, 'pragma soft_heap_limit=100000000')
+    expect(db.$client.query('pragma soft_heap_limit').get()).toEqual(before)
+  } finally {
+    db.$client.run(`pragma soft_heap_limit=${before.soft_heap_limit}`)
+    db.$client.close()
+  }
+})
+
+test('rejected diagnostic SQL cannot change the host SQLite temporary directory', () => {
+  const db = openKurumiDb(join(homeForTest(), 'kurumi.db'))
+  const before = db.$client.query('pragma temp_store_directory').all()
+  try {
+    expect(() => queryReadOnly(db.$client, "pragma temp_store_directory='/tmp'")).toThrow()
+    expect(db.$client.query('pragma temp_store_directory').all()).toEqual(before)
+  } finally {
+    db.$client.run("pragma temp_store_directory=''")
+    db.$client.close()
+  }
+})
+
+test('diagnostic worker preserves blobs and reports query errors and timeout', () => {
+  const db = openKurumiDb(join(homeForTest(), 'kurumi.db'))
+  try {
+    expect(queryReadOnly(db.$client, "select x'0001ff' as bytes")).toEqual([
+      { bytes: new Uint8Array([0, 1, 255]) },
+    ])
+    expect(() => queryReadOnly(db.$client, 'select from')).toThrow()
+    expect(() =>
+      queryReadOnly(
+        db.$client,
+        'with recursive numbers(n) as (values(0) union all select n+1 from numbers) select sum(n) from numbers',
+      ),
+    ).toThrow('Diagnostic SQL worker failed')
+    expect(queryReadOnly(db.$client, 'select 1 as alive')).toEqual([{ alive: 1 }])
+  } finally {
+    db.$client.close()
+  }
+}, 5000)
+
 test('the temporary host guard allows host and human callers and only agent channel calls', () => {
   const common = { path: ['probe'], input: undefined, grant: null }
   expect(initialGuard({ ...common, caller: { kind: 'host' }, meta: {} })).toEqual({ kind: 'allow' })

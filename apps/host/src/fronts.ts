@@ -1,10 +1,12 @@
 import { Database } from 'bun:sqlite'
+import { deserialize, serialize } from 'node:v8'
 
 import type { Caller } from '@kurumi/rpc/contract'
 import type { KurumiContext } from '@kurumi/rpc/server'
 import type { AnyContractRouter } from '@orpc/contract'
 import { ORPCError, type Router } from '@orpc/server'
 import { RPCHandler } from '@orpc/server/fetch'
+import { z } from 'zod'
 
 export function createRpcFronts<TContext extends KurumiContext>(
   router: Router<AnyContractRouter, TContext>,
@@ -23,9 +25,35 @@ export function createRpcFronts<TContext extends KurumiContext>(
   }
 }
 
+const queryReply = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('rows'), rows: z.array(z.record(z.string(), z.unknown())) }),
+  z.object({ kind: z.literal('forbidden'), message: z.string() }),
+  z.object({ kind: z.literal('error'), message: z.string() }),
+])
+
 export function queryReadOnly(sqlite: Database, sql: string): Record<string, unknown>[] {
-  // Preparing a PRAGMA can change connection settings before execution, so diagnostics use a snapshot.
-  const image = sqlite.serialize()
+  const child = Bun.spawnSync([process.execPath, import.meta.path, sql], {
+    stdin: sqlite.serialize(),
+    stdout: 'pipe',
+    stderr: 'pipe',
+    timeout: 1000,
+    killSignal: 'SIGKILL',
+  })
+  if (!child.success) {
+    throw new ORPCError('INTERNAL_SERVER_ERROR', { message: 'Diagnostic SQL worker failed' })
+  }
+  const reply = queryReply.parse(deserialize(child.stdout))
+  switch (reply.kind) {
+    case 'rows':
+      return reply.rows
+    case 'forbidden':
+      throw new ORPCError('FORBIDDEN', { message: reply.message })
+    case 'error':
+      throw new ORPCError('BAD_REQUEST', { message: reply.message })
+  }
+}
+
+function querySnapshot(image: Uint8Array, sql: string): Record<string, unknown>[] {
   // SQLite deserialize needs rollback-journal header bytes, even for a snapshot of a WAL database.
   image[18] = 1
   image[19] = 1
@@ -46,4 +74,20 @@ export function queryReadOnly(sqlite: Database, sql: string): Record<string, unk
     })
   }
   return statement.all()
+}
+
+if (import.meta.main) {
+  let reply: z.infer<typeof queryReply>
+  try {
+    const sql = process.argv[2]
+    if (sql === undefined) throw new Error('SQL is required')
+    const image = new Uint8Array(await Bun.stdin.arrayBuffer())
+    reply = { kind: 'rows', rows: querySnapshot(image, sql) }
+  } catch (error) {
+    reply = {
+      kind: error instanceof ORPCError && error.code === 'FORBIDDEN' ? 'forbidden' : 'error',
+      message: error instanceof Error ? error.message : String(error),
+    }
+  }
+  process.stdout.write(serialize(reply))
 }
