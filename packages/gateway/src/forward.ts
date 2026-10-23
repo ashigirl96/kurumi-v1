@@ -3,6 +3,10 @@ import { request, type RequestOptions } from 'node:https'
 import { isIP } from 'node:net'
 import { PassThrough, pipeline, type Duplex } from 'node:stream'
 
+import type { AccountHandle, AccountLedger, CredentialPrincipal } from '@kurumi/account/server'
+
+import { refusalHttp, refusalResponse, type GatewayRefusal } from './refusal.ts'
+
 export type ConnectTarget = { host: string; port: number }
 
 export type InjectionInput<Principal> = ConnectTarget & {
@@ -13,7 +17,9 @@ export type InjectionInput<Principal> = ConnectTarget & {
   rawHeaders: readonly string[]
 }
 
-export type Injection = { path: string; headers: Headers }
+export type Forwarded = { path: string; headers: Headers; account?: AccountHandle }
+
+type Injected = Forwarded | { refusal: GatewayRefusal }
 
 export type UpstreamDestination = {
   host: string
@@ -23,8 +29,24 @@ export type UpstreamDestination = {
 }
 
 export type ForwardDeps<Principal> = {
-  inject(input: InjectionInput<Principal>): Injection | Promise<Injection>
+  inject(input: InjectionInput<Principal>): Injected | Promise<Injected>
   upstream?: UpstreamDestination
+}
+
+export function credentialInject(
+  ledger: Pick<AccountLedger, 'credentialFor'>,
+): ForwardDeps<CredentialPrincipal>['inject'] {
+  return ({ principal, host, path, headers, rawHeaders }) => {
+    const decision = ledger.credentialFor(principal, { host, path, headers, rawHeaders })
+    switch (decision.kind) {
+      case 'inject':
+        return { ...decision.injection.apply(), account: decision.injection.handle }
+      case 'refuse':
+        return { refusal: decision.refusal }
+      case 'pass':
+        return { path, headers }
+    }
+  }
 }
 
 const hopHeaders = [
@@ -54,6 +76,13 @@ function withoutHopHeaders(headers: Headers): Headers {
   return result
 }
 
+/** Only the gateway names the account. A label is any text, and `writeHead` throws on a non-Latin1 or control character. */
+function withAccount(headers: Headers, account: AccountHandle | undefined): Headers {
+  headers.delete('x-kurumi-account')
+  if (account !== undefined) headers.set('x-kurumi-account', encodeURI(account.toWellFormed()))
+  return headers
+}
+
 function requestHeaders(req: IncomingMessage): Headers {
   const headers = new Headers()
   for (let index = 0; index < req.rawHeaders.length; index += 2) {
@@ -69,11 +98,20 @@ export function authority(target: ConnectTarget): string {
   return target.port === 443 ? host : `${host}:${target.port}`
 }
 
+type Prepared =
+  | {
+      kind: 'forward'
+      options: Omit<RequestOptions, 'headers'> & { headers: Record<string, string> }
+      account?: AccountHandle
+    }
+  | { kind: 'bad_request' }
+  | { kind: 'refused'; refusal: GatewayRefusal }
+
 async function prepareRequest<Principal>(
   context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
   req: IncomingMessage,
   deps: ForwardDeps<Principal>,
-): Promise<(Omit<RequestOptions, 'headers'> & { headers: Record<string, string> }) | null> {
+): Promise<Prepared> {
   const { target } = context
   const path = req.url ?? '/'
   const host = req.headers.host?.toLowerCase()
@@ -83,9 +121,9 @@ async function prepareRequest<Principal>(
     !host ||
     (host !== authority(target) && !(target.port === 443 && host === `${authority(target)}:443`))
   ) {
-    return null
+    return { kind: 'bad_request' }
   }
-  const injection = await deps.inject({
+  const injected = await deps.inject({
     principal: context.principal,
     ...target,
     method: req.method ?? 'GET',
@@ -93,7 +131,8 @@ async function prepareRequest<Principal>(
     headers: withoutHopHeaders(requestHeaders(req)),
     rawHeaders: [...req.rawHeaders],
   })
-  const headers = withoutHopHeaders(injection.headers)
+  if ('refusal' in injected) return { kind: 'refused', refusal: injected.refusal }
+  const headers = withoutHopHeaders(injected.headers)
   headers.set('host', authority(target))
   headers.delete('content-length')
   if (req.headers['transfer-encoding'] !== undefined) {
@@ -103,14 +142,18 @@ async function prepareRequest<Principal>(
   }
   const destination = deps.upstream?.host === target.host ? deps.upstream : undefined
   return {
-    hostname: destination?.address ?? target.host,
-    port: destination?.port ?? target.port,
-    servername: isIP(target.host) ? undefined : target.host,
-    ca: destination?.caPem,
-    method: req.method,
-    path: injection.path,
-    headers: Object.fromEntries(headers),
-    agent: false,
+    kind: 'forward',
+    options: {
+      hostname: destination?.address ?? target.host,
+      port: destination?.port ?? target.port,
+      servername: isIP(target.host) ? undefined : target.host,
+      ca: destination?.caPem,
+      method: req.method,
+      path: injected.path,
+      headers: Object.fromEntries(headers),
+      agent: false,
+    },
+    account: injected.account,
   }
 }
 
@@ -120,12 +163,18 @@ export async function forward<Principal>(
   res: ServerResponse,
   deps: ForwardDeps<Principal>,
 ): Promise<void> {
-  const options = await prepareRequest(context, req, deps)
+  const prepared = await prepareRequest(context, req, deps)
   if (context.signal.aborted || res.destroyed) return
-  if (!options) {
+  if (prepared.kind === 'bad_request') {
     res.writeHead(400, { connection: 'close' }).end()
     return
   }
+  if (prepared.kind === 'refused') {
+    const { status, headers, body } = refusalResponse(prepared.refusal)
+    res.writeHead(status, headers).end(body)
+    return
+  }
+  const { options, account } = prepared
   const body = new PassThrough()
   const upstream = request(options)
 
@@ -158,7 +207,7 @@ export async function forward<Principal>(
     res.end(JSON.stringify({ error: 'upstream_unreachable', host: context.target.host }))
   })
   upstream.once('response', (response) => {
-    const responseHeaders = withoutHopHeaders(requestHeaders(response))
+    const responseHeaders = withAccount(withoutHopHeaders(requestHeaders(response)), account)
     const outgoing: Record<string, string | string[]> = Object.fromEntries(responseHeaders)
     const cookies = responseHeaders.getSetCookie()
     if (cookies.length) outgoing['set-cookie'] = cookies
@@ -189,12 +238,17 @@ export async function forwardUpgrade<Principal>(
     client.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
     return
   }
-  const options = await prepareRequest(context, req, deps)
+  const prepared = await prepareRequest(context, req, deps)
   if (context.signal.aborted || client.destroyed) return
-  if (!options) {
+  if (prepared.kind === 'bad_request') {
     client.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
     return
   }
+  if (prepared.kind === 'refused') {
+    client.end(refusalHttp(prepared.refusal))
+    return
+  }
+  const { options, account } = prepared
   const upstream = request({
     ...options,
     headers: { ...options.headers, connection: 'Upgrade', upgrade: 'websocket' },
@@ -218,7 +272,7 @@ export async function forwardUpgrade<Principal>(
     else client.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
   })
   upstream.once('response', (response) => {
-    const headers = withoutHopHeaders(requestHeaders(response))
+    const headers = withAccount(withoutHopHeaders(requestHeaders(response)), account)
     headers.set('connection', 'close')
     client.write(upgradeResponse(response.statusCode ?? 502, headers))
     pipeline(response, client, () => cancel())
@@ -234,7 +288,7 @@ export async function forwardUpgrade<Principal>(
       client.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
       return
     }
-    const headers = withoutHopHeaders(requestHeaders(response))
+    const headers = withAccount(withoutHopHeaders(requestHeaders(response)), account)
     headers.set('connection', 'Upgrade')
     headers.set('upgrade', 'websocket')
     client.write(upgradeResponse(101, headers))

@@ -1,7 +1,14 @@
 import { afterEach, expect, test } from 'bun:test'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
+import { once } from 'node:events'
 import { request } from 'node:https'
+import type { TLSSocket } from 'node:tls'
 
+import { createAccountLedger, isInterceptedHost, type AuthMode } from '@kurumi/account/server'
+import { inMemoryDb, insertAgentGroup } from '@kurumi/account/testing'
+
+import { credentialInject } from './forward.ts'
+import { startAgentPort } from './port.ts'
 import { openTestTunnel, sendTestRequest, startFakeUpstream, startTestGateway } from './testing.ts'
 
 const stops: (() => void | Promise<void>)[] = []
@@ -195,4 +202,225 @@ test('a closed upstream returns host-bearing 502 JSON while the upload is unfini
   expect(client.writableEnded).toBe(false)
   expect(result.status).toBe(502)
   expect(JSON.parse(result.body)).toEqual({ error: 'upstream_unreachable', host: 'fake.test' })
+})
+
+const groupSelector = 'sk-ant-kurumi-YW50aHJvcGlj'
+const secrets = { main: 'sk-ant-api03-main-secret', second: 'sk-ant-oat01-second-secret' }
+
+async function setupCredentials() {
+  const db = inMemoryDb()
+  insertAgentGroup(db, 'g1')
+  const ledger = createAccountLedger({ db, vaultKey: randomBytes(32) })
+  const upstream = await startFakeUpstream({ host: 'api.anthropic.com' })
+  stops.push(upstream.stop)
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: (token) => (token === 'test-token' ? { agentGroupId: 'g1' } : null),
+    intercepts: isInterceptedHost,
+    forward: { upstream: upstream.destination, inject: credentialInject(ledger) },
+  })
+  stops.push(gateway.stop)
+  const tunnel = await openTestTunnel({
+    proxyPort: gateway.port,
+    token: 'test-token',
+    caPem: gateway.caPem,
+    target: { host: 'api.anthropic.com', port: 443 },
+  })
+  stops.push(tunnel.close)
+  const addKey = (label: string, value: string, authMode: AuthMode = 'api-key') =>
+    db.transaction((tx) =>
+      ledger.addKey(tx, {
+        vendor: 'anthropic',
+        label,
+        value,
+        authMode,
+        autoGrant: true,
+        addedBy: 't',
+      }),
+    )
+  const setDefault = (handle: string) =>
+    db.transaction((tx) => {
+      const found = ledger.accountIdOf(tx, handle)
+      if (!found.ok) throw new Error(`no account ${handle}`)
+      ledger.setDefault(tx, {
+        agentGroupId: 'g1',
+        accountId: found.accountId,
+        service: 'anthropic-api',
+      })
+    })
+  return { upstream, tunnel, addKey, setDefault }
+}
+
+async function exchangeRaw(socket: TLSSocket, bytes: string) {
+  const chunks: Buffer[] = []
+  socket.on('data', (chunk: Buffer) => chunks.push(chunk))
+  const closed = once(socket, 'close')
+  socket.write(bytes)
+  await closed
+  const text = Buffer.concat(chunks).toString()
+  const end = text.indexOf('\r\n\r\n')
+  const [statusLine = '', ...lines] = text.slice(0, end).split('\r\n')
+  return {
+    status: Number(statusLine.split(' ')[1]),
+    headers: Object.fromEntries(
+      lines.map((line) => {
+        const colon = line.indexOf(':')
+        return [line.slice(0, colon).toLowerCase(), line.slice(colon + 1).trim()]
+      }),
+    ),
+    body: text.slice(end + 4),
+  }
+}
+
+const mentionsKurumi = (values: readonly string[]) =>
+  values.filter((value) => /kurumi/i.test(value))
+
+test.each([
+  ['api-key', { 'x-api-key': groupSelector }, 'x-api-key', secrets.main, 'authorization'],
+  [
+    'oauth-token',
+    { authorization: `Bearer ${groupSelector}` },
+    'authorization',
+    `Bearer ${secrets.main}`,
+    'x-api-key',
+  ],
+] as const)(
+  'an %s account reaches the upstream in its own slot and is named on the response',
+  async (authMode, headers, slot, written, otherSlot) => {
+    const { upstream, tunnel, addKey } = await setupCredentials()
+    addKey('main', secrets.main, authMode)
+
+    const response = await sendTestRequest(tunnel, { path: '/v1/models', headers })
+
+    expect(response.status).toBe(200)
+    expect(response.headers['x-kurumi-account']).toBe('anthropic/main')
+    expect(upstream.requests).toHaveLength(1)
+    expect(upstream.requests[0]?.headers[slot]).toBe(written)
+    expect(upstream.requests[0]?.headers[otherSlot]).toBeUndefined()
+    expect(mentionsKurumi(upstream.requests[0]?.rawHeaders ?? [])).toEqual([])
+  },
+)
+
+test('the account the upstream names is replaced by the one the gateway chose', async () => {
+  const { upstream, tunnel, addKey } = await setupCredentials()
+  addKey('main', secrets.main)
+  upstream.setResponse('/v1/models', {
+    status: 200,
+    body: '{}',
+    headers: { 'x-kurumi-account': 'anthropic/forged' },
+  })
+
+  const response = await sendTestRequest(tunnel, { path: '/v1/models' })
+
+  expect(response.headers['x-kurumi-account']).toBe('anthropic/main')
+})
+
+test('a group with no account is refused with a JSON 404 and nothing goes upstream', async () => {
+  const { upstream, tunnel } = await setupCredentials()
+
+  const response = await sendTestRequest(tunnel, {
+    path: '/v1/models',
+    headers: { 'x-api-key': groupSelector },
+  })
+
+  expect(response.status).toBe(404)
+  expect(response.headers['content-type']).toBe('application/json')
+  expect(response.headers['x-should-retry']).toBe('false')
+  expect(response.headers['x-kurumi-gateway']).toBe('account_not_connected')
+  expect(JSON.parse(response.body)).toEqual({
+    error: 'account_not_connected',
+    service: 'anthropic-api',
+    next: expect.stringContaining('kurumi account add-key'),
+  })
+  expect(upstream.requests).toEqual([])
+})
+
+test('two accounts and no default are refused as ambiguous, listing both', async () => {
+  const { upstream, tunnel, addKey } = await setupCredentials()
+  addKey('main', secrets.main)
+  addKey('second', secrets.second, 'oauth-token')
+
+  const response = await sendTestRequest(tunnel, { path: '/v1/models' })
+
+  expect(response.status).toBe(409)
+  expect(JSON.parse(response.body)).toMatchObject({
+    error: 'account_ambiguous',
+    granted: ['anthropic/main', 'anthropic/second'],
+  })
+  expect(upstream.requests).toEqual([])
+})
+
+test('a named account wins over the default', async () => {
+  const { upstream, tunnel, addKey, setDefault } = await setupCredentials()
+  addKey('main', secrets.main)
+  addKey('second', secrets.second, 'oauth-token')
+  setDefault('anthropic/main')
+
+  const response = await sendTestRequest(tunnel, {
+    path: '/v1/models',
+    headers: { 'x-api-key': 'sk-ant-kurumi-YW50aHJvcGljL3NlY29uZA' },
+  })
+
+  expect(response.headers['x-kurumi-account']).toBe('anthropic/second')
+  expect(upstream.requests[0]?.headers.authorization).toBe(`Bearer ${secrets.second}`)
+})
+
+test('the default serves a request that names no account', async () => {
+  const { tunnel, addKey, setDefault } = await setupCredentials()
+  addKey('main', secrets.main)
+  addKey('second', secrets.second, 'oauth-token')
+  setDefault('anthropic/second')
+
+  const response = await sendTestRequest(tunnel, {
+    path: '/v1/models',
+    headers: { authorization: `Bearer ${groupSelector}` },
+  })
+
+  expect(response.status).toBe(200)
+  expect(response.headers['x-kurumi-account']).toBe('anthropic/second')
+})
+
+test('two Authorization lines are refused as a duplicate slot before anything goes upstream', async () => {
+  const { upstream, tunnel, addKey } = await setupCredentials()
+  addKey('main', secrets.main)
+
+  const response = await exchangeRaw(
+    tunnel.socket,
+    `GET /v1/models HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer ${groupSelector}\r\nauthorization: Bearer other\r\nConnection: close\r\n\r\n`,
+  )
+
+  expect(response.status).toBe(400)
+  expect(JSON.parse(response.body)).toEqual({
+    error: 'duplicate_slot',
+    service: 'anthropic-api',
+    header: 'authorization',
+    next: 'send the authorization header once',
+  })
+  expect(upstream.requests).toEqual([])
+})
+
+test('a refused WebSocket upgrade gets the same JSON response', async () => {
+  const { upstream, tunnel } = await setupCredentials()
+
+  const response = await exchangeRaw(
+    tunnel.socket,
+    `GET /v1/stream HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\n\r\n`,
+  )
+
+  expect(response.status).toBe(404)
+  expect(response.headers['content-type']).toBe('application/json')
+  expect(response.headers['x-kurumi-gateway']).toBe('account_not_connected')
+  expect(JSON.parse(response.body)).toMatchObject({ error: 'account_not_connected' })
+  expect(upstream.requests).toEqual([])
+})
+
+test('a label outside Latin-1 is named percent-encoded and the request completes', async () => {
+  const { upstream, tunnel, addKey } = await setupCredentials()
+  addKey('日本', secrets.main)
+
+  const response = await sendTestRequest(tunnel, { path: '/v1/models' })
+
+  expect(response.status).toBe(200)
+  expect(response.headers['x-kurumi-account']).toBe('anthropic/%E6%97%A5%E6%9C%AC')
+  expect(upstream.requests).toHaveLength(1)
 })
