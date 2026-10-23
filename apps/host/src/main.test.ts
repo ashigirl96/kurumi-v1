@@ -229,21 +229,87 @@ test('a killed host leaves a lock and socket that a new host can recover', async
   expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
 }, 5000)
 
-test('a vault key that did not seal the gateway CA stops the host and names the backup to restore', async () => {
+async function startedAndStoppedHome(): Promise<string> {
   const home = homeForTest()
   const first = spawnHost(home)
   await waitForHost(home, first)
   first.kill('SIGTERM')
   expect(await first.exited).toBe(0)
+  return home
+}
+
+async function startAndStop(home: string): Promise<string> {
+  const host = spawnHost(home)
+  await waitForHost(home, host)
+  host.kill('SIGTERM')
+  expect(await host.exited).toBe(0)
+  return new Response(host.stdout).text()
+}
+
+function storedCa(home: string): string | undefined {
+  const sqlite = new Database(join(home, 'kurumi.db'), { readonly: true })
+  try {
+    return sqlite.query<{ pem: string }, []>('SELECT cert_pem AS pem FROM gateway_ca').get()?.pem
+  } finally {
+    sqlite.close()
+  }
+}
+
+function storeAccount(home: string, material: Uint8Array): void {
+  const sqlite = new Database(join(home, 'kurumi.db'))
+  sqlite
+    .query(
+      `INSERT INTO account (id, vendor, label, kind, auth_mode, services, material, status, created_at)
+       VALUES ('acc-a', 'anthropic', 'main', 'key', 'api-key', '["anthropic-api"]', ?, 'active', 0)`,
+    )
+    .run(material)
+  sqlite.close()
+}
+
+test('with no accounts stored, a host whose vault.key was deleted starts with a new key and a new gateway CA', async () => {
+  const home = await startedAndStoppedHome()
+  const before = storedCa(home)
+  rmSync(join(home, 'vault.key'))
+
+  const stdout = await startAndStop(home)
+
+  expect(storedCa(home)).not.toBe(before)
+  expect(stdout).toContain('"kind":"gateway.ca.replaced"')
+}, 5000)
+
+test('after the start-over SQL deletes every account, a host without vault.key starts with a new gateway CA', async () => {
+  const home = await startedAndStoppedHome()
+  const before = storedCa(home)
+  storeAccount(home, Buffer.of(0))
+  rmSync(join(home, 'vault.key'))
+  const refused = spawnHost(home)
+  expect(await refused.exited).toBe(1)
+  const startOver = Bun.spawnSync([
+    'sqlite3',
+    join(home, 'kurumi.db'),
+    'PRAGMA foreign_keys = ON; DELETE FROM account;',
+  ])
+  expect(startOver.exitCode).toBe(0)
+
+  const stdout = await startAndStop(home)
+
+  expect(storedCa(home)).not.toBe(before)
+  expect(stdout).toContain('"kind":"gateway.ca.replaced"')
+}, 5000)
+
+test('with accounts stored, a wrong vault.key stops the host, names the backup, and keeps the gateway CA', async () => {
+  const home = await startedAndStoppedHome()
+  const before = storedCa(home)
+  storeAccount(home, Buffer.of(0))
   writeFileSync(join(home, 'vault.key'), randomBytes(32), { mode: 0o600 })
 
   const second = spawnHost(home)
+
   expect(await second.exited).toBe(1)
   const stderr = await new Response(second.stderr).text()
   expect(stderr).toContain(join(home, 'vault.key'))
-  expect(stderr).toContain('cannot open the gateway CA')
-  expect(stderr).toContain('gateway_ca failed authentication')
-  expect(stderr).toContain('restore that one from your backup')
+  expect(stderr).toContain('from your backup')
+  expect(storedCa(home)).toBe(before)
 }, 5000)
 
 test('diagnostic SQL reads a WAL snapshot without writing rows or changing the host connection', () => {

@@ -47,8 +47,13 @@ function notAfter(certPem: string): string {
 
 test('the CA is created once and every later load returns it', async () => {
   const { db, sqlite } = openDb()
-  const first = await loadCertificateAuthority({ db, vaultKey, log: ignore })
-  const second = await loadCertificateAuthority({ db, vaultKey, log: ignore })
+  const first = await loadCertificateAuthority({ db, vaultKey, accountsStored: false, log: ignore })
+  const second = await loadCertificateAuthority({
+    db,
+    vaultKey,
+    accountsStored: false,
+    log: ignore,
+  })
   expect(second.certPem).toBe(first.certPem)
   expect(sqlite.query('SELECT count(*) AS n FROM gateway_ca').get()).toEqual({ n: 1 })
   expect(new X509Certificate(first.certPem).ca).toBe(true)
@@ -57,11 +62,21 @@ test('the CA is created once and every later load returns it', async () => {
 test('a reopened database yields the same CA, and its leaves chain to the first certificate', async () => {
   const path = join(tempDir(), 'kurumi.db')
   const before = openDb(path)
-  const original = await loadCertificateAuthority({ db: before.db, vaultKey, log: ignore })
+  const original = await loadCertificateAuthority({
+    db: before.db,
+    vaultKey,
+    accountsStored: false,
+    log: ignore,
+  })
   before.sqlite.close()
 
   const after = openDb(path)
-  const reloaded = await loadCertificateAuthority({ db: after.db, vaultKey, log: ignore })
+  const reloaded = await loadCertificateAuthority({
+    db: after.db,
+    vaultKey,
+    accountsStored: false,
+    log: ignore,
+  })
   const leaf = new X509Certificate((await reloaded.leafFor('api.anthropic.com')).certPem)
   after.sqlite.close()
 
@@ -70,9 +85,9 @@ test('a reopened database yields the same CA, and its leaves chain to the first 
   expect(leaf.verify(new X509Certificate(original.certPem).publicKey)).toBe(true)
 })
 
-test('the stored key is sealed and does not open without the vault key', async () => {
+test('the stored key is sealed and, with accounts stored, does not open without the vault key', async () => {
   const { db, sqlite } = openDb()
-  await loadCertificateAuthority({ db, vaultKey, log: ignore })
+  await loadCertificateAuthority({ db, vaultKey, accountsStored: false, log: ignore })
   const row = sqlite
     .query<{ sealed_key: Uint8Array }, []>('SELECT sealed_key FROM gateway_ca')
     .get()
@@ -80,9 +95,46 @@ test('the stored key is sealed and does not open without the vault key', async (
   const failure = await loadCertificateAuthority({
     db,
     vaultKey: randomBytes(32),
+    accountsStored: true,
     log: ignore,
   }).catch((error: unknown) => error)
   expect(failure).toBeInstanceOf(VaultError)
+})
+
+test('with no accounts stored, a CA the vault key cannot open is replaced and the reason is logged', async () => {
+  const { db, sqlite } = openDb()
+  const original = await loadCertificateAuthority({
+    db,
+    vaultKey,
+    accountsStored: false,
+    log: ignore,
+  })
+  const newKey = randomBytes(32)
+  const events: unknown[] = []
+  const replaced = await loadCertificateAuthority({
+    db,
+    vaultKey: newKey,
+    accountsStored: false,
+    log: (event) => events.push(event),
+  })
+
+  expect(replaced.certPem).not.toBe(original.certPem)
+  expect(events).toEqual([
+    {
+      kind: 'gateway.ca.replaced',
+      reason:
+        'the vault key cannot open the stored CA (sealed material for gateway_ca failed authentication) and no accounts are stored',
+      notAfter: notAfter(replaced.certPem),
+    },
+  ])
+  expect(sqlite.query('SELECT count(*) AS n FROM gateway_ca').get()).toEqual({ n: 1 })
+  const reloaded = await loadCertificateAuthority({
+    db,
+    vaultKey: newKey,
+    accountsStored: true,
+    log: ignore,
+  })
+  expect(reloaded.certPem).toBe(replaced.certPem)
 })
 
 test.each([
@@ -91,13 +143,20 @@ test.each([
 ])('a stored CA that is %s is replaced at load and the renewal is logged', async (_, age) => {
   const { db, sqlite } = openDb()
   const start = Date.now()
-  const original = await loadCertificateAuthority({ db, vaultKey, now: () => start, log: ignore })
+  const original = await loadCertificateAuthority({
+    db,
+    vaultKey,
+    now: () => start,
+    accountsStored: false,
+    log: ignore,
+  })
   const later = start + age * day
   const events: unknown[] = []
   const renewed = await loadCertificateAuthority({
     db,
     vaultKey,
     now: () => later,
+    accountsStored: false,
     log: (event) => events.push(event),
   })
 
@@ -111,7 +170,13 @@ test.each([
     },
   ])
   expect(sqlite.query('SELECT count(*) AS n FROM gateway_ca').get()).toEqual({ n: 1 })
-  const reloaded = await loadCertificateAuthority({ db, vaultKey, now: () => later, log: ignore })
+  const reloaded = await loadCertificateAuthority({
+    db,
+    vaultKey,
+    now: () => later,
+    accountsStored: false,
+    log: ignore,
+  })
   expect(reloaded.certPem).toBe(renewed.certPem)
   const leaf = new X509Certificate((await reloaded.leafFor('api.anthropic.com')).certPem)
   expect(leaf.checkIssued(new X509Certificate(renewed.certPem))).toBe(true)
@@ -120,12 +185,19 @@ test.each([
 test('a stored CA with more than 30 days left is kept', async () => {
   const { db } = openDb()
   const start = Date.now()
-  const original = await loadCertificateAuthority({ db, vaultKey, now: () => start, log: ignore })
+  const original = await loadCertificateAuthority({
+    db,
+    vaultKey,
+    now: () => start,
+    accountsStored: false,
+    log: ignore,
+  })
   const events: unknown[] = []
   const later = await loadCertificateAuthority({
     db,
     vaultKey,
     now: () => start + 330 * day,
+    accountsStored: false,
     log: (event) => events.push(event),
   })
   expect(later.certPem).toBe(original.certPem)
@@ -140,6 +212,7 @@ test('a loaded CA that outlives its end while the host runs logs gateway.ca.expi
     db,
     vaultKey,
     now: () => now,
+    accountsStored: false,
     log: (event) => events.push(event),
   })
   now = Date.parse(notAfter(ca.certPem))
@@ -151,14 +224,21 @@ test('a loaded CA that outlives its end while the host runs logs gateway.ca.expi
   expect(events).toEqual([{ kind: 'gateway.ca.expired', notAfter: notAfter(ca.certPem) }])
 })
 
-test('an expired CA under a different vault key is refused, not replaced', async () => {
+test('with accounts stored, an expired CA under a different vault key is refused, not replaced', async () => {
   const { db, sqlite } = openDb()
   const start = Date.now()
-  const original = await loadCertificateAuthority({ db, vaultKey, now: () => start, log: ignore })
+  const original = await loadCertificateAuthority({
+    db,
+    vaultKey,
+    now: () => start,
+    accountsStored: false,
+    log: ignore,
+  })
   const failure = await loadCertificateAuthority({
     db,
     vaultKey: randomBytes(32),
     now: () => start + 400 * day,
+    accountsStored: true,
     log: ignore,
   }).catch((error: unknown) => error)
   expect(failure).toBeInstanceOf(VaultError)

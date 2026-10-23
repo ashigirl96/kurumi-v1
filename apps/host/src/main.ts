@@ -121,6 +121,7 @@ export async function startHost(config: HostConfig) {
     const ca = await loadCertificateAuthority({
       db,
       vaultKey,
+      accountsStored: storedAccounts(db).count > 0,
       log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
     }).catch((error: unknown) => {
       if (!(error instanceof VaultError)) throw error

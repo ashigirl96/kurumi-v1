@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join } from 'node:path'
 import { rootCertificates } from 'node:tls'
 
-import { open, seal } from '@kurumi/account/server'
+import { open, seal, VaultError } from '@kurumi/account/server'
 import type { Db } from '@kurumi/rpc/server'
 
 import {
@@ -30,11 +30,22 @@ const NO_PROXY = [CONTAINER_HOST, 'localhost', '127.0.0.1', '::1'].join(',')
 
 export type CaEvent =
   | { kind: 'gateway.ca.renewed'; previousNotAfter: string; notAfter: string }
+  | { kind: 'gateway.ca.replaced'; reason: string; notAfter: string }
   | CaExpired
+
+function openCaKey(vaultKey: Uint8Array, sealedKey: Uint8Array): string | VaultError {
+  try {
+    return open(vaultKey, CA_SEAL_ID, sealedKey)
+  } catch (error) {
+    if (error instanceof VaultError) return error
+    throw error
+  }
+}
 
 export async function loadCertificateAuthority(deps: {
   db: Db
   vaultKey: Uint8Array
+  accountsStored: boolean
   now?: () => number
   log: (event: CaEvent) => void
 }): Promise<CertificateAuthority> {
@@ -56,7 +67,18 @@ export async function loadCertificateAuthority(deps: {
   }
   const row = deps.db.select().from(gatewayCa).get()
   if (!row) return certificateAuthority(await sealNewCa(), clock)
-  const stored = { certPem: row.certPem, keyPem: open(deps.vaultKey, CA_SEAL_ID, row.sealedKey) }
+  const keyPem = openCaKey(deps.vaultKey, row.sealedKey)
+  if (keyPem instanceof VaultError) {
+    if (deps.accountsStored) throw keyPem
+    const replaced = await sealNewCa()
+    deps.log({
+      kind: 'gateway.ca.replaced',
+      reason: `the vault key cannot open the stored CA (${keyPem.message}) and no accounts are stored`,
+      notAfter: certificateNotAfter(replaced.certPem).toISOString(),
+    })
+    return certificateAuthority(replaced, clock)
+  }
+  const stored = { certPem: row.certPem, keyPem }
   const previousNotAfter = certificateNotAfter(stored.certPem)
   if (previousNotAfter.getTime() - now() > CA_RENEWAL_WINDOW_MS) {
     return certificateAuthority(stored, clock)
