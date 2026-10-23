@@ -156,14 +156,68 @@ async function rawConnect(proxyPort: number, authority: string): Promise<string>
     response += chunk.toString()
   })
   await once(client, 'connect')
-  const closed = once(client, 'close')
+  const answered = new Promise<void>((resolve) => {
+    client.on('data', () => {
+      if (response.includes('\r\n\r\n')) resolve()
+    })
+    client.once('close', () => resolve())
+  })
   const credential = Buffer.from('s:test-token').toString('base64')
   client.write(
     `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nProxy-Authorization: Basic ${credential}\r\n\r\n`,
   )
-  await closed
+  await answered
   return response
 }
+
+async function countingService() {
+  const service = createServer((socket) => socket.destroy())
+  const state = { accepts: 0, port: 0 }
+  service.on('connection', () => state.accepts++)
+  service.listen(0, '127.0.0.1')
+  await once(service, 'listening')
+  stops.push(() => new Promise<void>((resolve) => service.close(() => resolve())))
+  state.port = (service.address() as AddressInfo).port
+  return state
+}
+
+async function gatewayResolving(addresses: string[], refused: string[]) {
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: (token) => (token === 'test-token' ? {} : null),
+    intercepts: () => false,
+    addressRefusal: (address) => (refused.includes(address) ? 'test-refused' : null),
+    resolve: (host) =>
+      Promise.resolve(
+        host === 'pinned.test'
+          ? addresses.map((address) => ({ address, family: address.includes(':') ? 6 : 4 }))
+          : [],
+      ),
+    forward: { inject: ({ path, headers }) => ({ path, headers }) },
+  })
+  stops.push(gateway.stop)
+  return gateway
+}
+
+test('a tunnel dials the address the check approved, not a second lookup of the name', async () => {
+  const service = await countingService()
+  const gateway = await gatewayResolving(['127.0.0.1'], [])
+  const response = await rawConnect(gateway.port, `pinned.test:${service.port}`)
+  expect(response).toStartWith('HTTP/1.1 200 Connection Established')
+  await Bun.sleep(50)
+  expect(service.accepts).toBe(1)
+})
+
+test('a name with one approved and one refused address is refused before any connection', async () => {
+  const service = await countingService()
+  const gateway = await gatewayResolving(['127.0.0.1', '::1'], ['::1'])
+  const response = await rawConnect(gateway.port, `pinned.test:${service.port}`)
+  expect(response).toStartWith('HTTP/1.1 403 Forbidden')
+  expect(response).toContain('pinned.test: it resolves to a test-refused address')
+  expect(response).not.toContain('::1')
+  await Bun.sleep(50)
+  expect(service.accepts).toBe(0)
+})
 
 test.each([
   ['127.0.0.1', 'loopback'],
@@ -172,20 +226,14 @@ test.each([
   ['0.0.0.0', 'unspecified'],
 ])('CONNECT to %s on the host is refused as %s before any connection', async (host, reason) => {
   const { gateway } = await setup()
-  const service = createServer((socket) => socket.destroy())
-  let accepts = 0
-  service.on('connection', () => accepts++)
-  service.listen(0, '127.0.0.1')
-  await once(service, 'listening')
-  stops.push(() => new Promise<void>((resolve) => service.close(() => resolve())))
-  const { port } = service.address() as AddressInfo
+  const service = await countingService()
 
-  const response = await rawConnect(gateway.port, `${host}:${port}`)
+  const response = await rawConnect(gateway.port, `${host}:${service.port}`)
 
   expect(response).toStartWith('HTTP/1.1 403 Forbidden')
   expect(response).toContain(`a ${reason} address`)
   await Bun.sleep(50)
-  expect(accepts).toBe(0)
+  expect(service.accepts).toBe(0)
 })
 
 test.each([

@@ -1,7 +1,8 @@
+import type { LookupAddress } from 'node:dns'
 import { lookup } from 'node:dns/promises'
 import { once } from 'node:events'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { connect, type Server } from 'node:net'
+import { connect, type LookupFunction, type Server } from 'node:net'
 import { pipeline, type Duplex } from 'node:stream'
 import { createServer as createTlsServer } from 'node:tls'
 
@@ -67,6 +68,15 @@ function rejectConnect(socket: Duplex, status: 400 | 403 | 407 | 502, body = '')
   )
 }
 
+function pinnedLookup(addresses: LookupAddress[]): LookupFunction {
+  return (hostname, options, callback) => {
+    const [first] = addresses
+    if (!first) callback(new Error(`${hostname} resolved to no address`), '')
+    else if (options.all) callback(null, addresses)
+    else callback(null, first.address, first.family)
+  }
+}
+
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve) => {
     server.close(() => resolve())
@@ -78,6 +88,7 @@ export async function startAgentPort<Principal extends object>(deps: {
   authenticate(token: string): Principal | null | Promise<Principal | null>
   intercepts(host: string): boolean
   addressRefusal?: (address: string) => string | null
+  resolve?: (host: string) => Promise<LookupAddress[]>
   forward: ForwardDeps<Principal>
   ca?: CertificateAuthority
   onConnect?(target: ConnectTarget): void
@@ -91,6 +102,7 @@ export async function startAgentPort<Principal extends object>(deps: {
 }): Promise<AgentPort> {
   const ca = deps.ca ?? (await createCertificateAuthority())
   const refusal = deps.addressRefusal ?? addressRefusal
+  const resolve = deps.resolve ?? ((host: string) => lookup(host, { all: true }))
   const listeners = new Map<string, Promise<HostListener<Principal>>>()
   const sockets = new Map<Duplex, (() => void) | undefined>()
   let stopping = false
@@ -223,25 +235,22 @@ export async function startAgentPort<Principal extends object>(deps: {
     if (stopping || client.destroyed) return
     deps.onConnect?.(target)
     const listener = deps.intercepts(target.host) ? await listenerFor(target.host) : undefined
-    let address = '127.0.0.1'
-    if (!listener) {
-      const resolved = await lookup(target.host, { all: true, order: 'verbatim' })
-      for (const { address: candidate } of resolved) {
-        const reason = refusal(candidate)
-        if (reason !== null) {
-          rejectConnect(
-            client,
-            403,
-            `kurumi refuses to tunnel to ${target.host}, which resolves to ${candidate}, a ${reason} address\n`,
-          )
-          return
-        }
-      }
-      if (!resolved[0]) throw new Error(`${target.host} resolved to no address`)
-      address = resolved[0].address
+    const addresses = listener ? [] : await resolve(target.host)
+    const reason = addresses.map(({ address }) => refusal(address)).find((found) => found !== null)
+    if (reason) {
+      rejectConnect(
+        client,
+        403,
+        `kurumi refuses to tunnel to ${target.host}: it resolves to a ${reason} address\n`,
+      )
+      return
     }
     if (stopping || client.destroyed) return
-    const outbound = connect({ host: address, port: listener?.port ?? target.port })
+    const outbound = connect(
+      listener
+        ? { host: '127.0.0.1', port: listener.port }
+        : { host: target.host, port: target.port, lookup: pinnedLookup(addresses) },
+    )
     track(outbound)
     const cancel = () => outbound.destroy()
     aborted.signal.addEventListener('abort', cancel, { once: true })

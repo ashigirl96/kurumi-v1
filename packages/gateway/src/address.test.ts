@@ -30,6 +30,15 @@ test.each([
   ['255.255.255.255', 'reserved'],
   ['240.0.0.1', 'reserved'],
   ['::127.0.0.1', 'reserved'],
+  ['64:ff9b::7f00:1', 'loopback'],
+  ['64:ff9b::a9fe:a9fe', 'link-local'],
+  ['64:ff9b:1::1', 'private'],
+  ['2002:7f00:1::', 'loopback'],
+  ['::ffff:0:127.0.0.1', 'loopback'],
+  ['2002:a9fe:a9fe::1', 'link-local'],
+  ['fec0::1', 'site-local'],
+  ['192.0.0.1', 'reserved'],
+  ['100::1', 'reserved'],
   ['not-an-address', 'unparseable'],
 ])('%s is refused as %s', (address, reason) => {
   expect(addressRefusal(address)).toBe(reason)
@@ -46,6 +55,9 @@ test.each([
   '223.255.255.255',
   '2606:4700:4700::1111',
   '::ffff:8.8.8.8',
+  '64:ff9b::808:808',
+  '2002:808:808::1',
+  '::ffff:0:808:808',
 ])('%s is a public address', (address) => {
   expect(addressRefusal(address)).toBeNull()
 })
