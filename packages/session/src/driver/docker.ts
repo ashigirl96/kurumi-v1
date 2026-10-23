@@ -55,7 +55,9 @@ class CleanupError extends Error {
 
 const nativeCli: Cli = {
   start(args) {
-    const child = spawn('docker', [...args], { stdio: ['ignore', 'pipe', 'pipe'] })
+    // Own process group: a Ctrl-C or service-manager signal to the host's group would end a create
+    // the daemon still finishes, leaving the driver no answer about that container.
+    const child = spawn('docker', [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
     let stdoutBytes = 0
@@ -146,10 +148,17 @@ export function createDockerDriver(options: {
     let timer: ReturnType<typeof setTimeout> | undefined
     const create: Creation = {
       state: 'pending',
-      result: Promise.race([proc.result, deadline.promise]).finally(() => {
-        clearTimeout(timer)
-        if (create.state === 'pending') create.state = 'settled'
-      }),
+      result: Promise.race([proc.result, deadline.promise])
+        .then((exit) => {
+          // A CLI ended by a signal exits without the daemon's answer while the daemon may still create.
+          if (create.state === 'pending' && (exit.code === null || exit.code > 128))
+            create.state = 'unconfirmed'
+          return exit
+        })
+        .finally(() => {
+          clearTimeout(timer)
+          if (create.state === 'pending') create.state = 'settled'
+        }),
       cancel() {
         if (create.state !== 'pending' || timer !== undefined) return
         timer = setTimeout(() => {
@@ -219,7 +228,7 @@ export function createDockerDriver(options: {
     if (!owned) return
     if (owned.create?.state === 'unconfirmed')
       throw new CleanupError(
-        `Docker (${options.image}): cleanup of ${owned.name} unconfirmed after create deadline`,
+        `Docker (${options.image}): cleanup of ${owned.name} unconfirmed: create ended without a daemon answer`,
       )
     const { name, kind } = owned
     let removed = false
