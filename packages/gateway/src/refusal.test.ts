@@ -32,7 +32,7 @@ test('a non-public upstream is named with its host and reason', () => {
     error: 'upstream_not_public',
     host: 'api.anthropic.com',
     reason: 'private',
-    next: 'api.anthropic.com resolves to a private address, and kurumi forwards only to public addresses',
+    next: 'ask the owner to check the DNS answer for api.anthropic.com on the kurumi host; it resolves to a private address, and kurumi forwards only to public addresses',
   })
 })
 

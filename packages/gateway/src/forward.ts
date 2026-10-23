@@ -35,6 +35,7 @@ export type ForwardDeps<Principal> = {
   inject(input: InjectionInput<Principal>): Injected | Promise<Injected>
   upstream?: UpstreamDestination
   resolve?: (host: string) => Promise<LookupAddress[]>
+  addressRefusal?: (address: string) => string | null
 }
 
 const resolveAll = (host: string) => lookup(host, { all: true })
@@ -55,7 +56,10 @@ type Pinned =
 
 async function pinPublicUpstream(
   host: string,
-  resolve: (host: string) => Promise<LookupAddress[]>,
+  {
+    resolve = resolveAll,
+    addressRefusal: refusalOf = addressRefusal,
+  }: Pick<ForwardDeps<unknown>, 'resolve' | 'addressRefusal'>,
 ): Promise<Pinned> {
   let addresses: LookupAddress[]
   try {
@@ -63,9 +67,8 @@ async function pinPublicUpstream(
   } catch {
     return { kind: 'unreachable' }
   }
-  const reason = addresses
-    .map(({ address }) => addressRefusal(address))
-    .find((found) => found !== null)
+  if (addresses.length === 0) return { kind: 'unreachable' }
+  const reason = addresses.map(({ address }) => refusalOf(address)).find((found) => found !== null)
   if (reason) return { kind: 'refused', refusal: { code: 'upstream_not_public', host, reason } }
   return { kind: 'pinned', lookup: pinnedLookup(addresses) }
 }
@@ -161,11 +164,6 @@ async function prepareRequest<Principal>(
   ) {
     return { kind: 'bad_request' }
   }
-  const destination = deps.upstream?.host === target.host ? deps.upstream : undefined
-  const pinned = destination
-    ? undefined
-    : await pinPublicUpstream(target.host, deps.resolve ?? resolveAll)
-  if (pinned && pinned.kind !== 'pinned') return pinned
   const injected = await deps.inject({
     principal: context.principal,
     ...target,
@@ -175,6 +173,9 @@ async function prepareRequest<Principal>(
     rawHeaders: [...req.rawHeaders],
   })
   if ('refusal' in injected) return { kind: 'refused', refusal: injected.refusal }
+  const destination = deps.upstream?.host === target.host ? deps.upstream : undefined
+  const pinned = destination ? undefined : await pinPublicUpstream(target.host, deps)
+  if (pinned && pinned.kind !== 'pinned') return pinned
   const headers = withoutHopHeaders(injected.headers)
   headers.set('host', authority(target))
   headers.delete('content-length')
@@ -205,6 +206,12 @@ function respondUnreachable(res: ServerResponse, host: string): void {
   res.end(JSON.stringify({ error: 'upstream_unreachable', host }))
 }
 
+function respondAfterBodyDrains(req: IncomingMessage, respond: () => void): void {
+  req.resume()
+  if (req.complete) respond()
+  else req.once('end', respond)
+}
+
 const badGateway = 'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
 
 export async function forward<Principal>(
@@ -221,14 +228,11 @@ export async function forward<Principal>(
   }
   if (prepared.kind === 'refused') {
     const { status, headers, body } = refusalResponse(prepared.refusal)
-    const respond = () => res.writeHead(status, headers).end(body)
-    req.resume()
-    if (req.complete) respond()
-    else req.once('end', respond)
+    respondAfterBodyDrains(req, () => res.writeHead(status, headers).end(body))
     return
   }
   if (prepared.kind === 'unreachable') {
-    respondUnreachable(res, context.target.host)
+    respondAfterBodyDrains(req, () => respondUnreachable(res, context.target.host))
     return
   }
   const { options, account } = prepared

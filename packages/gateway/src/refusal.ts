@@ -30,7 +30,7 @@ export function nextStep(refusal: GatewayRefusal): string {
     case 'duplicate_slot':
       return `send the ${refusal.header} header once`
     case 'upstream_not_public':
-      return `${refusal.host} resolves to a ${refusal.reason} address, and kurumi forwards only to public addresses`
+      return `ask the owner to check the DNS answer for ${refusal.host} on the kurumi host; it resolves to a ${refusal.reason} address, and kurumi forwards only to public addresses`
     default: {
       const unknown: never = refusal
       return unknown

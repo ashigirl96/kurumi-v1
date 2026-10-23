@@ -6,10 +6,15 @@ import { request } from 'node:https'
 import { createServer } from 'node:net'
 import type { TLSSocket } from 'node:tls'
 
-import { createAccountLedger, isInterceptedHost, type AuthMode } from '@kurumi/account/server'
+import {
+  createAccountLedger,
+  isInterceptedHost,
+  type AuthMode,
+  type CredentialPrincipal,
+} from '@kurumi/account/server'
 import { inMemoryDb, insertAgentGroup } from '@kurumi/account/testing'
 
-import { credentialInject, pinnedLookup } from './forward.ts'
+import { credentialInject, pinnedLookup, type ForwardDeps } from './forward.ts'
 import { startAgentPort } from './port.ts'
 import { openTestTunnel, sendTestRequest, startFakeUpstream, startTestGateway } from './testing.ts'
 
@@ -209,7 +214,7 @@ test('a closed upstream returns host-bearing 502 JSON while the upload is unfini
 const groupSelector = 'sk-ant-kurumi-YW50aHJvcGlj'
 const secrets = { main: 'sk-ant-api03-main-secret', second: 'sk-ant-oat01-second-secret' }
 
-async function setupCredentials() {
+async function setupCredentials(forward: Partial<ForwardDeps<CredentialPrincipal>> = {}) {
   const db = inMemoryDb()
   insertAgentGroup(db, 'g1')
   const ledger = createAccountLedger({ db, vaultKey: randomBytes(32) })
@@ -219,7 +224,7 @@ async function setupCredentials() {
     bind: { host: '127.0.0.1', port: 0 },
     authenticate: (token) => (token === 'test-token' ? { agentGroupId: 'g1' } : null),
     intercepts: isInterceptedHost,
-    forward: { upstream: upstream.destination, inject: credentialInject(ledger) },
+    forward: { upstream: upstream.destination, inject: credentialInject(ledger), ...forward },
   })
   stops.push(gateway.stop)
   const tunnel = await openTestTunnel({
@@ -336,6 +341,23 @@ test('a group with no account is refused with a JSON 404 and nothing goes upstre
   expect(upstream.requests).toEqual([])
 })
 
+test('a credential refusal is decided before the upstream host is resolved', async () => {
+  let resolved = 0
+  const { tunnel } = await setupCredentials({
+    upstream: undefined,
+    resolve: () => {
+      resolved++
+      return Promise.reject(new Error('ENOTFOUND'))
+    },
+  })
+
+  const response = await sendTestRequest(tunnel, { path: '/v1/models' })
+
+  expect(response.status).toBe(404)
+  expect(JSON.parse(response.body)).toMatchObject({ error: 'account_not_connected' })
+  expect(resolved).toBe(0)
+})
+
 async function postToUnconnectedGroup(body: Buffer) {
   const { upstream, tunnel } = await setupCredentials()
   const response = Promise.withResolvers<{ status?: number; body: string }>()
@@ -362,7 +384,7 @@ async function postToUnconnectedGroup(body: Buffer) {
   return { ...(await response.promise), upstreamRequests: upstream.requests }
 }
 
-const uploadsToLoseTheResetRace = 3
+const uploadsToLoseTheResetRace = 10
 
 test('a refused POST with a 16 MiB body still reads the JSON refusal', async () => {
   const body = Buffer.alloc(16 * 1024 * 1024, 97)
@@ -465,7 +487,15 @@ test('a label outside Latin-1 is named percent-encoded and the request completes
   expect(upstream.requests).toHaveLength(1)
 })
 
-async function setupResolving(resolve: (host: string) => Promise<LookupAddress[]>) {
+async function setupResolving(
+  resolve: (host: string) => Promise<LookupAddress[]>,
+  {
+    host = 'localhost',
+    addressRefusal,
+  }: Pick<ForwardDeps<unknown>, 'addressRefusal'> & {
+    host?: string
+  } = {},
+) {
   let dials = 0
   const listener = createServer((socket) => {
     dials++
@@ -482,7 +512,7 @@ async function setupResolving(resolve: (host: string) => Promise<LookupAddress[]
     bind: { host: '127.0.0.1', port: 0 },
     authenticate: () => ({}),
     intercepts: () => true,
-    forward: { resolve, inject: ({ path, headers }) => ({ path, headers }) },
+    forward: { resolve, addressRefusal, inject: ({ path, headers }) => ({ path, headers }) },
   })
   stops.push(gateway.stop)
   // The system resolver also answers localhost, so a gateway that ignored `resolve` would dial the listener.
@@ -490,7 +520,7 @@ async function setupResolving(resolve: (host: string) => Promise<LookupAddress[]
     proxyPort: gateway.port,
     token: 'test-token',
     caPem: gateway.caPem,
-    target: { host: 'localhost', port: address.port },
+    target: { host, port: address.port },
   })
   stops.push(tunnel.close)
   return { tunnel, dials: () => dials }
@@ -520,7 +550,7 @@ test.each([
       error: 'upstream_not_public',
       host: 'localhost',
       reason,
-      next: `localhost resolves to a ${reason} address, and kurumi forwards only to public addresses`,
+      next: `ask the owner to check the DNS answer for localhost on the kurumi host; it resolves to a ${reason} address, and kurumi forwards only to public addresses`,
     })
     expect(dials()).toBe(0)
   },
@@ -551,6 +581,44 @@ test('an intercepted host that fails to resolve gets the host-bearing 502 JSON a
   expect(response.status).toBe(502)
   expect(JSON.parse(response.body)).toEqual({ error: 'upstream_unreachable', host: 'localhost' })
   expect(dials()).toBe(0)
+})
+
+test.each([
+  ['fails to resolve', () => Promise.reject(new Error('ENOTFOUND'))],
+  ['resolves to no address', async () => []],
+] satisfies [string, (host: string) => Promise<LookupAddress[]>][])(
+  'a 16 MiB POST to an intercepted host that %s still reads the 502 JSON and is never dialed',
+  async (_name, resolve) => {
+    const body = 'a'.repeat(16 * 1024 * 1024)
+    for (let upload = 0; upload < uploadsToLoseTheResetRace; upload++) {
+      const { tunnel, dials } = await setupResolving(resolve)
+
+      const response = await sendTestRequest(tunnel, { method: 'POST', path: '/v1/messages', body })
+
+      expect(response.status).toBe(502)
+      expect(JSON.parse(response.body)).toEqual({
+        error: 'upstream_unreachable',
+        host: 'localhost',
+      })
+      expect(dials()).toBe(0)
+    }
+  },
+)
+
+test('a forwarded request dials only the pinned address, resolved once', async () => {
+  let resolved = 0
+  const { tunnel, dials } = await setupResolving(
+    async () => {
+      resolved++
+      return [{ address: '127.0.0.1', family: 4 }]
+    },
+    { host: 'pinned.invalid', addressRefusal: () => null },
+  )
+
+  await sendTestRequest(tunnel, { path: '/v1/models' })
+
+  expect(dials()).toBe(1)
+  expect(resolved).toBe(1)
 })
 
 const checked = [
