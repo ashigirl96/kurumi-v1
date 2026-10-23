@@ -2,7 +2,9 @@ import { STATUS_CODES } from 'node:http'
 
 import type { CredentialRefusal } from '@kurumi/account/server'
 
-export type GatewayRefusal = CredentialRefusal
+export type GatewayRefusal =
+  | CredentialRefusal
+  | { code: 'upstream_not_public'; host: string; reason: string }
 
 export const REFUSAL_STATUS = {
   account_not_connected: 404,
@@ -10,6 +12,7 @@ export const REFUSAL_STATUS = {
   account_not_granted: 403,
   account_needs_reauth: 403,
   duplicate_slot: 400,
+  upstream_not_public: 403,
 } as const satisfies Record<GatewayRefusal['code'], number>
 
 export function nextStep(refusal: GatewayRefusal): string {
@@ -26,6 +29,8 @@ export function nextStep(refusal: GatewayRefusal): string {
       return `ask the owner to add ${refusal.handle} again`
     case 'duplicate_slot':
       return `send the ${refusal.header} header once`
+    case 'upstream_not_public':
+      return `${refusal.host} resolves to a ${refusal.reason} address, and kurumi forwards only to public addresses`
     default: {
       const unknown: never = refusal
       return unknown

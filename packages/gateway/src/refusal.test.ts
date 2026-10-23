@@ -16,8 +16,24 @@ test.each([
   ],
   [{ code: 'account_needs_reauth', service: 'anthropic-api', handle: main }, 403],
   [{ code: 'duplicate_slot', service: 'anthropic-api', header: 'x-api-key' }, 400],
+  [{ code: 'upstream_not_public', host: 'api.anthropic.com', reason: 'loopback' }, 403],
 ] satisfies [GatewayRefusal, number][])('%o answers %d', (refusal, status) => {
   expect(refusalResponse(refusal).status).toBe(status)
+})
+
+test('a non-public upstream is named with its host and reason', () => {
+  const { body } = refusalResponse({
+    code: 'upstream_not_public',
+    host: 'api.anthropic.com',
+    reason: 'private',
+  })
+
+  expect(JSON.parse(body)).toEqual({
+    error: 'upstream_not_public',
+    host: 'api.anthropic.com',
+    reason: 'private',
+    next: 'api.anthropic.com resolves to a private address, and kurumi forwards only to public addresses',
+  })
 })
 
 test('the body names the refusal as error, keeps its fields and says what to do next', () => {

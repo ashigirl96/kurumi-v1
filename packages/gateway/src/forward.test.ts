@@ -1,13 +1,15 @@
 import { afterEach, expect, test } from 'bun:test'
 import { createHash, randomBytes } from 'node:crypto'
+import type { LookupAddress } from 'node:dns'
 import { once } from 'node:events'
 import { request } from 'node:https'
+import { createServer } from 'node:net'
 import type { TLSSocket } from 'node:tls'
 
 import { createAccountLedger, isInterceptedHost, type AuthMode } from '@kurumi/account/server'
 import { inMemoryDb, insertAgentGroup } from '@kurumi/account/testing'
 
-import { credentialInject } from './forward.ts'
+import { credentialInject, pinnedLookup } from './forward.ts'
 import { startAgentPort } from './port.ts'
 import { openTestTunnel, sendTestRequest, startFakeUpstream, startTestGateway } from './testing.ts'
 
@@ -461,4 +463,123 @@ test('a label outside Latin-1 is named percent-encoded and the request completes
   expect(response.status).toBe(200)
   expect(response.headers['x-kurumi-account']).toBe('anthropic/%E6%97%A5%E6%9C%AC')
   expect(upstream.requests).toHaveLength(1)
+})
+
+async function setupResolving(resolve: (host: string) => Promise<LookupAddress[]>) {
+  let dials = 0
+  const listener = createServer((socket) => {
+    dials++
+    socket.destroy()
+  })
+  listener.listen(0, '::')
+  await once(listener, 'listening')
+  stops.push(() => {
+    listener.close()
+  })
+  const address = listener.address()
+  if (!address || typeof address === 'string') throw new Error('listener has no TCP address')
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: () => ({}),
+    intercepts: () => true,
+    forward: { resolve, inject: ({ path, headers }) => ({ path, headers }) },
+  })
+  stops.push(gateway.stop)
+  // The system resolver also answers localhost, so a gateway that ignored `resolve` would dial the listener.
+  const tunnel = await openTestTunnel({
+    proxyPort: gateway.port,
+    token: 'test-token',
+    caPem: gateway.caPem,
+    target: { host: 'localhost', port: address.port },
+  })
+  stops.push(tunnel.close)
+  return { tunnel, dials: () => dials }
+}
+
+test.each([
+  ['127.0.0.1', [{ address: '127.0.0.1', family: 4 }], 'loopback'],
+  ['an IPv4-mapped private address', [{ address: '::ffff:a00:1', family: 6 }], 'private'],
+  [
+    'a public address and 127.0.0.1',
+    [
+      { address: '93.184.215.14', family: 4 },
+      { address: '127.0.0.1', family: 4 },
+    ],
+    'loopback',
+  ],
+] satisfies [string, LookupAddress[], string][])(
+  'an intercepted host resolving to %s is refused with a JSON 403 and never dialed',
+  async (_name, addresses, reason) => {
+    const { tunnel, dials } = await setupResolving(async () => addresses)
+
+    const response = await sendTestRequest(tunnel, { path: '/v1/models' })
+
+    expect(response.status).toBe(403)
+    expect(response.headers['x-kurumi-gateway']).toBe('upstream_not_public')
+    expect(JSON.parse(response.body)).toEqual({
+      error: 'upstream_not_public',
+      host: 'localhost',
+      reason,
+      next: `localhost resolves to a ${reason} address, and kurumi forwards only to public addresses`,
+    })
+    expect(dials()).toBe(0)
+  },
+)
+
+test('a WebSocket upgrade to an intercepted host resolving to loopback is refused', async () => {
+  const { tunnel, dials } = await setupResolving(async () => [{ address: '127.0.0.1', family: 4 }])
+
+  const response = await exchangeRaw(
+    tunnel.socket,
+    `GET /v1/stream HTTP/1.1\r\nHost: ${tunnel.target.host}:${tunnel.target.port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\n\r\n`,
+  )
+
+  expect(response.status).toBe(403)
+  expect(response.headers['x-kurumi-gateway']).toBe('upstream_not_public')
+  expect(JSON.parse(response.body)).toMatchObject({
+    error: 'upstream_not_public',
+    reason: 'loopback',
+  })
+  expect(dials()).toBe(0)
+})
+
+test('an intercepted host that fails to resolve gets the host-bearing 502 JSON and is never dialed', async () => {
+  const { tunnel, dials } = await setupResolving(() => Promise.reject(new Error('ENOTFOUND')))
+
+  const response = await sendTestRequest(tunnel, { path: '/v1/models' })
+
+  expect(response.status).toBe(502)
+  expect(JSON.parse(response.body)).toEqual({ error: 'upstream_unreachable', host: 'localhost' })
+  expect(dials()).toBe(0)
+})
+
+const checked = [
+  { address: '2606:4700:4700::1111', family: 6 },
+  { address: '93.184.215.14', family: 4 },
+]
+
+function lookupOnce(addresses: LookupAddress[], all: boolean) {
+  let answer:
+    | { error: Error | null; address: string | LookupAddress[]; family?: number }
+    | undefined
+  pinnedLookup(addresses)('api.anthropic.com', { all }, (error, address, family) => {
+    answer = { error, address, family }
+  })
+  return answer
+}
+
+test('a pinned single lookup answers the first checked address and its family', () => {
+  expect(lookupOnce(checked, false)).toEqual({
+    error: null,
+    address: '2606:4700:4700::1111',
+    family: 6,
+  })
+})
+
+test('a pinned lookup for all addresses answers every checked address', () => {
+  expect(lookupOnce(checked, true)).toEqual({ error: null, address: checked, family: undefined })
+})
+
+test('a pinned lookup over no address fails', () => {
+  expect(lookupOnce([], false)?.error).toBeInstanceOf(Error)
 })

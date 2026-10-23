@@ -1,10 +1,13 @@
+import type { LookupAddress } from 'node:dns'
+import { lookup } from 'node:dns/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request, type RequestOptions } from 'node:https'
-import { isIP } from 'node:net'
+import { isIP, type LookupFunction } from 'node:net'
 import { PassThrough, pipeline, type Duplex } from 'node:stream'
 
 import type { AccountHandle, AccountLedger, CredentialPrincipal } from '@kurumi/account/server'
 
+import { addressRefusal } from './address.ts'
 import { refusalHttp, refusalResponse, type GatewayRefusal } from './refusal.ts'
 
 export type ConnectTarget = { host: string; port: number }
@@ -31,6 +34,40 @@ export type UpstreamDestination = {
 export type ForwardDeps<Principal> = {
   inject(input: InjectionInput<Principal>): Injected | Promise<Injected>
   upstream?: UpstreamDestination
+  resolve?: (host: string) => Promise<LookupAddress[]>
+}
+
+const resolveAll = (host: string) => lookup(host, { all: true })
+
+export function pinnedLookup(addresses: LookupAddress[]): LookupFunction {
+  return (hostname, options, callback) => {
+    const [first] = addresses
+    if (!first) callback(new Error(`${hostname} resolved to no address`), '')
+    else if (options.all) callback(null, addresses)
+    else callback(null, first.address, first.family)
+  }
+}
+
+type Pinned =
+  | { kind: 'pinned'; lookup: LookupFunction }
+  | { kind: 'refused'; refusal: GatewayRefusal }
+  | { kind: 'unreachable' }
+
+async function pinPublicUpstream(
+  host: string,
+  resolve: (host: string) => Promise<LookupAddress[]>,
+): Promise<Pinned> {
+  let addresses: LookupAddress[]
+  try {
+    addresses = await resolve(host)
+  } catch {
+    return { kind: 'unreachable' }
+  }
+  const reason = addresses
+    .map(({ address }) => addressRefusal(address))
+    .find((found) => found !== null)
+  if (reason) return { kind: 'refused', refusal: { code: 'upstream_not_public', host, reason } }
+  return { kind: 'pinned', lookup: pinnedLookup(addresses) }
 }
 
 export function credentialInject(
@@ -106,6 +143,7 @@ type Prepared =
     }
   | { kind: 'bad_request' }
   | { kind: 'refused'; refusal: GatewayRefusal }
+  | { kind: 'unreachable' }
 
 async function prepareRequest<Principal>(
   context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
@@ -123,6 +161,11 @@ async function prepareRequest<Principal>(
   ) {
     return { kind: 'bad_request' }
   }
+  const destination = deps.upstream?.host === target.host ? deps.upstream : undefined
+  const pinned = destination
+    ? undefined
+    : await pinPublicUpstream(target.host, deps.resolve ?? resolveAll)
+  if (pinned && pinned.kind !== 'pinned') return pinned
   const injected = await deps.inject({
     principal: context.principal,
     ...target,
@@ -140,12 +183,12 @@ async function prepareRequest<Principal>(
   } else if (req.headers['content-length'] !== undefined) {
     headers.set('content-length', req.headers['content-length'])
   }
-  const destination = deps.upstream?.host === target.host ? deps.upstream : undefined
   return {
     kind: 'forward',
     options: {
       hostname: destination?.address ?? target.host,
       port: destination?.port ?? target.port,
+      lookup: pinned?.lookup,
       servername: isIP(target.host) ? undefined : target.host,
       ca: destination?.caPem,
       method: req.method,
@@ -156,6 +199,13 @@ async function prepareRequest<Principal>(
     account: injected.account,
   }
 }
+
+function respondUnreachable(res: ServerResponse, host: string): void {
+  res.writeHead(502, { 'content-type': 'application/json', connection: 'close' })
+  res.end(JSON.stringify({ error: 'upstream_unreachable', host }))
+}
+
+const badGateway = 'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
 
 export async function forward<Principal>(
   context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
@@ -175,6 +225,10 @@ export async function forward<Principal>(
     req.resume()
     if (req.complete) respond()
     else req.once('end', respond)
+    return
+  }
+  if (prepared.kind === 'unreachable') {
+    respondUnreachable(res, context.target.host)
     return
   }
   const { options, account } = prepared
@@ -206,8 +260,7 @@ export async function forward<Principal>(
       res.destroy()
       return
     }
-    res.writeHead(502, { 'content-type': 'application/json', connection: 'close' })
-    res.end(JSON.stringify({ error: 'upstream_unreachable', host: context.target.host }))
+    respondUnreachable(res, context.target.host)
   })
   upstream.once('response', (response) => {
     const responseHeaders = replaceAccountHeader(
@@ -254,6 +307,10 @@ export async function forwardUpgrade<Principal>(
     client.end(refusalHttp(prepared.refusal))
     return
   }
+  if (prepared.kind === 'unreachable') {
+    client.end(badGateway)
+    return
+  }
   const { options, account } = prepared
   const upstream = request({
     ...options,
@@ -275,7 +332,7 @@ export async function forwardUpgrade<Principal>(
   upstream.once('error', () => {
     if (client.destroyed) return
     if (upgraded) client.destroy()
-    else client.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+    else client.end(badGateway)
   })
   upstream.once('response', (response) => {
     const headers = replaceAccountHeader(withoutHopHeaders(requestHeaders(response)), account)
@@ -291,7 +348,7 @@ export async function forwardUpgrade<Principal>(
     }
     if (response.headers.upgrade?.toLowerCase() !== 'websocket') {
       cleanup()
-      client.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+      client.end(badGateway)
       return
     }
     const headers = replaceAccountHeader(withoutHopHeaders(requestHeaders(response)), account)
