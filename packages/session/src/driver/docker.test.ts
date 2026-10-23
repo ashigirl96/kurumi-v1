@@ -1,4 +1,7 @@
 import { expect, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { createDockerDriver } from '../server.ts'
 import type { Cli } from './docker.ts'
@@ -959,3 +962,95 @@ test.each(['agent', 'probe'] as const)(
     await pending
   },
 )
+
+function signalledDaemon(code: number | null) {
+  const cli = new FakeCli()
+  const containers = new Set<string>()
+  const created = Promise.withResolvers<void>()
+  const daemon: Cli = {
+    start(args) {
+      const proc = cli.start(args)
+      if (args[0] === 'create') {
+        const name = containerName([...args])
+        proc.complete({ code })
+        setTimeout(() => {
+          containers.add(name)
+          created.resolve()
+        }, 30)
+      }
+      if (args[0] === 'rm') {
+        const name = args.at(-1) ?? ''
+        proc.complete(
+          containers.delete(name)
+            ? { stdout: name }
+            : { code: 1, stderr: `No such container: ${name}` },
+        )
+      }
+      if (args[0] === 'ps') proc.complete({ stdout: '' })
+      return proc
+    },
+  }
+  return { cli, containers, created: created.promise, daemon }
+}
+
+test.each(
+  (['agent', 'probe'] as const).flatMap((role) =>
+    (
+      [
+        { exit: 'exit 143', code: 143 },
+        { exit: 'exit 130', code: 130 },
+        { exit: 'code null', code: null },
+      ] as const
+    ).map(({ exit, code }) => ({ role, exit, code })),
+  ),
+)(
+  'stop leaves no $role container or rejects when its create CLI ends by $exit from an outside signal',
+  async ({ role, code }) => {
+    const { cli, containers, created, daemon } = signalledDaemon(code)
+    const driver = createDockerDriver({ install: 'test-install', image, cli: daemon })
+    const pending = role === 'agent' ? driver.run(agentSpec()) : observe(driver.probe(url))
+    await call(cli, 0)
+    await pending
+    const stopped = await driver.stop().then(
+      () => 'ok',
+      (error: unknown) => String(error),
+    )
+    await created
+    expect(stopped === 'ok' ? `left: ${[...containers].join(' ')}` : stopped).toMatch(
+      /^left: $|unconfirmed/,
+    )
+  },
+)
+
+test('kill rejects after an agent create CLI ends by an outside signal', async () => {
+  const { created, daemon } = signalledDaemon(143)
+  const driver = createDockerDriver({ install: 'test-install', image, cli: daemon })
+  expect((await driver.run(agentSpec())).ok).toBe(false)
+  const killed = await driver.kill('ctr-one', 0).then(
+    () => 'ok',
+    (error: unknown) => String(error),
+  )
+  await created
+  expect(killed).toContain('unconfirmed')
+  await driver.stop().catch(() => {})
+})
+
+test('docker CLI children run outside the host process group so a group signal cannot end them', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kurumi-docker-pgid-'))
+  const record = join(dir, 'pgid')
+  writeFileSync(join(dir, 'docker'), `#!/bin/sh\nps -o pgid= -p $$ > '${record}'\n`, {
+    mode: 0o755,
+  })
+  const path = process.env.PATH
+  process.env.PATH = `${dir}:${path}`
+  try {
+    const driver = createDockerDriver({ install: 'test-install', image })
+    expect(await driver.list()).toEqual([])
+    await driver.stop()
+    const own = (await Bun.$`ps -o pgid= -p ${process.pid}`.text()).trim()
+    expect(readFileSync(record, 'utf8').trim()).not.toBe(own)
+  } finally {
+    process.env.PATH = path
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

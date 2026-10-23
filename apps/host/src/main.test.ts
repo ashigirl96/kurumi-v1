@@ -90,6 +90,19 @@ test('a second host fails at the lock and names the first pid', async () => {
   expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
 }, 5000)
 
+test.each(['SIGTERM', 'SIGINT'] as const)(
+  '%s stops the host cleanly and removes its socket',
+  async (signal) => {
+    const home = homeForTest()
+    const host = spawnHost(home)
+    await waitForHost(home, host)
+    host.kill(signal)
+    expect(await host.exited).toBe(0)
+    expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
+  },
+  5000,
+)
+
 test('concurrent host starts name the lock owner before its pid write completes', async () => {
   for (let attempt = 0; attempt < 5; attempt++) {
     const home = homeForTest()
