@@ -225,7 +225,7 @@ export async function startHost(config: HostConfig) {
 if (import.meta.main) {
   try {
     const host = await startHost(loadConfig(process.env))
-    process.once('SIGTERM', () => {
+    const shutdown = () => {
       host
         .stop()
         .then(() => process.exit(0))
@@ -233,7 +233,9 @@ if (import.meta.main) {
           process.stderr.write(`${String(error)}\n`)
           process.exit(1)
         })
-    })
+    }
+    process.once('SIGTERM', shutdown)
+    process.once('SIGINT', shutdown)
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
