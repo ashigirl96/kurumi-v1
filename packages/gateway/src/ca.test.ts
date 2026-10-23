@@ -58,7 +58,7 @@ test('a leaf minted in the last week of its CA expires with the CA', async () =>
   )
 })
 
-test('a CA past its end mints no leaf, drops its cached leaves, and logs gateway.ca.expired', async () => {
+test('a CA past its end mints no leaf, stops serving cached leaves, and logs gateway.ca.expired once', async () => {
   const material = await generateCaMaterial()
   const end = Date.parse(new X509Certificate(material.certPem).validTo)
   let now = end - 60 * 60 * 1000
@@ -77,8 +77,5 @@ test('a CA past its end mints no leaf, drops its cached leaves, and logs gateway
 
   expect(cached).toHaveProperty('message', expired)
   expect(minted).toHaveProperty('message', expired)
-  expect(events).toEqual([
-    { kind: 'gateway.ca.expired', notAfter: new Date(end).toISOString() },
-    { kind: 'gateway.ca.expired', notAfter: new Date(end).toISOString() },
-  ])
+  expect(events).toEqual([{ kind: 'gateway.ca.expired', notAfter: new Date(end).toISOString() }])
 })

@@ -78,12 +78,14 @@ export async function certificateAuthority(
   const der = Buffer.from(material.keyPem.replace(/-----[^-]+-----|\s/g, ''), 'base64')
   const signingKey = await crypto.subtle.importKey('pkcs8', der, algorithm, false, ['sign'])
   const cache = new Map<string, { expiresAt: number; leaf: Promise<Leaf> }>()
+  let expiryLogged = false
 
   async function mintLeaf(host: string): Promise<Leaf> {
     const issuedAt = now()
     if (issuedAt >= end) {
       const notAfter = certificate.notAfter.toISOString()
-      log({ kind: 'gateway.ca.expired', notAfter })
+      if (!expiryLogged) log({ kind: 'gateway.ca.expired', notAfter })
+      expiryLogged = true
       throw new CaExpiredError(
         `the gateway CA expired at ${notAfter}; restart the host to renew it`,
       )
