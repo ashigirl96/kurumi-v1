@@ -481,6 +481,7 @@ type DaemonContainer = {
   labels: Map<string, string>
   state: string
   waits: Set<FakeProcess>
+  links: string[]
 }
 
 function render(format: string, name: string, entry: DaemonContainer, noTrunc: boolean): string {
@@ -488,7 +489,7 @@ function render(format: string, name: string, entry: DaemonContainer, noTrunc: b
     const label = /^\(?\.Label "([^"]+)"\)?$/.exec(expression)?.[1]
     if (label !== undefined) return entry.labels.get(label) ?? ''
     if (expression === '.ID') return noTrunc ? entry.id : entry.id.slice(0, 12)
-    if (expression === '.Names') return name
+    if (expression === '.Names') return noTrunc ? [name, ...entry.links].join(',') : name
     if (expression === '.State') return entry.state
     throw new Error(`the fake daemon cannot render ${expression}`)
   }
@@ -506,6 +507,7 @@ function fakeDaemon() {
   const streams = new Set<(line: string) => void>()
   const held = new Map<string, (() => void)[]>()
   const failing = new Set<string>()
+  let extraListing: string | undefined
   let late: number | null | undefined
   const emit = (action: string, name: string) => {
     for (const stream of streams) stream(`${action} ${name}`)
@@ -516,6 +518,7 @@ function fakeDaemon() {
       labels: new Map(Object.entries(labels)),
       state,
       waits: new Set(),
+      links: [],
     })
     emit('create', name)
   }
@@ -597,13 +600,10 @@ function fakeDaemon() {
       else missing()
     } else if (command === 'ps') {
       const format = flagValues(args, '--format')[0] ?? '{{.Names}}'
-      answer({
-        stdout: selected(args)
-          .map(
-            ([listed, entry]) => `${render(format, listed, entry, args.includes('--no-trunc'))}\n`,
-          )
-          .join(''),
-      })
+      const noTrunc = args.includes('--no-trunc')
+      const lines = selected(args).map(([listed, entry]) => render(format, listed, entry, noTrunc))
+      if (noTrunc && extraListing !== undefined) lines.push(extraListing)
+      answer({ stdout: lines.map((line) => `${line}\n`).join('') })
     } else if (command === 'events' && onLine) {
       streams.add(onLine)
       void proc.result.then(
@@ -639,6 +639,9 @@ function fakeDaemon() {
     remove,
     labelImage(image: string, labels: Record<string, string>) {
       images.set(image, labels)
+    },
+    appendListing(line: string | undefined) {
+      extraListing = line
     },
     hold(command: string) {
       held.set(command, [])
@@ -783,6 +786,9 @@ test('a removal that gets no answer is killed after the driver timeout instead o
   expect(outcome).toContain('unconfirmed')
   expect(performance.now() - started).toBeLessThan(1_000)
   expect(docker.commands('rm').map(({ proc }) => proc.killed)).toEqual([true])
+  const id = docker.containers.get('kurumi-agent-stuck')?.id
+  expect(docker.commands('rm').map(({ args }) => args.at(-1))).toEqual([id])
+  expect(flagValues(docker.commands('ps').at(-1)?.args ?? [], '--filter')).toEqual([`id=${id}`])
   docker.release('rm')
   await dockerDriver.stop().catch(() => {})
 })
@@ -817,6 +823,9 @@ test('a sweep lists and removes only containers that carry this install label', 
     ])
     for (const entry of listed) await dockerDriver.remove(entry)
     await dockerDriver.kill('ctr-adopt', 0)
+    expect(docker.commands('rm').map(({ args }) => args.at(-1))).toEqual(
+      listed.map(({ dockerId }) => dockerId),
+    )
   } finally {
     await dockerDriver.stop()
   }
@@ -1245,6 +1254,91 @@ test('a forged listing line never makes the restarted host adopt a container out
     if (isAlive(foreign)) process.kill(foreign, 'SIGTERM')
     await restarted.stop()
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('kill() without a record removes the containers its label listing names by ID and nothing a label value names', async () => {
+  const docker = fakeDaemon()
+  docker.add('unlabelled', {})
+  docker.add('injector', {
+    'kurumi.install': 'stuck',
+    'kurumi.role': 'agent',
+    'kurumi.container': 'ctr-stuck',
+    'kurumi.session': 'x\nunlabelled',
+  })
+  const id = docker.containers.get('injector')?.id
+  const dockerDriver = createDockerDriver({
+    install: 'stuck',
+    image: 'agent-test',
+    cli: docker.daemon,
+  })
+  try {
+    await dockerDriver.kill('ctr-stuck', 0)
+    expect([...docker.containers.keys()]).toEqual(['unlabelled'])
+    expect(docker.commands('rm').map(({ args }) => args.at(-1))).toEqual([id])
+    expect(docker.cli.joined().join('\n')).not.toMatch(/unlabelled/)
+  } finally {
+    await dockerDriver.stop()
+  }
+})
+
+test.each([
+  ['a line that is not JSON', 'kurumi-agent-x|agent|ses|ctr||running'],
+  ['a line with six fields', `["${'a'.repeat(64)}","x","running","","",""]`],
+  ['a truncated ID', '["aaaaaaaaaaaa","x","running","","","",""]'],
+  ['two names without a link', `["${'a'.repeat(64)}","x,y","running","","","",""]`],
+])(
+  'a listing with %s fails the pass, keeps adoption closed and removes nothing until it parses',
+  async (_case, line) => {
+    await ledger.stop()
+    const docker = fakeDaemon()
+    const { token } = await restartedHost(docker)
+    docker.add('kurumi-agent-ghost', { 'kurumi.install': 'restart', 'kurumi.role': 'agent' })
+    docker.appendListing(line)
+    const restartedAt = logs.length
+    const removals = docker.commands('rm').length
+    const restarted = supervisedHost(docker, { intervalMs: 50 })
+    let adopted = false
+    try {
+      await restarted.sessions.start()
+      void restarted.sessions.adopted().then(
+        () => {
+          adopted = true
+        },
+        () => {},
+      )
+      await Bun.sleep(150)
+      expect(adopted).toBe(false)
+      expect(restarted.sessions.authenticate(token)).toBeNull()
+      expect(docker.commands('rm')).toHaveLength(removals)
+      expect(logs.slice(restartedAt)).toContainEqual(
+        expect.objectContaining({
+          kind: 'session.reconcile.failed',
+          reason: expect.stringContaining('invalid container listing'),
+        }),
+      )
+      docker.appendListing(undefined)
+      await until(() => adopted && !docker.containers.has('kurumi-agent-ghost'))
+      expect(restarted.sessions.authenticate(token)).not.toBeNull()
+    } finally {
+      await restarted.stop()
+    }
+  },
+)
+
+test('a restarted host still adopts an agent that another container links to', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const { token, who, first } = await restartedHost(docker)
+  docker.containers.get(first.dockerDriver.nameOf(who.containerId))?.links.push('linker/alias')
+  const restarted = supervisedHost(docker)
+  try {
+    await restarted.sessions.start()
+    await restarted.sessions.adopted()
+    expect(restarted.sessions.authenticate(token)).not.toBeNull()
+    expect(docker.commands('create')).toHaveLength(1)
+  } finally {
+    await restarted.stop()
   }
 })
 
