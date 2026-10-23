@@ -101,8 +101,8 @@ test('the contribution points the container at the Agent Port and its CA bundle'
   expect(gatewayContribution({ port: 4100, caBundle })).toEqual({
     env: {
       KURUMI_URL: 'http://host.docker.internal:4100',
-      NO_PROXY: 'host.docker.internal',
-      no_proxy: 'host.docker.internal',
+      NO_PROXY: 'host.docker.internal,localhost,127.0.0.1,::1',
+      no_proxy: 'host.docker.internal,localhost,127.0.0.1,::1',
       NODE_EXTRA_CA_CERTS: '/etc/kurumi/ca.pem',
       SSL_CERT_FILE: '/etc/kurumi/ca.pem',
     },

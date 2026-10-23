@@ -19,6 +19,7 @@ const CA_ROW = 1
 const CA_SEAL_ID = 'gateway_ca'
 const CONTAINER_HOST = 'host.docker.internal'
 const CONTAINER_CA_PATH = '/etc/kurumi/ca.pem'
+const NO_PROXY = [CONTAINER_HOST, 'localhost', '127.0.0.1', '::1'].join(',')
 
 export async function loadCertificateAuthority(deps: {
   db: Db
@@ -77,8 +78,8 @@ export function gatewayContribution(input: {
   return {
     env: {
       KURUMI_URL: `http://${CONTAINER_HOST}:${input.port}`,
-      NO_PROXY: CONTAINER_HOST,
-      no_proxy: CONTAINER_HOST,
+      NO_PROXY,
+      no_proxy: NO_PROXY,
       NODE_EXTRA_CA_CERTS: CONTAINER_CA_PATH,
       SSL_CERT_FILE: CONTAINER_CA_PATH,
     },
