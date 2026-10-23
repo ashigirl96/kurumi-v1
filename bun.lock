@@ -67,7 +67,10 @@
       "name": "@kurumi/access",
       "dependencies": {
         "@kurumi/agent": "workspace:*",
+        "@kurumi/rpc": "workspace:*",
+        "@orpc/server": "catalog:",
         "drizzle-orm": "catalog:",
+        "zod": "catalog:",
       },
       "devDependencies": {
         "drizzle-kit": "catalog:",
