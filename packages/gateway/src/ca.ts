@@ -33,6 +33,10 @@ export type CertificateAuthority = {
 
 export type CaMaterial = { certPem: string; keyPem: string }
 
+export type CaExpired = { kind: 'gateway.ca.expired'; notAfter: string }
+
+export class CaExpiredError extends Error {}
+
 type Clock = { now?: () => number }
 
 async function pkcs8Pem(key: CryptoKey): Promise<string> {
@@ -67,14 +71,23 @@ export function certificateNotAfter(certPem: string): Date {
 
 export async function certificateAuthority(
   material: CaMaterial,
-  { now = Date.now }: Clock = {},
+  { now = Date.now, log = () => {} }: Clock & { log?: (event: CaExpired) => void } = {},
 ): Promise<CertificateAuthority> {
   const certificate = new X509Certificate(material.certPem)
+  const end = certificate.notAfter.getTime()
   const der = Buffer.from(material.keyPem.replace(/-----[^-]+-----|\s/g, ''), 'base64')
   const signingKey = await crypto.subtle.importKey('pkcs8', der, algorithm, false, ['sign'])
   const cache = new Map<string, { expiresAt: number; leaf: Promise<Leaf> }>()
 
   async function mintLeaf(host: string): Promise<Leaf> {
+    const issuedAt = now()
+    if (issuedAt >= end) {
+      const notAfter = certificate.notAfter.toISOString()
+      log({ kind: 'gateway.ca.expired', notAfter })
+      throw new CaExpiredError(
+        `the gateway CA expired at ${notAfter}; restart the host to renew it`,
+      )
+    }
     const leafKeys = await crypto.subtle.generateKey(algorithm, true, ['sign', 'verify'])
     const serial = crypto.getRandomValues(new Uint8Array(16))
     serial[0] = 1
@@ -82,8 +95,8 @@ export async function certificateAuthority(
       serialNumber: Buffer.from(serial).toString('hex'),
       subject: 'CN=kurumi leaf',
       issuer: certificate.subject,
-      notBefore: new Date(now() - 60_000),
-      notAfter: new Date(Math.min(now() + 7 * day, certificate.notAfter.getTime())),
+      notBefore: new Date(issuedAt - 60_000),
+      notAfter: new Date(Math.min(issuedAt + 7 * day, end)),
       signingAlgorithm: algorithm,
       publicKey: leafKeys.publicKey,
       signingKey,
@@ -107,7 +120,7 @@ export async function certificateAuthority(
       if (cache.get(host)?.leaf === leaf) cache.delete(host)
       throw error
     })
-    cache.set(host, { expiresAt: now() + day, leaf })
+    cache.set(host, { expiresAt: Math.min(now() + day, end), leaf })
     return leaf
   }
 

@@ -57,3 +57,28 @@ test('a leaf minted in the last week of its CA expires with the CA', async () =>
     Date.parse(new X509Certificate(material.certPem).validTo),
   )
 })
+
+test('a CA past its end mints no leaf, drops its cached leaves, and logs gateway.ca.expired', async () => {
+  const material = await generateCaMaterial()
+  const end = Date.parse(new X509Certificate(material.certPem).validTo)
+  let now = end - 60 * 60 * 1000
+  const events: unknown[] = []
+  const ca = await certificateAuthority(material, {
+    now: () => now,
+    log: (event) => events.push(event),
+  })
+  await ca.leafFor('fake.test')
+
+  now = end
+  const expired = `the gateway CA expired at ${new Date(end).toISOString()}; restart the host to renew it`
+  const cached = await ca.leafFor('fake.test').catch((error: unknown) => error)
+  now = end + 5 * 24 * 60 * 60 * 1000
+  const minted = await ca.mintLeaf('other.test').catch((error: unknown) => error)
+
+  expect(cached).toHaveProperty('message', expired)
+  expect(minted).toHaveProperty('message', expired)
+  expect(events).toEqual([
+    { kind: 'gateway.ca.expired', notAfter: new Date(end).toISOString() },
+    { kind: 'gateway.ca.expired', notAfter: new Date(end).toISOString() },
+  ])
+})

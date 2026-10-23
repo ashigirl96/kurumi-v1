@@ -7,7 +7,12 @@ import { pipeline, type Duplex } from 'node:stream'
 import { createServer as createTlsServer } from 'node:tls'
 
 import { addressRefusal } from './address.ts'
-import { createCertificateAuthority, type CertificateAuthority, type Leaf } from './ca.ts'
+import {
+  CaExpiredError,
+  createCertificateAuthority,
+  type CertificateAuthority,
+  type Leaf,
+} from './ca.ts'
 import { forward, forwardUpgrade, type ConnectTarget, type ForwardDeps } from './forward.ts'
 
 type Tunnel<Principal> = {
@@ -327,8 +332,9 @@ export async function startAgentPort<Principal extends object>(deps: {
   outer.on('connection', track)
   outer.on('clientError', (_error, socket) => socket.destroy())
   outer.on('connect', (req, socket, head) => {
-    void handleConnect(req, socket, head).catch(() => {
-      if (!socket.destroyed) rejectConnect(socket, 502)
+    void handleConnect(req, socket, head).catch((error: unknown) => {
+      if (socket.destroyed) return
+      rejectConnect(socket, 502, error instanceof CaExpiredError ? `${error.message}\n` : '')
     })
   })
 

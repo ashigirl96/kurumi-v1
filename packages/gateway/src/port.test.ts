@@ -1,10 +1,11 @@
 import { afterEach, expect, test } from 'bun:test'
+import { X509Certificate } from 'node:crypto'
 import { once } from 'node:events'
 import { request } from 'node:http'
 import { connect, createServer, type AddressInfo } from 'node:net'
 import { join } from 'node:path'
 
-import { createCertificateAuthority } from './ca.ts'
+import { certificateAuthority, createCertificateAuthority, generateCaMaterial } from './ca.ts'
 import { startAgentPort } from './port.ts'
 import { openTestTunnel, sendTestRequest, startFakeUpstream, startTestGateway } from './testing.ts'
 
@@ -250,6 +251,24 @@ test.each([
   const response = await rawConnect(gateway.port, authority)
   expect(response).toStartWith('HTTP/1.1 403 Forbidden')
   expect(response).toContain(`a ${reason} address`)
+})
+
+test('CONNECT to an intercepted host after the CA has expired is refused with the reason', async () => {
+  const material = await generateCaMaterial()
+  const end = Date.parse(new X509Certificate(material.certPem).validTo)
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: (token) => (token === 'test-token' ? {} : null),
+    intercepts: () => true,
+    ca: await certificateAuthority(material, { now: () => end }),
+    forward: { inject: ({ path, headers }) => ({ path, headers }) },
+  })
+  stops.push(gateway.stop)
+
+  const response = await rawConnect(gateway.port, 'fake.test:443')
+
+  expect(response).toStartWith('HTTP/1.1 502 Bad Gateway')
+  expect(response).toContain(`the gateway CA expired at ${new Date(end).toISOString()}`)
 })
 
 test('concurrent tunnels on the same host retain distinct principals and destination ports', async () => {

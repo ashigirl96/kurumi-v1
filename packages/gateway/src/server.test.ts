@@ -132,6 +132,25 @@ test('a stored CA with more than 30 days left is kept', async () => {
   expect(events).toEqual([])
 })
 
+test('a loaded CA that outlives its end while the host runs logs gateway.ca.expired', async () => {
+  const { db } = openDb()
+  let now = Date.now()
+  const events: unknown[] = []
+  const ca = await loadCertificateAuthority({
+    db,
+    vaultKey,
+    now: () => now,
+    log: (event) => events.push(event),
+  })
+  now = Date.parse(notAfter(ca.certPem))
+  const failure = await ca.leafFor('api.anthropic.com').catch((error: unknown) => error)
+  expect(failure).toHaveProperty(
+    'message',
+    `the gateway CA expired at ${notAfter(ca.certPem)}; restart the host to renew it`,
+  )
+  expect(events).toEqual([{ kind: 'gateway.ca.expired', notAfter: notAfter(ca.certPem) }])
+})
+
 test('an expired CA under a different vault key is refused, not replaced', async () => {
   const { db, sqlite } = openDb()
   const start = Date.now()

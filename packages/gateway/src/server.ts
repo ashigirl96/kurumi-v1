@@ -10,6 +10,7 @@ import {
   certificateAuthority,
   certificateNotAfter,
   generateCaMaterial,
+  type CaExpired,
   type CertificateAuthority,
 } from './ca.ts'
 import { gatewayCa } from './schema.ts'
@@ -27,15 +28,18 @@ const CONTAINER_HOST = 'host.docker.internal'
 const CONTAINER_CA_PATH = '/etc/kurumi/ca.pem'
 const NO_PROXY = [CONTAINER_HOST, 'localhost', '127.0.0.1', '::1'].join(',')
 
-export type CaRenewal = { kind: 'gateway.ca.renewed'; previousNotAfter: string; notAfter: string }
+export type CaEvent =
+  | { kind: 'gateway.ca.renewed'; previousNotAfter: string; notAfter: string }
+  | CaExpired
 
 export async function loadCertificateAuthority(deps: {
   db: Db
   vaultKey: Uint8Array
   now?: () => number
-  log(event: CaRenewal): void
+  log: (event: CaEvent) => void
 }): Promise<CertificateAuthority> {
   const now = deps.now ?? Date.now
+  const clock = { now, log: deps.log }
   const sealNewCa = async () => {
     const material = await generateCaMaterial({ now })
     const row = {
@@ -51,11 +55,11 @@ export async function loadCertificateAuthority(deps: {
     return material
   }
   const row = deps.db.select().from(gatewayCa).get()
-  if (!row) return certificateAuthority(await sealNewCa(), { now })
+  if (!row) return certificateAuthority(await sealNewCa(), clock)
   const stored = { certPem: row.certPem, keyPem: open(deps.vaultKey, CA_SEAL_ID, row.sealedKey) }
   const previousNotAfter = certificateNotAfter(stored.certPem)
   if (previousNotAfter.getTime() - now() > CA_RENEWAL_WINDOW_MS) {
-    return certificateAuthority(stored, { now })
+    return certificateAuthority(stored, clock)
   }
   const renewed = await sealNewCa()
   deps.log({
@@ -63,7 +67,7 @@ export async function loadCertificateAuthority(deps: {
     previousNotAfter: previousNotAfter.toISOString(),
     notAfter: certificateNotAfter(renewed.certPem).toISOString(),
   })
-  return certificateAuthority(renewed, { now })
+  return certificateAuthority(renewed, clock)
 }
 
 export type CaBundle = { path: string; sha: string }
