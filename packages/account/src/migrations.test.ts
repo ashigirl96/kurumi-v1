@@ -26,7 +26,7 @@ function firstMigrationOnly(): string {
   return dir
 }
 
-test('accounts written before auth modes existed come through the auth_mode rebuild', () => {
+test('accounts, grants and defaults written before auth modes existed come through the auth_mode rebuild', () => {
   const sqlite = new Database(':memory:')
   const db = drizzle(sqlite)
   // SQLite ignores foreign_keys inside drizzle's migration transaction, so the host turns it off around migrate.
@@ -45,6 +45,10 @@ test('accounts written before auth modes existed come through the auth_mode rebu
     `INSERT INTO account_grant (agent_group_id, account_id, vendor, service, granted_by, granted_at)
      VALUES ('g1', 'acc-a', 'anthropic', 'anthropic-api', 'test', 0)`,
   )
+  sqlite.run(
+    `INSERT INTO default_account (agent_group_id, service, account_id, vendor)
+     VALUES ('g1', 'anthropic-api', 'acc-a', 'anthropic')`,
+  )
 
   migrate(db, { migrationsFolder: accountMigrations.folder, migrationsTable: table })
 
@@ -54,6 +58,14 @@ test('accounts written before auth modes existed come through the auth_mode rebu
   ])
   expect(sqlite.query('SELECT account_id FROM account_grant').all()).toEqual([
     { account_id: 'acc-a' },
+  ])
+  expect(sqlite.query('SELECT * FROM default_account').all()).toEqual([
+    {
+      agent_group_id: 'g1',
+      service: 'anthropic-api',
+      account_id: 'acc-a',
+      vendor: 'anthropic',
+    },
   ])
   expect(sqlite.query('PRAGMA foreign_key_check').all()).toEqual([])
 })
