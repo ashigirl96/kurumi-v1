@@ -58,9 +58,13 @@ export async function startHost(config: HostConfig) {
     const stale = lstatSync(socket, { throwIfNoEntry: false })
     if (stale && !stale.isSocket()) throw new Error(`${socket} exists and is not a socket`)
     rmSync(socket, { force: true })
-    const server = Bun.serve({ unix: socket, fetch: rpc.host })
-    listener = server
-    chmodSync(socket, 0o600)
+    const umask = process.umask(0o177)
+    try {
+      listener = Bun.serve({ unix: socket, fetch: rpc.host })
+    } finally {
+      process.umask(umask)
+    }
+    const server = listener
     return {
       async stop() {
         await server.stop(true)
