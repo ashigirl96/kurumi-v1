@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "d3848aac-ef43-4a46-8261-92223beba2d2",
+  "id": "fb453fef-0a68-43cb-b09e-727eb8bd8273",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "pending_approval": {
@@ -56,6 +56,13 @@
           "notNull": true,
           "autoincrement": false
         },
+        "dedupe_key": {
+          "name": "dedupe_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "approvers": {
           "name": "approvers",
           "type": "text",
@@ -106,7 +113,24 @@
           "autoincrement": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "pending_approval_pending_dedupe_key": {
+          "name": "pending_approval_pending_dedupe_key",
+          "columns": [
+            "dedupe_key"
+          ],
+          "isUnique": true,
+          "where": "\"pending_approval\".\"status\" = 'pending'"
+        },
+        "pending_approval_agent_group_status": {
+          "name": "pending_approval_agent_group_status",
+          "columns": [
+            "agent_group_id",
+            "status"
+          ],
+          "isUnique": false
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},

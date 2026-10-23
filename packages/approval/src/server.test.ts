@@ -2,12 +2,11 @@ import { Database } from 'bun:sqlite'
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import { user } from '@kurumi/access/schema'
 import {
   createAccessLedger,
-  HOST_OWNER,
   migrations as accessMigrations,
   router as accessRouter,
   type AccessLedger,
@@ -37,11 +36,13 @@ import {
   type ApprovalDecision,
   type ApprovalHandlers,
   type ApprovalLedger,
+  type ApprovalLog,
   type ApprovalRecord,
 } from './server.ts'
 
 const agent = { kind: 'agent', agentGroupId: 'ag-a', sessionId: 'session-a' } as const
 const host: Caller = { kind: 'host' }
+const hostApprover = { kind: 'host' } as const
 
 let home: string
 const open: Database[] = []
@@ -71,11 +72,14 @@ function openDb(): Db {
 
 type Handled = { id: string; decision: ApprovalDecision }
 
-function recordingLedger(db: Db, fail = false) {
+const crash = (message: string) => () => Promise.reject(new Error(message))
+
+function recordingLedger(db: Db, run: () => Promise<void> = () => Promise.resolve()) {
   const handled: Handled[] = []
+  const logged: ApprovalLog[] = []
   const record = (approval: ApprovalRecord, decision: ApprovalDecision) => {
     handled.push({ id: approval.id, decision })
-    return fail ? Promise.reject(new Error('handler crashed')) : Promise.resolve()
+    return run()
   }
   const accessLedger = createAccessLedger({ db })
   const ledger = createApprovalLedger({
@@ -83,8 +87,9 @@ function recordingLedger(db: Db, fail = false) {
     accessLedger,
     handlers: () => ({ procedure: record, 'gateway.request': record }),
     decidePath: ['approval', 'decide'],
+    log: (event) => logged.push(event),
   })
-  return { ledger, accessLedger, handled }
+  return { ledger, accessLedger, handled, logged }
 }
 
 function requestProcedure(db: Db, ledger: ApprovalLedger): string {
@@ -126,7 +131,7 @@ test('a request stores a pending approval with the approver chain baked in', () 
     agentGroupId: 'ag-a',
     sessionId: 'session-a',
     title: 'access.users.create',
-    approvers: ['slack:admin', HOST_OWNER],
+    approvers: [{ kind: 'user', userId: 'slack:admin' }, hostApprover],
   })
   expect(ledger.list('pending').map((approval) => approval.id)).toEqual([id])
   expect(ledger.list('decided')).toEqual([])
@@ -144,7 +149,7 @@ test.each([
 
     const result = await ledger.decide({ id, decision, by: host })
 
-    expect(result).toMatchObject({ changed: true, approval: { status, decidedBy: HOST_OWNER } })
+    expect(result).toMatchObject({ changed: true, approval: { status, decidedBy: hostApprover } })
     expect(result.message).toStartWith(`${status} by host at `)
     expect(handled).toEqual([{ id, decision }])
     expect(ledger.show(id)).toMatchObject({ status, handledAt: expect.any(Date) })
@@ -217,10 +222,13 @@ test('the approvers are frozen when the approval is requested', async () => {
       decision: 'approve',
       by: { kind: 'human', userId: 'slack:original' },
     }),
-  ).toMatchObject({ changed: true, approval: { decidedBy: 'slack:original' } })
+  ).toMatchObject({
+    changed: true,
+    approval: { decidedBy: { kind: 'user', userId: 'slack:original' } },
+  })
   expect(await ledger.decide({ id: second, decision: 'deny', by: host })).toMatchObject({
     changed: true,
-    approval: { decidedBy: HOST_OWNER },
+    approval: { decidedBy: hostApprover },
   })
 })
 
@@ -228,7 +236,7 @@ test('start reruns, exactly once, a decided approval whose host died before its 
   const db = openDb()
   const id = requestProcedure(db, recordingLedger(db).ledger)
   db.update(pendingApproval)
-    .set({ status: 'approved', decidedBy: HOST_OWNER, decidedAt: new Date() })
+    .set({ status: 'approved', decidedBy: hostApprover, decidedAt: new Date() })
     .where(eq(pendingApproval.id, id))
     .run()
 
@@ -242,7 +250,7 @@ test('start reruns, exactly once, a decided approval whose host died before its 
 
 test('a handler that throws runs once, is recorded as failed, and is not rerun at start', async () => {
   const db = openDb()
-  const crashing = recordingLedger(db, true)
+  const crashing = recordingLedger(db, crash('handler crashed'))
   const id = requestProcedure(db, crashing.ledger)
 
   const decided = await crashing.ledger.decide({ id, decision: 'approve', by: host })
@@ -291,27 +299,34 @@ test('the table refuses a half-decided row, a handled pending row, and unknown v
 })
 
 type Context = KurumiContext & { accessLedger: AccessLedger; approvalLedger: ApprovalLedger }
-const probe = os.$context<Context>().$meta<Meta>({}).meta({ agent: 'hold' })
+const probe = os.$context<Context>().$meta<Meta>({})
+const heldProbe = probe.meta({ agent: 'hold' })
 
 function composedHost(db: Db) {
   const accessLedger: AccessLedger = createAccessLedger({ db })
+  const logged: ApprovalLog[] = []
   const approvalLedger = createApprovalLedger({
     db,
     accessLedger,
     handlers: () => handlers,
     decidePath: ['approval', 'decide'],
+    log: (event) => logged.push(event),
   })
   const ran: unknown[] = []
   const router = guardRouter<Context>().router({
     access: accessRouter,
     approval: approvalRouter,
     probe: {
-      tagged: probe
+      tagged: heldProbe
         .input(z.object({ tags: z.string().transform((tags) => tags.split(',')) }))
         .handler(({ input }) => {
           ran.push(input.tags)
         }),
-      note: probe.input(z.object({ text: z.string() })).handler(() => {}),
+      note: heldProbe.input(z.object({ text: z.string() })).handler(() => {}),
+      scoped: probe
+        .meta({ agent: 'scoped' })
+        .input(z.object({ name: z.string() }))
+        .handler(() => {}),
     },
   })
   const contextFor = (caller: Caller, grant: ApprovalGrant | null = null): Context => ({
@@ -349,7 +364,7 @@ function composedHost(db: Db) {
     const { approvalId } = z.object({ approvalId: z.string() }).parse(answer.data)
     return approvalId
   }
-  return { router, contextFor, post, held, ran }
+  return { router, contextFor, post, held, ran, logged }
 }
 
 test('an agent-held users.create runs only after the host approves it, and only once', async () => {
@@ -417,7 +432,7 @@ test('a grant is refused for another input or another caller', async () => {
   const input = { id: 'slack:U1', displayName: 'Bob' }
   const id = await held(agent, 'access/users/create', input)
   db.update(pendingApproval)
-    .set({ status: 'approved', decidedBy: HOST_OWNER, decidedAt: new Date() })
+    .set({ status: 'approved', decidedBy: hostApprover, decidedAt: new Date() })
     .where(eq(pendingApproval.id, id))
     .run()
   const replay = (caller: Caller) =>
@@ -474,22 +489,78 @@ test('the same held call from the same caller reuses its pending approval', asyn
   expect(await held(agent, 'access/users/create', input)).not.toBe(first)
 })
 
-test('bidi and line separator characters in held input are escaped in the stored body', async () => {
+const invisible = '\u202e\u2028\u3164\ufe0f\u{e0100}\u0085\u200b'
+const escaped = '\\u{202e}\\u{2028}\\u{3164}\\u{fe0f}\\u{e0100}\\u{85}\\u{200b}'
+const unprintable = /[\p{C}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/u
+const cliMain = resolve(import.meta.dir, '../../../apps/cli/src/main.ts')
+
+async function kurumi(...argv: string[]): Promise<string> {
+  const child = Bun.spawn([process.execPath, cliMain, ...argv], {
+    env: { ...process.env, KURUMI_HOME: home },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ])
+  expect({ argv, exitCode, stderr }).toEqual({ argv, exitCode: 0, stderr: '' })
+  return stdout
+}
+
+test('invisible code points are escaped in the stored title, body, and handler error, and in what the CLI prints', async () => {
   const db = openDb()
   const { router, contextFor, held } = composedHost(db)
-  const id = await held(agent, 'access/users/create', {
-    id: 'slack:U1\u202eevil',
-    displayName: 'Bob\u2028approved by host',
+  const heldId = await held(agent, 'access/users/create', {
+    id: `slack:U1${invisible.replace('\u2028', '')}`,
+    displayName: `Bob${invisible}approved by host`,
   })
+  const { ledger } = recordingLedger(db, crash(`boom${invisible}`))
+  const requested = transaction(
+    db,
+    (tx) =>
+      ledger.request(tx, {
+        kind: 'gateway.request',
+        agentGroupId: null,
+        sessionId: null,
+        title: `title${invisible}`,
+        body: [`body${invisible}`],
+        payload: { url: 'https://example.com' },
+      }).approvalId,
+  )
+  await ledger.decide({ id: requested, decision: 'deny', by: host })
 
-  const client = createRouterClient(router, { context: contextFor(host) })
-  const rendered = JSON.stringify([
-    await client.approval.show([id]),
-    await client.approval.list({}),
-  ])
+  expect(ledger.show(requested)).toMatchObject({
+    title: `title${escaped}`,
+    body: [`body${escaped}`],
+    handlerError: `boom${escaped}`,
+  })
+  expect(ledger.show(heldId).body.join('\n')).toContain(`Bob${escaped}approved by host`)
 
-  expect(rendered).not.toMatch(/[\u202e\u2028]/)
-  expect((await client.approval.show([id])).body.join('\n')).toContain('U1\\u{202e}evil')
+  const server = Bun.serve({
+    unix: join(home, 'kurumi.sock'),
+    async fetch(request) {
+      const { response } = await new RPCHandler(router).handle(request, {
+        prefix: '/rpc',
+        context: contextFor(host),
+      })
+      return response ?? new Response('Not found', { status: 404 })
+    },
+  })
+  try {
+    const printed = await Promise.all([
+      kurumi('approval', 'list'),
+      kurumi('approval', 'list', '--status', 'decided'),
+      kurumi('approval', 'show', heldId),
+      kurumi('approval', 'show', requested),
+    ])
+    expect(printed.join('').replaceAll('\n', '')).not.toMatch(unprintable)
+    expect(printed[0]).toContain(`Bob${escaped.replaceAll('\\', '\\\\')}approved by host`)
+    expect(printed[3]).toContain(`boom${escaped.replaceAll('\\', '\\\\')}`)
+  } finally {
+    await server.stop(true)
+  }
 })
 
 test('humans named as approvers at request time decide through the router, others do not', async () => {
@@ -515,11 +586,11 @@ test('humans named as approvers at request time decide through the router, other
   expect(await decide(agent, scopedFirst)).toMatchObject({ code: 'FORBIDDEN' })
   expect(await decide({ kind: 'human', userId: 'slack:scoped' }, scopedFirst)).toMatchObject({
     changed: true,
-    approval: { decidedBy: 'slack:scoped' },
+    approval: { decidedBy: { kind: 'user', userId: 'slack:scoped' } },
   })
   expect(await decide({ kind: 'human', userId: 'slack:owner' }, ownerFirst)).toMatchObject({
     changed: true,
-    approval: { decidedBy: 'slack:owner' },
+    approval: { decidedBy: { kind: 'user', userId: 'slack:owner' } },
   })
   expect(db.select().from(user).where(eq(user.id, 'slack:U2')).get()).toBeDefined()
 })
@@ -544,3 +615,180 @@ function ledgerRow(db: Db, id: string) {
   if (row === undefined) throw new Error(`approval ${id} is missing`)
   return row
 }
+
+const create = (n: number) => ({ id: `slack:U${n}`, displayName: 'Bob' })
+
+function decideBehindTheLedger(db: Db, id: string) {
+  db.run(
+    sql`UPDATE pending_approval SET status = 'approved', decided_by = '{"kind":"host"}', decided_at = 0 WHERE id = ${id}`,
+  )
+}
+
+test('held calls that differ only in ignored keys, key order, or untrimmed strings share one pending approval', async () => {
+  const db = openDb()
+  const { held } = composedHost(db)
+  const first = await held(agent, 'access/users/create', { id: 'slack:U1', displayName: 'Bob' })
+
+  for (const variant of [
+    { id: 'slack:U1', displayName: 'Bob', junk: 'x'.repeat(60_000) },
+    { id: 'slack:U1', displayName: 'Bob', other: 'y' },
+    { displayName: 'Bob', id: 'slack:U1' },
+    { id: 'slack:U1', displayName: ' Bob ' },
+  ]) {
+    expect(await held(agent, 'access/users/create', variant)).toBe(first)
+  }
+  expect(db.select().from(pendingApproval).all()).toHaveLength(1)
+  expect(ledgerRow(db, first).payload).toEqual({
+    path: ['access', 'users', 'create'],
+    input: { id: 'slack:U1', displayName: 'Bob' },
+    caller: agent,
+  })
+})
+
+test('an agent group with 20 pending approvals is refused a new one with 429 and no row', async () => {
+  const db = openDb()
+  const { post, held } = composedHost(db)
+  const pending: string[] = []
+  for (let n = 0; n < 20; n++) pending.push(await held(agent, 'access/users/create', create(n)))
+
+  expect(await post(agent, 'access/users/create', create(20))).toMatchObject({
+    status: 429,
+    code: 'TOO_MANY_REQUESTS',
+  })
+  expect(
+    await post({ ...agent, sessionId: 'session-b' }, 'access/users/create', create(21)),
+  ).toMatchObject({ status: 429 })
+  expect(await held(agent, 'access/users/create', create(0))).toBe(pending.at(0) ?? 'none')
+  const otherGroup = { kind: 'agent', agentGroupId: 'ag-b', sessionId: 'session-b' } as const
+  expect(await held(otherGroup, 'access/users/create', create(20))).toMatch(/^apr-/)
+  expect(
+    db.select().from(pendingApproval).where(eq(pendingApproval.agentGroupId, 'ag-a')).all(),
+  ).toHaveLength(20)
+})
+
+test('a decided row whose payload does not parse is recorded as a failed handler, and start still settles the rest', async () => {
+  const db = openDb()
+  const { ledger: requester } = recordingLedger(db)
+  const shapeless = requestProcedure(db, requester)
+  const unparsable = requestProcedure(db, requester)
+  const healthy = requestProcedure(db, requester)
+  for (const id of [shapeless, unparsable, healthy]) decideBehindTheLedger(db, id)
+  db.run(sql`UPDATE pending_approval SET payload = '{"nope":1}' WHERE id = ${shapeless}`)
+  db.run(sql`UPDATE pending_approval SET payload = 'not json' WHERE id = ${unparsable}`)
+  const { ledger, handled, logged } = recordingLedger(db)
+
+  await ledger.start()
+
+  const outcome = (id: string) =>
+    db
+      .select({ handledAt: pendingApproval.handledAt, handlerError: pendingApproval.handlerError })
+      .from(pendingApproval)
+      .where(eq(pendingApproval.id, id))
+      .get()
+  expect(handled).toEqual([{ id: healthy, decision: 'approve' }])
+  for (const id of [shapeless, unparsable]) {
+    expect(outcome(id)).toEqual({ handledAt: expect.any(Date), handlerError: expect.any(String) })
+  }
+  expect(outcome(healthy)).toEqual({ handledAt: expect.any(Date), handlerError: null })
+  expect(logged.map((event) => [event.kind, event.approvalId])).toEqual([
+    ['approval.handler.failed', shapeless],
+    ['approval.handler.failed', unparsable],
+  ])
+})
+
+test('a handler that throws synchronously is recorded as failed at decide and at start', async () => {
+  const db = openDb()
+  const { ledger } = recordingLedger(db, () => {
+    throw new Error('sync boom')
+  })
+  const atDecide = requestProcedure(db, ledger)
+  const atStart = requestProcedure(db, ledger)
+  decideBehindTheLedger(db, atStart)
+
+  const decided = await ledger.decide({ id: atDecide, decision: 'approve', by: host })
+  await ledger.start()
+
+  expect(decided.approval).toMatchObject({ handledAt: expect.any(Date), handlerError: 'sync boom' })
+  expect(ledger.show(atStart)).toMatchObject({
+    handledAt: expect.any(Date),
+    handlerError: 'sync boom',
+  })
+})
+
+test('when the outcome cannot be recorded, decide and start resolve, log it, and leave the row for the next start', async () => {
+  const db = openDb()
+  const { ledger, handled, logged } = recordingLedger(db)
+  const id = requestProcedure(db, ledger)
+  db.run(
+    sql`CREATE TRIGGER disk_full BEFORE UPDATE OF handled_at ON pending_approval BEGIN SELECT RAISE(ABORT, 'disk full'); END`,
+  )
+
+  const decided = await ledger.decide({ id, decision: 'approve', by: host })
+  await ledger.start()
+
+  expect(decided.message).toMatch(
+    /^approved by host at .*, but recording its outcome failed, so its handler runs again at the next host start: disk full$/,
+  )
+  expect(ledger.show(id)).toMatchObject({ status: 'approved', handledAt: null })
+  const unrecorded: ApprovalLog = {
+    kind: 'approval.outcome.unrecorded',
+    approvalId: id,
+    error: 'disk full',
+  }
+  expect(logged).toEqual([unrecorded, unrecorded])
+
+  db.run(sql`DROP TRIGGER disk_full`)
+  await ledger.start()
+  expect(ledger.show(id)).toMatchObject({ handledAt: expect.any(Date), handlerError: null })
+  expect(handled).toHaveLength(3)
+})
+
+test('a failed handler logs one line with the approval id and the escaped error at decide and at start', async () => {
+  const db = openDb()
+  const { ledger, logged } = recordingLedger(db, crash('boom‮'))
+  const atDecide = requestProcedure(db, ledger)
+  const atStart = requestProcedure(db, ledger)
+  decideBehindTheLedger(db, atStart)
+
+  await ledger.decide({ id: atDecide, decision: 'approve', by: host })
+  await ledger.start()
+
+  expect(logged).toEqual([
+    { kind: 'approval.handler.failed', approvalId: atDecide, error: 'boom\\u{202e}' },
+    { kind: 'approval.handler.failed', approvalId: atStart, error: 'boom\\u{202e}' },
+  ])
+})
+
+test('a human whose user id is host is not the host approver', async () => {
+  const db = openDb()
+  const { router, contextFor, held } = composedHost(db)
+  const id = await held(agent, 'access/users/create', { id: 'slack:U1', displayName: 'Bob' })
+
+  expect(
+    await createRouterClient(router, { context: contextFor({ kind: 'human', userId: 'host' }) })
+      .approval.decide([id, { approve: true }])
+      .catch((caught: unknown) => caught),
+  ).toMatchObject({ code: 'FORBIDDEN' })
+  expect(ledgerRow(db, id).status).toBe('pending')
+})
+
+test.each([
+  ['an agent calling a scoped procedure', agent, 'probe/scoped'],
+  [
+    'a non-owner human calling a held procedure',
+    { kind: 'human', userId: 'slack:m' },
+    'probe/note',
+  ],
+] as const)(
+  'malformed input from %s is a 403 without schema issues through the approval guard',
+  async (_name, caller, path) => {
+    const db = openDb()
+    const { post } = composedHost(db)
+
+    const answer = await post(caller, path, { name: 42, text: 42 })
+
+    expect(answer).toMatchObject({ status: 403, code: 'FORBIDDEN' })
+    expect(JSON.stringify(answer)).not.toContain('issues')
+    expect(db.select().from(pendingApproval).all()).toEqual([])
+  },
+)

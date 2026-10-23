@@ -26,7 +26,7 @@ export type GuardCall = {
 }
 export type GuardOutcome =
   | { kind: 'allow' }
-  | { kind: 'hold'; request: () => { approvalId: string } }
+  | { kind: 'hold'; request: (validInput: unknown) => { approvalId: string } }
   | { kind: 'deny'; reason: string }
 export type Guard = (call: GuardCall) => GuardOutcome
 export type KurumiContext = { db: Db; caller: Caller; guard: Guard; grant: ApprovalGrant | null }
@@ -85,14 +85,16 @@ function requestedGroup(input: unknown): unknown {
     : undefined
 }
 
-async function assertValidInput(procedure: AnyProcedure, input: unknown): Promise<void> {
+async function validInput(procedure: AnyProcedure, input: unknown): Promise<unknown> {
   const result = await procedure['~orpc'].inputSchema?.['~standard'].validate(input)
-  if (result?.issues) {
+  if (result === undefined) return input
+  if (result.issues) {
     throw new ORPCError('BAD_REQUEST', {
       message: 'Input validation failed',
       data: { issues: result.issues },
     })
   }
+  return result.value
 }
 
 const base = os.$context<KurumiContext>().$meta<Meta>({})
@@ -106,13 +108,14 @@ export const guarded = base.middleware(async ({ context, path, procedure, next }
   switch (outcome.kind) {
     case 'allow':
       return next()
-    case 'hold':
+    case 'hold': {
       // oRPC validates input only after router-level middleware, so a malformed call must not become an approval.
-      await assertValidInput(procedure, input)
+      const valid = await validInput(procedure, input)
       throw new ORPCError('APPROVAL_PENDING', {
         status: 409,
-        data: { approvalId: outcome.request().approvalId },
+        data: { approvalId: outcome.request(valid).approvalId },
       })
+    }
     case 'deny':
       throw new ORPCError('FORBIDDEN', { message: outcome.reason })
   }

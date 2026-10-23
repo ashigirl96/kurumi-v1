@@ -216,6 +216,7 @@ export async function startHost(config: HostConfig) {
       accessLedger,
       handlers: () => approvalHandlers,
       decidePath: ['approval', 'decide'],
+      log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
     })
     const chatLedger = createChatLedger({
       db,

@@ -1,3 +1,4 @@
+import { principal } from '@kurumi/access/contract'
 import { kc } from '@kurumi/rpc/contract'
 import { z } from 'zod'
 
@@ -15,7 +16,7 @@ const common = {
   agentGroupId: z.string().nullable(),
   sessionId: z.string().nullable(),
   body: z.array(z.string()),
-  approvers: z.array(z.string()),
+  approvers: z.array(principal),
   createdAt: z.date(),
 }
 
@@ -24,7 +25,7 @@ export const approvalView = z.discriminatedUnion('status', [
   z.object({
     ...common,
     status: z.enum(['approved', 'denied']),
-    decidedBy: z.string(),
+    decidedBy: principal,
     decidedAt: z.date(),
     handledAt: z.date().nullable(),
     handlerError: z.string().nullable(),

@@ -6,6 +6,7 @@ CREATE TABLE `pending_approval` (
 	`title` text NOT NULL,
 	`body` text NOT NULL,
 	`payload` text NOT NULL,
+	`dedupe_key` text,
 	`approvers` text NOT NULL,
 	`status` text NOT NULL,
 	`decided_by` text,
@@ -20,3 +21,6 @@ CREATE TABLE `pending_approval` (
 	CONSTRAINT "pending_approval_handled_only_when_decided" CHECK("pending_approval"."handled_at" IS NULL OR "pending_approval"."status" <> 'pending'),
 	CONSTRAINT "pending_approval_handler_error_only_when_handled" CHECK("pending_approval"."handler_error" IS NULL OR "pending_approval"."handled_at" IS NOT NULL)
 );
+--> statement-breakpoint
+CREATE UNIQUE INDEX `pending_approval_pending_dedupe_key` ON `pending_approval` (`dedupe_key`) WHERE "pending_approval"."status" = 'pending';--> statement-breakpoint
+CREATE INDEX `pending_approval_agent_group_status` ON `pending_approval` (`agent_group_id`,`status`);

@@ -13,6 +13,12 @@ export const createUserInput = z.object({
 
 const user = z.object({ id: z.string(), kind: z.string(), displayName: z.string() })
 
+export const principal = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('host') }),
+  z.object({ kind: z.literal('user'), userId: z.string() }),
+])
+export type Principal = z.infer<typeof principal>
+
 export const contract = {
   users: {
     create: kc

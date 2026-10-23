@@ -8,7 +8,7 @@ import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 
 import { user, userRole } from './schema.ts'
-import { createAccessLedger, HOST_OWNER, migrations, type AccessLedger } from './server.ts'
+import { createAccessLedger, migrations, type AccessLedger } from './server.ts'
 
 let sqlite: Database
 let db: Db
@@ -33,13 +33,15 @@ afterEach(() => {
   sqlite.close()
 })
 
+const userApprover = (userId: string) => ({ kind: 'user', userId }) as const
+
 function grant(userId: string, role: 'owner' | 'admin', agentGroupId: string | null, at: number) {
   db.insert(user)
     .values({ id: userId, kind: 'slack', displayName: userId })
     .onConflictDoNothing()
     .run()
   db.insert(userRole)
-    .values({ userId, role, agentGroupId, grantedBy: HOST_OWNER, grantedAt: new Date(at) })
+    .values({ userId, role, agentGroupId, grantedBy: 'host', grantedAt: new Date(at) })
     .run()
 }
 
@@ -51,12 +53,16 @@ test('the approver chain lists scoped admins, global admins, owners, then the ho
   grant('slack:owner', 'admin', 'ag-a', 5)
 
   expect(ledger.approverChain('ag-a')).toEqual([
-    'slack:scoped',
-    'slack:owner',
-    'slack:global',
-    HOST_OWNER,
+    userApprover('slack:scoped'),
+    userApprover('slack:owner'),
+    userApprover('slack:global'),
+    { kind: 'host' },
   ])
-  expect(ledger.approverChain(null)).toEqual(['slack:global', 'slack:owner', HOST_OWNER])
+  expect(ledger.approverChain(null)).toEqual([
+    userApprover('slack:global'),
+    userApprover('slack:owner'),
+    { kind: 'host' },
+  ])
 })
 
 test('the host and global owners are owners; scoped owners, admins, and agents are not', () => {
@@ -71,11 +77,13 @@ test('the host and global owners are owners; scoped owners, admins, and agents a
   expect(ledger.isOwner({ kind: 'agent', agentGroupId: 'ag-a', sessionId: 's' })).toBe(false)
 })
 
-test('an approver is a caller whose principal is in the given set', () => {
-  const approvers = ['slack:admin', HOST_OWNER]
+test('an approver is a caller whose principal is in the given set, and no user id names the host', () => {
+  const approvers = [{ kind: 'user', userId: 'slack:admin' }, { kind: 'host' }] as const
   expect(ledger.isApprover({ kind: 'host' }, approvers)).toBe(true)
   expect(ledger.isApprover({ kind: 'human', userId: 'slack:admin' }, approvers)).toBe(true)
   expect(ledger.isApprover({ kind: 'human', userId: 'slack:other' }, approvers)).toBe(false)
+  expect(ledger.isApprover({ kind: 'human', userId: 'host' }, approvers)).toBe(false)
+  expect(ledger.isApprover({ kind: 'host' }, [{ kind: 'user', userId: 'host' }])).toBe(false)
   expect(
     ledger.isApprover({ kind: 'agent', agentGroupId: 'ag-a', sessionId: 's' }, approvers),
   ).toBe(false)

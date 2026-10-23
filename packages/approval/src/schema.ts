@@ -1,5 +1,6 @@
+import type { Principal } from '@kurumi/access/contract'
 import { sql } from 'drizzle-orm'
-import { check, integer, sqliteTable, text } from 'drizzle-orm/sqlite-core'
+import { check, index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
 
 import { approvalKinds, approvalStatuses } from './contract.ts'
 
@@ -13,15 +14,20 @@ export const pendingApproval = sqliteTable(
     title: text('title').notNull(),
     body: text('body', { mode: 'json' }).$type<string[]>().notNull(),
     payload: text('payload', { mode: 'json' }).notNull(),
-    approvers: text('approvers', { mode: 'json' }).$type<string[]>().notNull(),
+    dedupeKey: text('dedupe_key'),
+    approvers: text('approvers', { mode: 'json' }).$type<Principal[]>().notNull(),
     status: text('status', { enum: approvalStatuses }).notNull(),
-    decidedBy: text('decided_by'),
+    decidedBy: text('decided_by', { mode: 'json' }).$type<Principal>(),
     createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
     decidedAt: integer('decided_at', { mode: 'timestamp_ms' }),
     handledAt: integer('handled_at', { mode: 'timestamp_ms' }),
     handlerError: text('handler_error'),
   },
   (t) => [
+    uniqueIndex('pending_approval_pending_dedupe_key')
+      .on(t.dedupeKey)
+      .where(sql`${t.status} = 'pending'`),
+    index('pending_approval_agent_group_status').on(t.agentGroupId, t.status),
     check('pending_approval_kind', sql`${t.kind} IN ${oneOf(approvalKinds)}`),
     check('pending_approval_status', sql`${t.status} IN ${oneOf(approvalStatuses)}`),
     check(

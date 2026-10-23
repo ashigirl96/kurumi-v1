@@ -4,36 +4,38 @@ import { implement, ORPCError } from '@orpc/server'
 import { and, eq, isNull, or } from 'drizzle-orm'
 import type { z } from 'zod'
 
-import { contract, createUserInput } from './contract.ts'
+import { contract, createUserInput, type Principal } from './contract.ts'
 import { user, userRole } from './schema.ts'
 
 export { migrations } from '../migrations/index.ts'
 
-export const HOST_OWNER = 'host'
-
 export type User = typeof user.$inferSelect
 
 export type AccessLedger = {
-  principalOf(caller: Caller): string | null
+  principalOf(caller: Caller): Principal | null
   isOwner(caller: Caller): boolean
-  isApprover(caller: Caller, approvers: readonly string[]): boolean
+  isApprover(caller: Caller, approvers: readonly Principal[]): boolean
   /** Scoped admins of the group, then global admins, then owners, then the host. */
-  approverChain(agentGroupId: string | null): string[]
+  approverChain(agentGroupId: string | null): Principal[]
   createUser(input: z.input<typeof createUserInput>): User
 }
 
 const tierOf = (role: { role: 'owner' | 'admin'; agentGroupId: string | null }): number =>
   role.agentGroupId !== null ? 0 : role.role === 'admin' ? 1 : 2
 
-function principalOf(caller: Caller): string | null {
+function principalOf(caller: Caller): Principal | null {
   switch (caller.kind) {
     case 'host':
-      return HOST_OWNER
+      return { kind: 'host' }
     case 'human':
-      return caller.userId
+      return { kind: 'user', userId: caller.userId }
     case 'agent':
       return null
   }
+}
+
+function samePrincipal(a: Principal, b: Principal): boolean {
+  return a.kind === 'host' ? b.kind === 'host' : b.kind === 'user' && a.userId === b.userId
 }
 
 export function createAccessLedger({ db }: { db: Db }): AccessLedger {
@@ -63,7 +65,7 @@ export function createAccessLedger({ db }: { db: Db }): AccessLedger {
     },
     isApprover(caller, approvers) {
       const principal = principalOf(caller)
-      return principal !== null && approvers.includes(principal)
+      return principal !== null && approvers.some((approver) => samePrincipal(approver, principal))
     },
     approverChain(agentGroupId) {
       const scoped =
@@ -81,7 +83,8 @@ export function createAccessLedger({ db }: { db: Db }): AccessLedger {
         .orderBy(userRole.grantedAt, userRole.userId)
         .all()
         .toSorted((a, b) => tierOf(a) - tierOf(b))
-      return [...new Set([...roles.map((role) => role.userId), HOST_OWNER])]
+      const userIds = [...new Set(roles.map((role) => role.userId))]
+      return [...userIds.map((userId): Principal => ({ kind: 'user', userId })), { kind: 'host' }]
     },
     createUser(input) {
       const parsed = createUserInput.safeParse(input)
