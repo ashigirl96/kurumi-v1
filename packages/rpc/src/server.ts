@@ -124,7 +124,6 @@ export function guardRouter<TContext extends KurumiContext>() {
   return os.$context<TContext>().$meta<Meta>({}).use(guarded)
 }
 
-/** Goes through the router's middleware, so a replayed call meets the guard like any other call. */
 export async function callByPath<TContext extends KurumiContext>(
   router: Router<AnyContractRouter, TContext>,
   path: readonly string[],

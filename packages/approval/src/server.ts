@@ -84,7 +84,6 @@ export type ApprovalLedger = {
   list(filter: 'pending' | 'decided'): ApprovalView[]
   show(id: string): ApprovalView
   guard: Guard
-  /** Re-runs, oldest first, the handler of every decided approval whose handler never finished. */
   start(): Promise<HandlerFailure[]>
 }
 
@@ -143,7 +142,6 @@ export function createApprovalLedger({
 }: {
   db: Db
   accessLedger: AccessLedger
-  /** Late-bound: the handlers live above this domain, in the host. */
   handlers: () => ApprovalHandlers
 }): ApprovalLedger {
   const rowOf = (id: string): Row | undefined =>

@@ -13,7 +13,6 @@ export const pendingApproval = sqliteTable(
     title: text('title').notNull(),
     body: text('body', { mode: 'json' }).$type<string[]>().notNull(),
     payload: text('payload', { mode: 'json' }).notNull(),
-    /** Resolved once at request time; a later role change does not change who may decide. */
     approvers: text('approvers', { mode: 'json' }).$type<string[]>().notNull(),
     status: text('status', { enum: approvalStatuses }).notNull(),
     decidedBy: text('decided_by'),

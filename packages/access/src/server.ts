@@ -9,7 +9,6 @@ import { user, userRole } from './schema.ts'
 
 export { migrations } from '../migrations/index.ts'
 
-/** The kurumi.sock caller. User ids always contain `:`, so this cannot collide with one. */
 export const HOST_OWNER = 'host'
 
 export type User = typeof user.$inferSelect
@@ -17,7 +16,6 @@ export type User = typeof user.$inferSelect
 export type AccessLedger = {
   principalOf(caller: Caller): string | null
   isOwner(caller: Caller): boolean
-  /** Checked against a set baked earlier, so a later role change cannot widen or narrow it. */
   isApprover(caller: Caller, approvers: readonly string[]): boolean
   /** Scoped admins of the group, then global admins, then owners, then the host. */
   approverChain(agentGroupId: string | null): string[]
