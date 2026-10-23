@@ -85,7 +85,7 @@ export function loadVaultKey(home: string, { sealedAccounts }: { sealedAccounts:
   if (sealedAccounts > 0) {
     const accounts = sealedAccounts === 1 ? '1 sealed account' : `${sealedAccounts} sealed accounts`
     throw new Error(
-      `${path} is missing, but kurumi.db holds ${accounts} that only it can open. Restore vault.key from your backup; a new key could not open them, so none is created.`,
+      `${path} is missing, but kurumi.db holds ${accounts} that only it can open. Restore vault.key from your backup; a new key could not open what is stored, so none is created.`,
     )
   }
   createKeyAtomically(home, path)
