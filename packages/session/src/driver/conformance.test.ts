@@ -728,6 +728,30 @@ test('detach leaves running agents and removes only an agent that is still start
   expect((await dockerDriver.run(agentSpec({ sessionId: 'ses-three' }))).ok).toBe(false)
 })
 
+test('a removal that gets no answer is killed after the driver timeout instead of hanging', async () => {
+  const docker = fakeDaemon()
+  docker.add('kurumi-agent-stuck', {
+    'kurumi.install': 'stuck',
+    'kurumi.role': 'agent',
+    'kurumi.session': 'ses-stuck',
+    'kurumi.container': 'ctr-stuck',
+  })
+  docker.hold('rm')
+  const dockerDriver = createDockerDriver({
+    install: 'stuck',
+    image: 'agent-test',
+    cli: docker.daemon,
+    timeoutMs: 50,
+  })
+  const started = performance.now()
+  const outcome = await dockerDriver.kill('ctr-stuck', 0).then(() => 'removed', String)
+  expect(outcome).toContain('unconfirmed')
+  expect(performance.now() - started).toBeLessThan(1_000)
+  expect(docker.commands('rm').map(({ proc }) => proc.killed)).toEqual([true])
+  docker.release('rm')
+  await dockerDriver.stop().catch(() => {})
+})
+
 test('a sweep lists and removes only containers that carry this install label', async () => {
   const docker = fakeDaemon()
   docker.add('other-agent', {
