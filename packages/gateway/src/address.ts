@@ -1,4 +1,5 @@
 import { BlockList, isIP } from 'node:net'
+import { networkInterfaces } from 'node:os'
 
 type Range = [reason: string, network: string, prefix: number]
 
@@ -38,16 +39,44 @@ function embeddings([reason, network, prefix]: Range): Range[] {
   ]
 }
 
-const refused = [...ipv4, ...ipv6, ...ipv4.flatMap(embeddings)].map(([reason, network, prefix]) => {
+function blockList(ranges: Range[]): BlockList {
   const list = new BlockList()
-  list.addSubnet(network, prefix, isIP(network) === 4 ? 'ipv4' : 'ipv6')
-  return { reason, list }
-})
+  for (const [, network, prefix] of ranges) {
+    list.addSubnet(network, prefix, isIP(network) === 4 ? 'ipv4' : 'ipv6')
+  }
+  return list
+}
 
-export function addressRefusal(address: string): string | null {
+const refused = [...ipv4, ...ipv6, ...ipv4.flatMap(embeddings)].map((range) => ({
+  reason: range[0],
+  list: blockList([range]),
+}))
+
+function hostRanges(address: string): Range[] {
+  const bare = address.replace(/%.*$/, '')
+  const family = isIP(bare)
+  if (family === 4) {
+    const range: Range = ['host interface', bare, 32]
+    return [range, ...embeddings(range)]
+  }
+  return family === 6 ? [['host interface', bare, 128]] : []
+}
+
+export function hostAddresses(): string[] {
+  return Object.values(networkInterfaces()).flatMap((entries = []) =>
+    entries.map(({ address }) => address),
+  )
+}
+
+export function addressRefusal(
+  address: string,
+  host: readonly string[] = hostAddresses(),
+): string | null {
   const bare = address.replace(/%.*$/, '')
   const family = isIP(bare)
   if (family === 0) return 'unparseable'
   const type = family === 4 ? 'ipv4' : 'ipv6'
-  return refused.find(({ list }) => list.check(bare, type))?.reason ?? null
+  const reason = refused.find(({ list }) => list.check(bare, type))?.reason
+  if (reason) return reason
+  return blockList(host.flatMap(hostRanges)).check(bare, type) ? 'host interface' : null
 }
