@@ -32,6 +32,7 @@ import { migrateAll, openKurumiDb, type KurumiDb } from './db.ts'
 import { createRpcFronts, queryReadOnly } from './fronts.ts'
 import { acquireLock } from './lock.ts'
 import { migrations } from './migrations.ts'
+import { loadVaultKey } from './vault-key.ts'
 
 export const initialGuard: Guard = ({ caller, meta }) =>
   caller.kind !== 'agent' || meta.agent === 'channel'
@@ -77,6 +78,7 @@ export async function startHost(config: HostConfig) {
     return stopped
   }
   try {
+    const vaultKey = loadVaultKey(config.home)
     const milliseconds = z.coerce.number().int().max(2_147_483_647)
     const environment = z
       .object({
@@ -159,7 +161,7 @@ export async function startHost(config: HostConfig) {
       agentLedger,
       chatLedger,
       sessionLedger,
-      accountLedger: createAccountLedger({ db }),
+      accountLedger: createAccountLedger({ db, vaultKey }),
     }
     type HostContext = KurumiContext &
       typeof ledgers & {

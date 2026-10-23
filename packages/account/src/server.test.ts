@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, test } from 'bun:test'
+import { randomBytes } from 'node:crypto'
 
 import { sql } from 'drizzle-orm'
 
@@ -44,7 +45,7 @@ const defaultRows = () => db.select().from(defaultAccount).all()
 
 beforeEach(() => {
   db = inMemoryDb()
-  ledger = createAccountLedger({ db })
+  ledger = createAccountLedger({ db, vaultKey: randomBytes(32) })
   for (const group of ['g1', 'g2', 'g3']) insertAgentGroup(db, group)
   insertAccount(db, {
     id: 'acc-a',

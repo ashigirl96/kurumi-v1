@@ -34,7 +34,7 @@ export type AccountLedger = {
   candidates(agentGroupId: string, service: ServiceId): GrantedCandidate[]
 }
 
-export function createAccountLedger(deps: { db: Db }): AccountLedger {
+export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): AccountLedger {
   const candidatesQuery = deps.db
     .select({
       accountId: account.id,

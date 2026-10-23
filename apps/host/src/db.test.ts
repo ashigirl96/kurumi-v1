@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { randomBytes } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -47,7 +48,7 @@ function seedTwoGroups() {
     services: ['gmail', 'google-calendar'],
   })
   insertAccount(db, { id: 'acc-c', vendor: 'google', label: 'c', services: ['gmail'] })
-  const ledger = createAccountLedger({ db })
+  const ledger = createAccountLedger({ db, vaultKey: randomBytes(32) })
   db.transaction((tx) => {
     const grant = (agentGroupId: string, accountId: string, service: 'gmail' | 'google-calendar') =>
       ledger.grant(tx, { agentGroupId, accountId, service, grantedBy: 'test' })
