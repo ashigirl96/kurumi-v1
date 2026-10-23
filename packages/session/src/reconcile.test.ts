@@ -3,21 +3,23 @@ import { expect, test } from 'bun:test'
 import type { ListedContainer } from './driver/docker.ts'
 import { planReconciliation, type ContainerRow } from './reconcile.ts'
 
-const now = Date.parse('2026-10-23T12:00:00Z')
+const now = 1_000_000
 const staleAfterMs = 30_000
 
 function row(overrides: Partial<ContainerRow> = {}): ContainerRow {
   return {
     id: 'ctr-a',
+    name: 'kurumi-agent-a',
     sessionId: 'ses-a',
     status: 'running',
     sessionActive: true,
-    owned: false,
-    startedAt: now - 60_000,
-    lastSeenAt: now - 1_000,
-    toolDeadlineAt: null,
+    liveness: null,
     ...overrides,
   }
+}
+
+function live(lastCall: number | null, since = now - 1_000, toolDeadline: number | null = null) {
+  return { since, lastCall, toolDeadline }
 }
 
 function listed(overrides: Partial<ListedContainer> = {}): ListedContainer {
@@ -39,13 +41,11 @@ function plan(rows: ContainerRow[], containers: ListedContainer[] | null) {
   )
 }
 
+const adopt = { kind: 'adopt', row: 'ctr-a', reason: 'running container matches its row' } as const
+
 test('a running container whose live row survived the restart is adopted', () => {
-  expect(plan([row()], [listed()])).toEqual([
-    { kind: 'adopt', row: 'ctr-a', reason: 'running container matches its row' },
-  ])
-  expect(plan([row({ status: 'starting' })], [listed()])).toEqual([
-    { kind: 'adopt', row: 'ctr-a', reason: 'running container matches its row' },
-  ])
+  expect(plan([row()], [listed()])).toEqual([adopt])
+  expect(plan([row({ status: 'starting' })], [listed()])).toEqual([adopt])
 })
 
 test('containers without a live row are stopped whatever their role', () => {
@@ -54,8 +54,8 @@ test('containers without a live row are stopped whatever their role', () => {
       [],
       [
         listed(),
-        listed({ name: 'kurumi-probe-1', role: 'probe', sessionId: '', containerId: '' }),
-        listed({ name: 'hand-made', role: '', sessionId: '', containerId: '' }),
+        listed({ name: 'kurumi-probe-1', role: 'probe', sessionId: null, containerId: null }),
+        listed({ name: 'hand-made', role: null, sessionId: null, containerId: null }),
       ],
     ),
   ).toEqual([
@@ -74,74 +74,81 @@ test('a row from an earlier host is reaped when its container is gone or unusabl
   expect(plan([row({ sessionActive: false })], [listed()])).toEqual([
     { kind: 'reap', row: 'ctr-a', reason: 'session closed' },
   ])
-  expect(plan([row()], [listed({ sessionId: 'ses-other' })])).toEqual([
-    { kind: 'reap', row: 'ctr-a', reason: 'labels disagree with the row' },
+  for (const labels of [{ sessionId: 'ses-other' }, { containerId: 'ctr-other' }, { role: null }])
+    expect(plan([row()], [listed(labels)])).toEqual([
+      { kind: 'reap', row: 'ctr-a', reason: 'labels disagree with the row' },
+    ])
+})
+
+test('a row claims the container with its own name and a stray wearing its labels is stopped', () => {
+  expect(plan([row()], [listed({ name: 'kurumi-stray' }), listed()])).toEqual([
+    adopt,
+    { kind: 'stop', name: 'kurumi-stray', reason: 'no live row' },
   ])
 })
 
 test('rows this host supervises are left to the driver unless they are stale', () => {
-  expect(plan([row({ owned: true })], [])).toEqual([])
-  expect(plan([row({ owned: true, status: 'starting' })], [])).toEqual([])
-  expect(plan([row({ owned: true })], [listed({ state: 'exited' })])).toEqual([])
+  expect(plan([row({ liveness: live(now) })], [])).toEqual([])
+  expect(plan([row({ liveness: live(now), status: 'starting' })], [])).toEqual([])
+  expect(plan([row({ liveness: live(now) })], [listed({ state: 'exited' })])).toEqual([])
 })
 
-test('an owned running container is stale once its last sign of life is older than the limit', () => {
+test('a supervised running container is stale once its last channel call is older than the limit', () => {
   const stale = { kind: 'reap', row: 'ctr-a', reason: 'stale' } as const
-  expect(plan([row({ owned: true, lastSeenAt: now - staleAfterMs })], [listed()])).toEqual([])
-  expect(plan([row({ owned: true, lastSeenAt: now - staleAfterMs - 1 })], [listed()])).toEqual([
-    stale,
+  expect(plan([row({ liveness: live(now - staleAfterMs) })], [listed()])).toEqual([])
+  expect(plan([row({ liveness: live(now - staleAfterMs - 1) })], [listed()])).toEqual([stale])
+  expect(plan([row({ liveness: live(now - staleAfterMs - 1) })], null)).toEqual([stale])
+  expect(
+    plan([row({ liveness: live(now - staleAfterMs - 1, now - 99_000, now + 1) })], [listed()]),
+  ).toEqual([])
+  expect(
+    plan([row({ liveness: live(now - staleAfterMs - 1, now - 99_000, now - 1) })], [listed()]),
+  ).toEqual([stale])
+  expect(
+    plan([row({ status: 'starting', liveness: live(now - 10 * staleAfterMs) })], null),
+  ).toEqual([])
+})
+
+test('a started or adopted container that never calls is reaped after the shorter of the limit and 60 s', () => {
+  const silent = { kind: 'reap', row: 'ctr-a', reason: 'no channel call since start' } as const
+  expect(plan([row({ liveness: live(null, now - staleAfterMs) })], [listed()])).toEqual([])
+  expect(plan([row({ liveness: live(null, now - staleAfterMs - 1) })], [listed()])).toEqual([
+    silent,
   ])
-  expect(
-    plan([row({ owned: true, lastSeenAt: null, startedAt: now - staleAfterMs - 1 })], null),
-  ).toEqual([stale])
-  expect(
-    plan([row({ owned: true, lastSeenAt: null, startedAt: now - staleAfterMs })], null),
-  ).toEqual([])
-  expect(
-    plan(
-      [row({ owned: true, lastSeenAt: now - staleAfterMs - 1, toolDeadlineAt: now + 1 })],
-      [listed()],
-    ),
-  ).toEqual([])
-  expect(
-    plan(
-      [row({ owned: true, lastSeenAt: now - staleAfterMs - 1, toolDeadlineAt: now - 1 })],
-      [listed()],
-    ),
-  ).toEqual([stale])
-  expect(
-    plan([row({ owned: true, status: 'starting', lastSeenAt: now - 10 * staleAfterMs })], null),
-  ).toEqual([])
-  expect(plan([row({ lastSeenAt: now - 10 * staleAfterMs })], [listed()])).toEqual([
-    { kind: 'adopt', row: 'ctr-a', reason: 'running container matches its row' },
+  const long = (rows: ContainerRow[]) =>
+    planReconciliation({ rows, containers: null, now, staleAfterMs: 600_000 }).map(
+      (decision) => decision.reason,
+    )
+  expect(long([row({ liveness: live(null, now - 60_000) })])).toEqual([])
+  expect(long([row({ liveness: live(null, now - 60_001) })])).toEqual([
+    'no channel call since start',
   ])
 })
 
 test('stopping rows keep their container for the cleanup that is already under way', () => {
   expect(plan([row({ status: 'stopping' })], [listed()])).toEqual([])
-  expect(plan([row({ status: 'stopping', owned: true })], [])).toEqual([])
+  expect(plan([row({ status: 'stopping', liveness: live(now - 10 * staleAfterMs) })], [])).toEqual(
+    [],
+  )
 })
 
 test('without a listing only staleness is judged and unadopted rows wait', () => {
   expect(plan([row()], null)).toEqual([])
-  expect(plan([row({ owned: true, lastSeenAt: now - staleAfterMs - 1 })], null)).toEqual([
-    { kind: 'reap', row: 'ctr-a', reason: 'stale' },
-  ])
 })
 
-test('each container is claimed by at most one row and the rest are stopped', () => {
+test('each row claims at most one container and unclaimed ones are stopped', () => {
   expect(
     plan(
-      [row(), row({ id: 'ctr-b', sessionId: 'ses-b' })],
+      [row(), row({ id: 'ctr-b', name: 'kurumi-agent-b', sessionId: 'ses-b' })],
       [
         listed(),
-        listed({ name: 'kurumi-agent-a2' }),
         listed({ name: 'kurumi-agent-b', sessionId: 'ses-b', containerId: 'ctr-b' }),
+        listed({ name: 'kurumi-agent-c', sessionId: 'ses-c', containerId: 'ctr-c' }),
       ],
     ),
   ).toEqual([
-    { kind: 'adopt', row: 'ctr-a', reason: 'running container matches its row' },
+    adopt,
     { kind: 'adopt', row: 'ctr-b', reason: 'running container matches its row' },
-    { kind: 'stop', name: 'kurumi-agent-a2', reason: 'no live row' },
+    { kind: 'stop', name: 'kurumi-agent-c', reason: 'no live row' },
   ])
 })
