@@ -296,6 +296,8 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 
 ## Implementation reconciliation
 
+- P09 fix-forward 1 `driver/docker.ts`: stop and probe abort let an in-flight create finish before removal. Cancellation waits at most `timeoutMs` (10 seconds by default), then kills the CLI, retains the uncertain name, and rejects cleanup. A deadline expiry does not prove daemon completion or container absence, so stop cannot report successful cleanup and the driver cannot replace that container. This supersedes P06's create-abort cleanup rule below.
+
 - P05 `forward.ts`: upgrade は通常の request と宛先検査と注入の準備を共有する。WebSocket の GET だけを受け、body を指定する handshake は 400 にする。hop header を除いてから Connection と Upgrade を設定し、両側の head byte を送って pipeline につなぐ。upstream の拒否は status と body を返す。
 - P05 `testing.ts`: P04 の raw header と upload の fake を保ち、`startFakeStreamUpstream` を同じ testing entry に追加した。Bun の native WebSocket echo と close code、送信 byte を数える `/sse?bytes=N`、`/sse-idle?ms=N`、`setSseResponse(path, body)`、`/stats` を持つ。呼び手は upstream と gateway を別 process で起動でき、両方の helper が PID を出す。計画の 200 MB は 209,715,200 byte（200 MiB）として扱う。
 - P05 ALPN test: CI と host の `/usr/bin/curl` を使う。`--http2-prior-knowledge` は curl 8.10.0 未満なら h1 の 200、それ以降なら ALPN 不一致による TLS error を検査する。h2 専用の client を h1 に変換するものではない。container の curl lane は P04 と同じ digest の image を使う。

@@ -19,12 +19,18 @@ export type ContainerDriver = {
 }
 
 type RunResult = Awaited<ReturnType<ContainerDriver['run']>>
+type Creation = {
+  result: Promise<CliResult>
+  state: 'pending' | 'settled' | 'unconfirmed'
+  cancel(): void
+}
 type AgentContainer = {
   sessionId: string
   containerId: string
   name: string
   ownership: 'uncertain' | 'confirmed' | 'absent'
   phase: 'starting' | 'running' | 'stopping' | 'failed'
+  create: Creation | undefined
   processes: Set<CliProcess>
   removal: Promise<void> | undefined
   cancelled: boolean
@@ -127,12 +133,37 @@ export function createDockerDriver(options: {
     throw error('timeoutMs must be a positive integer no greater than 2147483647')
   }
   let owned:
-    | { name: string; kind: 'uncertain' | 'confirmed' | 'absent'; create: CliProcess | undefined }
+    | { name: string; kind: 'uncertain' | 'confirmed' | 'absent'; create: Creation | undefined }
     | undefined
   let active = false
 
   function normalize(operation: string, cause: unknown): Error {
     return error(`${operation}: ${cause instanceof Error ? cause.message : String(cause)}`, cause)
+  }
+
+  function settleCreate(proc: CliProcess): Creation {
+    const deadline = Promise.withResolvers<never>()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const create: Creation = {
+      state: 'pending',
+      result: Promise.race([proc.result, deadline.promise]).finally(() => {
+        clearTimeout(timer)
+        if (create.state === 'pending') create.state = 'settled'
+      }),
+      cancel() {
+        if (create.state !== 'pending' || timer !== undefined) return
+        timer = setTimeout(() => {
+          create.state = 'unconfirmed'
+          proc.kill()
+          deadline.reject(
+            new CleanupError(
+              `Docker (${options.image}): create cleanup unconfirmed after ${timeoutMs} ms`,
+            ),
+          )
+        }, timeoutMs)
+      },
+    }
+    return create
   }
 
   async function result(proc: CliProcess, operation: string): Promise<string> {
@@ -160,8 +191,8 @@ export function createDockerDriver(options: {
     const container = operation === 'create' ? owned : undefined
     try {
       const proc = cli.start(args)
-      if (container) container.create = proc
-      const exit = await proc.result
+      if (container) container.create = settleCreate(proc)
+      const exit = await (container?.create?.result ?? proc.result)
       if (container) {
         if (exit.code === 0) container.kind = 'confirmed'
         else if (/^(?:Error response from daemon: )?No such image: [^\r\n]+\s*$/.test(exit.stderr))
@@ -186,6 +217,10 @@ export function createDockerDriver(options: {
 
   async function cleanup(): Promise<void> {
     if (!owned) return
+    if (owned.create?.state === 'unconfirmed')
+      throw new CleanupError(
+        `Docker (${options.image}): cleanup of ${owned.name} unconfirmed after create deadline`,
+      )
     const { name, kind } = owned
     let removed = false
     let removing = false
@@ -256,9 +291,11 @@ export function createDockerDriver(options: {
       throw error(`${args[0]} failed`)
     }
     const tracked = operation?.processes ?? commands
-    tracked.add(proc)
+    const create = args[0] === 'create' && operation ? settleCreate(proc) : undefined
+    if (create && operation) operation.create = create
+    else tracked.add(proc)
     try {
-      const exit = await proc.result
+      const exit = await (create?.result ?? proc.result)
       if (Buffer.byteLength(exit.stdout) > outputLimit)
         throw error(`${args[0]} output exceeds limit`)
       return exit
@@ -281,11 +318,14 @@ export function createDockerDriver(options: {
     if (agent.removal) return agent.removal
     agent.cancelled = true
     agent.phase = 'stopping'
+    agent.create?.cancel()
     for (const proc of agent.processes) proc.kill()
     const joining = [...agent.processes].map((proc) => proc.result.catch(() => {}))
     agent.removal = Promise.resolve()
       .then(async () => {
         await Promise.all(joining)
+        await agent.create?.result.catch(() => {})
+        if (agent.create?.state === 'unconfirmed') throw error('agent create cleanup unconfirmed')
         let removed = false
         let removing = false
         try {
@@ -434,7 +474,7 @@ export function createDockerDriver(options: {
     let attach: CliProcess | undefined
     let aborted: ReturnType<typeof Promise.withResolvers<never>> | undefined
     const abort = () => {
-      owned?.create?.kill()
+      owned?.create?.cancel()
       attach?.kill()
       aborted?.reject(error('probe aborted'))
     }
@@ -537,6 +577,7 @@ export function createDockerDriver(options: {
         name: `kurumi-agent-${createHash('sha256').update(options.install).update('\0').update(spec.containerId).digest('hex').slice(0, 32)}`,
         ownership: 'uncertain',
         phase: 'starting',
+        create: undefined,
         processes: new Set(),
         pending: Promise.resolve({ ok: false, reason: 'not started' }),
         removal: undefined,
@@ -576,6 +617,7 @@ export function createDockerDriver(options: {
           const replacement = replacements.get(containerId)
           if (replacement) {
             replacement.cancelled = true
+            replacement.create?.cancel()
             for (const proc of replacement.processes) proc.kill()
             await replacement.pending
             return
@@ -620,6 +662,7 @@ export function createDockerDriver(options: {
               name,
               ownership: 'confirmed',
               phase: 'stopping',
+              create: undefined,
               processes: new Set(),
               removal: undefined,
               cancelled: true,

@@ -146,7 +146,7 @@ test('a signal aborted before probe allocates no container', async () => {
 })
 
 test.each(['success', 'failure'])(
-  'abort kills create and joins its late %s before cleanup',
+  'abort lets create settle with late %s before cleanup',
   async (late) => {
     const { cli, driver } = setup()
     const abort = new AbortController()
@@ -156,7 +156,7 @@ test.each(['success', 'failure'])(
     })
     const create = await call(cli, 0)
     abort.abort()
-    expect(create.proc.killed).toBe(true)
+    expect(create.proc.killed).toBe(false)
     expect(settled).toBe(false)
     expect(cli.started).toHaveLength(1)
     if (late === 'success') create.proc.complete({ stdout: 'late-container' })
@@ -665,7 +665,7 @@ test('agent lockdown uses the contributed network and never attaches to stdout',
   await driver.stop()
 })
 
-test('kill aborts and joins a pending create before removing its late container', async () => {
+test('kill lets a pending create settle before removing its late container', async () => {
   const { cli, driver } = setup()
   const run = driver.run(agentSpec())
   const create = await call(cli, 0)
@@ -673,7 +673,7 @@ test('kill aborts and joins a pending create before removing its late container'
   const kill = driver.kill('ctr-one', 0).then(() => {
     settled = true
   })
-  expect(create.proc.killed).toBe(true)
+  expect(create.proc.killed).toBe(false)
   expect(settled).toBe(false)
   expect(cli.started).toHaveLength(1)
   create.proc.complete()
@@ -852,7 +852,7 @@ test('stop retries cleanup of a probe whose earlier cleanup was unconfirmed', as
   await stopping
 })
 
-test('kill aborts a replacement create after its predecessor cleanup finishes', async () => {
+test('kill lets a replacement create settle after its predecessor cleanup finishes', async () => {
   const { cli, driver } = setup()
   const failed = driver.run(agentSpec())
   ;(await call(cli, 0)).proc.complete({ code: 1 })
@@ -863,13 +863,13 @@ test('kill aborts a replacement create after its predecessor cleanup finishes', 
   ;(await call(cli, 3)).proc.complete({ code: 1, stderr: 'No such container: old' })
   const create = await call(cli, 4)
   const killing = driver.kill('ctr-retry', 0)
-  const cancelled = create.proc.killed
-  create.proc.complete({ code: null })
+  const killed = create.proc.killed
+  create.proc.complete()
   ;(await call(cli, 5)).proc.complete({ code: 1, stderr: 'No such container: new' })
   await killing
   expect((await retry).ok).toBe(false)
   await driver.stop()
-  expect(cancelled).toBe(true)
+  expect(killed).toBe(false)
 })
 
 test.each(['agent', 'probe'] as const)(
