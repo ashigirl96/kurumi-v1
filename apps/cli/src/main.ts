@@ -24,6 +24,8 @@ import { z } from 'zod'
 
 type ForwardingRouter = { [key: string]: ForwardingRouter | AnyProcedure }
 
+export const cliContract = { agent: agentContract, account: accountContract, ...hostContract }
+
 export async function main(argv: string[]): Promise<number> {
   const home = process.env.KURUMI_HOME ?? join(homedir(), '.kurumi')
   const socket = join(home, 'kurumi.sock')
@@ -49,7 +51,7 @@ export async function main(argv: string[]): Promise<number> {
   })
   if (argv[0] === 'chat') return chat(argv.slice(1), link)
   return runCommand(argv, {
-    contract: { agent: agentContract, account: accountContract, ...hostContract },
+    contract: cliContract,
     link,
     stdin: { isTTY: process.stdin.isTTY, chunks: process.stdin },
   })
@@ -63,7 +65,14 @@ export async function runCommand(
   argv: string[],
   { contract, link, stdin }: { contract: AnyContractRouter; link: Link; stdin: Stdin },
 ): Promise<number> {
-  const router = forward(contract, link, stdin)
+  let router: ForwardingRouter
+  try {
+    router = forward(contract, link, stdin)
+  } catch (error) {
+    if (!(error instanceof StdinRouteError)) throw error
+    process.stderr.write(`${error.message}\n`)
+    return 1
+  }
   const cli = createCli({
     router,
     name: 'kurumi',
@@ -260,46 +269,103 @@ type StdinField = {
   cliSchema: z.ZodType
 }
 
+class StdinRouteError extends Error {}
+
 function stdinFieldOf(command: string, schema: unknown): StdinField | null {
   if (!(schema instanceof z.ZodType)) return null
-  const [only, ...more] = stdinMarkers(
-    z.toJSONSchema(schema, { io: 'input', unrepresentable: 'any' }),
-  )
-  if (!only) return null
-  const refuse = (why: string) => new Error(`kurumi ${command} cannot read stdin: ${why}`)
+  const markers = stdinMarkers(schema)
+  const [marker, ...others] = markers
+  if (!marker) return null
+  const refuse = (why: string) => new StdinRouteError(`kurumi ${command} cannot read stdin: ${why}`)
+  if (others.length > 0) {
+    const all = markers.map(({ at }) => pathOf(at)).join(' and ')
+    throw refuse(`${all} are each marked stdin, but only one field can be`)
+  }
+  const where = pathOf(marker.at)
   const items: readonly z.core.$ZodType[] = schema instanceof z.ZodTuple ? schema.def.items : []
   const options = items.at(-1)
-  const field = only.path
-    .join('/')
-    .match(new RegExp(`^prefixItems/${items.length - 1}/properties/([^/]+)(?:/anyOf/\\d+)*$`))?.[1]
-  if (more.length > 0 || field === undefined || !(options instanceof z.ZodObject)) {
-    throw refuse('only one field of the trailing options object may be marked stdin')
+  const [owner, property] = marker.at
+  if (
+    !(options instanceof z.ZodObject) ||
+    marker.at.length !== 2 ||
+    owner?.kind !== 'index' ||
+    owner.index !== items.length - 1 ||
+    property?.kind !== 'property'
+  ) {
+    throw refuse(`${where} is marked stdin, but only a field of the trailing options object can be`)
   }
-  if (typeof only.maxLength !== 'number') throw refuse(`${field} needs a maximum length`)
-  const { [field]: fieldSchema, ...rest } = options.shape
-  if (fieldSchema === undefined) throw refuse(`${field} is not in the options object`)
-  const [first, ...others] = [...items.slice(0, -1), z.object(rest)]
+  const { maxLength } = z.toJSONSchema(marker.schema, {
+    io: 'input',
+    unrepresentable: 'any',
+    metadata: z.registry(),
+  })
+  if (typeof maxLength !== 'number') throw refuse(`${where} needs a maximum length`)
+  const { [property.name]: fieldSchema, ...rest } = options.shape
+  const [first, ...more] = [...items.slice(0, -1), z.object(rest)]
   return {
-    field,
+    field: property.name,
     schema: fieldSchema,
-    maxLength: only.maxLength,
-    cliSchema: z.tuple([first, ...others]),
+    maxLength,
+    cliSchema: z.tuple([first, ...more]),
   }
 }
 
+type Step =
+  | { kind: 'index'; index: number }
+  | { kind: 'property'; name: string }
+  | { kind: 'keyword'; name: string }
+
+type Marker = { at: readonly Step[]; schema: z.core.$ZodType }
+
+const pathOf = (at: readonly Step[]): string =>
+  `input${at
+    .map((step) =>
+      step.kind === 'index'
+        ? `[${step.index}]`
+        : step.kind === 'property'
+          ? `.${step.name}`
+          : `<${step.name}>`,
+    )
+    .join('')}`
+
+const SAME_VALUE_DEF_KEYS = new Set(['innerType', 'in', 'out', 'options', 'left', 'right'])
+
 function stdinMarkers(
-  node: unknown,
-  path: string[] = [],
-): { path: string[]; maxLength: unknown }[] {
-  if (typeof node !== 'object' || node === null) return []
-  const here =
-    'stdin' in node && node.stdin === true
-      ? [{ path, maxLength: 'maxLength' in node ? node.maxLength : undefined }]
-      : []
+  schema: z.core.$ZodType,
+  at: readonly Step[] = [],
+  ancestors: ReadonlySet<z.core.$ZodType> = new Set(),
+): Marker[] {
+  if (ancestors.has(schema)) return []
+  const inside = new Set(ancestors).add(schema)
+  const here = z.globalRegistry.get(schema)?.stdin === true ? [{ at, schema }] : []
   return [
     ...here,
-    ...Object.entries(node).flatMap(([key, child]) => stdinMarkers(child, [...path, key])),
+    ...childSchemas(schema).flatMap(([step, child]) =>
+      stdinMarkers(child, step ? [...at, step] : at, inside),
+    ),
   ]
+}
+
+function childSchemas(schema: z.core.$ZodType): [Step | null, z.core.$ZodType][] {
+  if (schema instanceof z.core.$ZodLazy) return [[null, schema._zod.innerType]]
+  return Object.entries(schema._zod.def).flatMap(
+    ([key, value]): [Step | null, z.core.$ZodType][] => {
+      if (key === 'shape') {
+        return Object.entries(value as z.core.$ZodShape).map(([name, child]) => [
+          { kind: 'property', name },
+          child,
+        ])
+      }
+      const step: Step | null = SAME_VALUE_DEF_KEYS.has(key) ? null : { kind: 'keyword', name: key }
+      if (value instanceof z.core.$ZodType) return [[step, value]]
+      if (!Array.isArray(value)) return []
+      return value.flatMap((child: unknown, index): [Step | null, z.core.$ZodType][] =>
+        child instanceof z.core.$ZodType
+          ? [[key === 'items' ? { kind: 'index', index } : step, child]]
+          : [],
+      )
+    },
+  )
 }
 
 function withField(input: unknown, field: string, value: string): unknown[] {
@@ -337,7 +403,7 @@ async function readStdinValue(
   }
   let text: string
   try {
-    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks))
+    text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))
   } catch (error) {
     throw new Error(`BAD_REQUEST: stdin is not valid UTF-8, so it holds no ${field}`, {
       cause: error,

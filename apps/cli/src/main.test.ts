@@ -1,11 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 
-import { contract as accountContract } from '@kurumi/account/contract'
 import { kc } from '@kurumi/rpc/contract'
 import type { AnyContractRouter } from '@orpc/contract'
 import { z } from 'zod'
 
-import { runCommand, type Stdin } from './main.ts'
+import { cliContract, runCommand, type Stdin } from './main.ts'
 
 type Call = { path: readonly string[]; input: unknown }
 
@@ -47,20 +46,25 @@ function piped(...chunks: (string | Uint8Array)[]): Stdin {
   }
 }
 
-const run = (
-  argv: string[],
-  stdin: Stdin,
-  contract: AnyContractRouter = { account: accountContract },
-) => runCommand(argv, { contract, link, stdin })
+const run = (argv: string[], stdin: Stdin, contract: AnyContractRouter = cliContract) =>
+  runCommand(argv, { contract, link, stdin })
 
 const addKey = ['account', 'add-key', 'anthropic', '--label', 'main']
+
+test('the CLI builds from the full host contract and status answers', async () => {
+  expect(await run(['status'], piped(''))).toBe(0)
+
+  expect(calls.map(({ path }) => path)).toEqual([['status']])
+  expect(stderr).toBe('')
+})
 
 describe('account add-key', () => {
   test.each([
     ['LF', 'sk-ant-one\n'],
     ['CRLF', 'sk-ant-one\r\n'],
     ['no newline', 'sk-ant-one'],
-  ])('sends the piped key with one trailing %s removed and prints the handle', async (_, text) => {
+    ['UTF-8 byte order mark before it and LF', '\uFEFFsk-ant-one\n'],
+  ])('sends the piped key with one %s removed and prints the handle', async (_, text) => {
     expect(await run(addKey, piped(text))).toBe(0)
 
     expect(calls).toEqual([
@@ -101,19 +105,19 @@ describe('account add-key', () => {
     expect(calls).toEqual([])
   })
 
-  test('stops reading an endless stdin once it is past the key length cap', async () => {
+  test('stops reading a long stdin once it is past the key length cap', async () => {
     let read = 0
-    const endless: Stdin = {
+    const mebibyte: Stdin = {
       isTTY: false,
       chunks: (async function* () {
-        for (;;) {
+        for (let chunk = 0; chunk < 1024; chunk++) {
           read += 1024
           yield new Uint8Array(1024).fill(0x6b)
         }
       })(),
     }
 
-    expect(await run(addKey, endless)).toBe(1)
+    expect(await run(addKey, mebibyte)).toBe(1)
 
     expect(stderr).toBe('BAD_REQUEST: stdin is longer than the 4096 characters value may hold\n')
     expect(read).toBeLessThan(64 * 1024)
@@ -146,12 +150,36 @@ const put = (options: z.ZodObject) =>
     .input(z.tuple([z.string().describe('name'), options]))
     .output(z.object({ ok: z.boolean() }))
 
+const same = (value: string) => value
+
 describe('a contract field marked stdin', () => {
   test.each([
     ['optional', secret.meta({ stdin: true }).optional()],
     ['marked after optional', secret.optional().meta({ stdin: true })],
     ['defaulted', secret.meta({ stdin: true }).default('unused')],
     ['nullable', secret.meta({ stdin: true }).nullable()],
+    ['marked with an id', secret.meta({ stdin: true, id: 'Secret' })],
+    ['the output of a pipe', z.string().pipe(secret.meta({ stdin: true }))],
+    [
+      'the output of a pipe after a transform',
+      z
+        .string()
+        .transform(same)
+        .pipe(secret.meta({ stdin: true })),
+    ],
+    [
+      'the output of a pipe after a codec',
+      z
+        .codec(z.string(), z.string(), { decode: same, encode: same })
+        .pipe(secret.meta({ stdin: true })),
+    ],
+    [
+      'the middle of a pipe chain',
+      z
+        .string()
+        .pipe(secret.meta({ stdin: true }))
+        .pipe(z.string()),
+    ],
   ])('is read from stdin when %s, and gets no flag', async (_, field) => {
     const contract = { put: put(z.object({ label: z.string(), secret: field })) }
 
@@ -168,39 +196,71 @@ describe('a contract field marked stdin', () => {
   })
 
   test.each([
+    ['a default value', z.object({ stdin: z.boolean() }).default({ stdin: true })],
+    ['examples', z.string().meta({ examples: [{ stdin: true }] })],
+  ])('is not found in %s that only hold stdin: true as data', async (_, label) => {
+    const contract = {
+      put: put(z.object({ label, secret: secret.meta({ stdin: true }) })),
+    }
+
+    expect(await run(['put', 'n', '--help'], piped(''), contract)).toBe(0)
+    expect(stdout).toContain('--label')
+    expect(stdout).not.toContain('--secret')
+  })
+
+  test('is read from stdin beside a recursive schema', async () => {
+    type Tree = { children: Tree[] }
+    const tree: z.ZodType<Tree> = z.lazy(() => z.object({ children: z.array(tree) }))
+    const contract = {
+      put: put(z.object({ tree: tree.optional(), secret: secret.meta({ stdin: true }) })),
+    }
+
+    expect(await run(['put', 'n'], piped('s3cret'), contract)).toBe(0)
+    expect(calls).toEqual([{ path: ['put'], input: ['n', { secret: 's3cret' }] }])
+  })
+
+  const marked = secret.meta({ stdin: true })
+
+  test.each([
     [
       'a positional',
-      kc
-        .meta({ cli: true })
-        .input(z.tuple([secret.meta({ stdin: true }), z.object({ label: z.string() })])),
-      'only one field of the trailing options object may be marked stdin',
+      kc.meta({ cli: true }).input(z.tuple([marked, z.object({ label: z.string() })])),
+      'input[0] is marked stdin, but only a field of the trailing options object can be',
     ],
     [
       'a nested field',
-      put(z.object({ auth: z.object({ secret: secret.meta({ stdin: true }) }) })),
-      'only one field of the trailing options object may be marked stdin',
+      put(z.object({ auth: z.object({ secret: marked }) })),
+      'input[1].auth.secret is marked stdin, but only a field of the trailing options object can be',
     ],
     [
-      'one of two fields',
-      put(z.object({ a: secret.meta({ stdin: true }), b: secret.meta({ stdin: true }) })),
-      'only one field of the trailing options object may be marked stdin',
+      'an array element',
+      put(z.object({ secrets: z.array(marked) })),
+      'input[1].secrets<element> is marked stdin, but only a field of the trailing options object can be',
+    ],
+    [
+      'two fields',
+      put(z.object({ a: marked, b: marked })),
+      'input[1].a and input[1].b are each marked stdin, but only one field can be',
     ],
     [
       'an object input',
-      kc.meta({ cli: true }).input(z.object({ secret: secret.meta({ stdin: true }) })),
-      'only one field of the trailing options object may be marked stdin',
+      kc.meta({ cli: true }).input(z.object({ secret: marked })),
+      'input.secret is marked stdin, but only a field of the trailing options object can be',
     ],
     [
       'a field with no maximum length',
       put(z.object({ secret: z.string().meta({ stdin: true }) })),
-      'secret needs a maximum length',
+      'input[1].secret needs a maximum length',
     ],
-  ])('in %s fails the CLI closed instead of becoming a flag', async (_, procedure, why) => {
-    const refused = await run(['put', '--help'], piped(''), { put: procedure }).catch(
-      (error: unknown) => error,
-    )
+  ])(
+    'in %s refuses every command with one line instead of becoming a flag',
+    async (_, procedure, why) => {
+      const contract = { ...cliContract, put: procedure }
 
-    expect(refused).toEqual(new Error(`kurumi put cannot read stdin: ${why}`))
-    expect(calls).toEqual([])
-  })
+      expect(await run(['status'], piped(''), contract)).toBe(1)
+
+      expect(stderr).toBe(`kurumi put cannot read stdin: ${why}\n`)
+      expect(calls).toEqual([])
+    },
+  )
 })
