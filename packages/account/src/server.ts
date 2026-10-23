@@ -295,8 +295,7 @@ const containerEnvServices = serviceIds.filter((service) =>
   ),
 )
 
-/** The mode an unnamed request would be served in, so the SDK in the container writes the slot that account reads. */
-function containerAuthMode(service: ServiceId, rows: readonly GrantRow[]): AuthMode | null {
+function unnamedRequestAuthMode(service: ServiceId, rows: readonly GrantRow[]): AuthMode | null {
   const selection = selectAccount(service, rows, { kind: 'none' })
   const chosen = selection.ok
     ? rows.find((row) => row.accountId === selection.accountId)
@@ -526,7 +525,7 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
     containerEnv(agentGroupId) {
       return Object.fromEntries(
         containerEnvServices.flatMap((service) => {
-          const mode = containerAuthMode(service, grantRows(agentGroupId, service))
+          const mode = unnamedRequestAuthMode(service, grantRows(agentGroupId, service))
           const env = placementOf(service, mode).containerEnv?.(groupSelector(vendorOf(service)))
           return Object.entries(env ?? {})
         }),

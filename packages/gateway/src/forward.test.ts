@@ -361,10 +361,11 @@ async function postToUnconnectedGroup(body: Buffer) {
   return { ...(await response.promise), upstreamRequests: upstream.requests }
 }
 
+const uploadsToLoseTheResetRace = 3
+
 test('a refused POST with a 16 MiB body still reads the JSON refusal', async () => {
   const body = Buffer.alloc(16 * 1024 * 1024, 97)
-  // An early answer resets the connection only when it wins a race, about two attempts in three.
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let upload = 0; upload < uploadsToLoseTheResetRace; upload++) {
     const response = await postToUnconnectedGroup(body)
 
     expect(response.status).toBe(404)

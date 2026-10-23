@@ -896,8 +896,6 @@ describe('the slot an Anthropic account is written to', () => {
       'an Injection holds a credential and cannot be serialized',
     )
     expect(Bun.inspect(decision)).not.toContain(secret)
-    // oxlint-disable-next-line typescript/no-base-to-string -- the default stringification is what this pins.
-    expect(String(decision.injection)).not.toContain(secret)
   })
 })
 

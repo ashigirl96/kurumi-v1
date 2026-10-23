@@ -76,8 +76,8 @@ function withoutHopHeaders(headers: Headers): Headers {
   return result
 }
 
-/** Only the gateway names the account. A label is any text, and `writeHead` throws on a non-Latin1 or control character. */
-function withAccount(headers: Headers, account: AccountHandle | undefined): Headers {
+/** `writeHead` throws on a non-Latin1 or control character, and a label is any text. */
+function replaceAccountHeader(headers: Headers, account: AccountHandle | undefined): Headers {
   headers.delete('x-kurumi-account')
   if (account !== undefined) headers.set('x-kurumi-account', encodeURI(account.toWellFormed()))
   return headers
@@ -210,7 +210,10 @@ export async function forward<Principal>(
     res.end(JSON.stringify({ error: 'upstream_unreachable', host: context.target.host }))
   })
   upstream.once('response', (response) => {
-    const responseHeaders = withAccount(withoutHopHeaders(requestHeaders(response)), account)
+    const responseHeaders = replaceAccountHeader(
+      withoutHopHeaders(requestHeaders(response)),
+      account,
+    )
     const outgoing: Record<string, string | string[]> = Object.fromEntries(responseHeaders)
     const cookies = responseHeaders.getSetCookie()
     if (cookies.length) outgoing['set-cookie'] = cookies
@@ -275,7 +278,7 @@ export async function forwardUpgrade<Principal>(
     else client.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
   })
   upstream.once('response', (response) => {
-    const headers = withAccount(withoutHopHeaders(requestHeaders(response)), account)
+    const headers = replaceAccountHeader(withoutHopHeaders(requestHeaders(response)), account)
     headers.set('connection', 'close')
     client.write(upgradeResponse(response.statusCode ?? 502, headers))
     pipeline(response, client, () => cancel())
@@ -291,7 +294,7 @@ export async function forwardUpgrade<Principal>(
       client.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
       return
     }
-    const headers = withAccount(withoutHopHeaders(requestHeaders(response)), account)
+    const headers = replaceAccountHeader(withoutHopHeaders(requestHeaders(response)), account)
     headers.set('connection', 'Upgrade')
     headers.set('upgrade', 'websocket')
     client.write(upgradeResponse(101, headers))

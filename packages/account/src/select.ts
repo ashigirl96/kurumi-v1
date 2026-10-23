@@ -95,10 +95,6 @@ export function selectAccount(
   return { ok: false, refusal: { code: 'account_ambiguous', service, granted: granted() } }
 }
 
-/**
- * The selector a container holds when it should get whatever account its group chooses at request time. It is the
- * vendor id alone, which no Account Handle can be because a handle always has a non-empty `/<label>`.
- */
 export function groupSelector(vendor: VendorId): string {
   return selectorShapeOf(vendor).format(vendor)
 }
