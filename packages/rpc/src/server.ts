@@ -53,9 +53,11 @@ export function targetGroup(caller: Caller, requested: string | undefined): stri
   return requested
 }
 
+export function transaction(db: Db, callback: (tx: Tx) => undefined): undefined
 export function transaction<T>(
   db: Db,
-  callback: (tx: Tx) => T & (Extract<T, PromiseLike<unknown>> extends never ? unknown : never),
-): T {
+  callback: (tx: Tx) => T & (void extends T ? never : { then?: never } | null | undefined),
+): T
+export function transaction(db: Db, callback: (tx: Tx) => unknown): unknown {
   return db.transaction(callback)
 }

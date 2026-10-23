@@ -191,6 +191,11 @@ test('TypeScript rejects Promise returns through inline, imported, block, functi
     )
     const rejected = {
       'inline.ts': 'transaction(db, async () => 1)',
+      'explicit-void.ts': 'transaction<void>(db, async () => { await write() })',
+      'explicit-object.ts': 'transaction<object>(db, async () => 1)',
+      'explicit-empty-object.ts': 'transaction<{}>(db, async () => 1)',
+      'explicit-unknown.ts': 'transaction<unknown>(db, async () => 1)',
+      'explicit-void-function.ts': 'transaction<(tx: unknown) => void>(db, async () => {})',
       'block.ts': 'transaction(db, () => { return write() })',
       'function.ts': 'transaction(db, function () { return write() })',
       'imported.ts': 'transaction(db, write)',
@@ -227,7 +232,9 @@ test('TypeScript rejects Promise returns through inline, imported, block, functi
     expect(diagnostics.map((match) => match[1] ?? '').toSorted()).toEqual(
       Object.keys(rejected).toSorted(),
     )
-    expect(diagnostics.every((match) => match[2] === '2345' || match[2] === '2322')).toBe(true)
+    expect(diagnostics.every((match) => ['2345', '2322', '2769'].includes(match[2] ?? ''))).toBe(
+      true,
+    )
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
