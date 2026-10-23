@@ -15,6 +15,7 @@ import {
   isInterceptedHost,
   router as accountRouter,
   storedAccounts,
+  VaultError,
 } from '@kurumi/account/server'
 import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
@@ -121,6 +122,12 @@ export async function startHost(config: HostConfig) {
       db,
       vaultKey,
       log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
+    }).catch((error: unknown) => {
+      if (!(error instanceof VaultError)) throw error
+      throw new Error(
+        `${join(config.home, 'vault.key')} did not seal the gateway CA that kurumi.db holds. Restore the vault.key that sealed it from your backup; kurumi does not replace the CA under this key, because the accounts sealed with the original key would stay unreadable.`,
+        { cause: error },
+      )
     })
     const caBundle = stageCaBundle(config.home, ca.certPem)
     const runner = join(config.home, 'runner/runner.js')

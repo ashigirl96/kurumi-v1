@@ -229,6 +229,22 @@ test('a killed host leaves a lock and socket that a new host can recover', async
   expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
 }, 5000)
 
+test('a vault key that did not seal the gateway CA stops the host and names the backup to restore', async () => {
+  const home = homeForTest()
+  const first = spawnHost(home)
+  await waitForHost(home, first)
+  first.kill('SIGTERM')
+  expect(await first.exited).toBe(0)
+  writeFileSync(join(home, 'vault.key'), randomBytes(32), { mode: 0o600 })
+
+  const second = spawnHost(home)
+  expect(await second.exited).toBe(1)
+  const stderr = await new Response(second.stderr).text()
+  expect(stderr).toContain(join(home, 'vault.key'))
+  expect(stderr).toContain('did not seal the gateway CA')
+  expect(stderr).toContain('Restore the vault.key that sealed it from your backup')
+}, 5000)
+
 test('diagnostic SQL reads a WAL snapshot without writing rows or changing the host connection', () => {
   const home = homeForTest()
   const db = openKurumiDb(join(home, 'kurumi.db'))
