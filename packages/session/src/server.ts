@@ -25,11 +25,17 @@ import {
   type StateKeyInput,
   type StatePutInput,
 } from './contract.ts'
-import type { ContainerDriver, ContainerSpec } from './driver/docker.ts'
+import type { ContainerDriver, ContainerInventory, ContainerSpec } from './driver/docker.ts'
+import {
+  createLiveness,
+  createSupervisor,
+  type ContainerRow,
+  type SupervisionLog,
+} from './reconcile.ts'
 import { container, inboundMessage, outboundMessage, session, sessionState } from './schema.ts'
 
 export { createDockerDriver } from './driver/docker.ts'
-export type { ContainerDriver, ContainerSpec } from './driver/docker.ts'
+export type { ContainerDriver, ContainerInventory, ContainerSpec } from './driver/docker.ts'
 export { migrations } from '../migrations/index.ts'
 export type { AgentPrincipal, SessionId } from './contract.ts'
 
@@ -47,13 +53,18 @@ export type Admission =
       since: Date
     }
 export type SessionRuntime = {
-  driver: ContainerDriver
   image: string
   egress: {
     admission(): Admission
     contribution(input: { agentGroupId: string; sessionToken: string }): ContainerEgress
   }
-}
+} & (
+  | { driver: ContainerDriver; supervision?: undefined }
+  | {
+      driver: ContainerDriver & ContainerInventory
+      supervision: { staleAfterMs: number; intervalMs: number }
+    }
+)
 export type InboundLog = {
   kind: 'session.inbound.received' | 'session.inbound.committed'
   inboundId: string
@@ -75,9 +86,19 @@ export type RuntimeLog =
       monotonicMs: number
     }
   | { kind: 'session.cleanup.failed'; sessionId: string; containerId: string; monotonicMs: number }
+  | {
+      kind: 'session.container.reaped'
+      sessionId: string
+      containerId: string
+      name: string | null
+      reason: string
+      monotonicMs: number
+    }
+  | SupervisionLog
 type OutboundInput = { id: string; sessionId: string; text: string; inReplyTo?: string }
 export type SessionLedger = {
   start(): Promise<void>
+  adopted(): Promise<void>
   stop(): Promise<void>
   routeInbound(event: InboundEvent): Promise<InboundReceipt>
   postOutbound(input: OutboundInput): Promise<void>
@@ -126,6 +147,10 @@ export function createSessionLedger({
   const pulls = new Set<Promise<{ messages: Inbound[] }>>()
   const waiters = new Map<string, Set<() => void>>()
   const retries = new Map<string, { attempt: number; due: number }>()
+  const liveness = createLiveness({ maxStepMs: 3 * (runtime?.supervision?.intervalMs ?? Infinity) })
+  const supervision = runtime?.supervision
+    ? { inventory: runtime.driver, ...runtime.supervision }
+    : undefined
   let timer: ReturnType<typeof setInterval> | undefined
   let enabled = false
   let stopped = false
@@ -135,7 +160,8 @@ export function createSessionLedger({
     for (const notify of waiters.get(id) ?? []) notify()
   }
 
-  function authorize(tx: Tx, principal: AgentPrincipal) {
+  function authorize(tx: Tx, principal: AgentPrincipal, { arrival = true } = {}) {
+    if (stopped) throw new ORPCError('SERVICE_UNAVAILABLE', { message: 'host is stopping' })
     const row = tx
       .select({ id: container.id })
       .from(container)
@@ -150,11 +176,13 @@ export function createSessionLedger({
         ),
       )
       .get()
-    if (stopped || !row)
+    if (!row)
       throw new ORPCError('UNAUTHORIZED', { message: 'container incarnation is no longer active' })
+    if (arrival) liveness.touch(principal.containerId)
   }
 
   function retire(id: string) {
+    liveness.end(id)
     const retired = transaction(db, (tx) => {
       const row = tx.select().from(container).where(eq(container.id, id)).get()
       if (!row || row.status === 'stopping') return null
@@ -185,6 +213,7 @@ export function createSessionLedger({
       })
       wake(retired.sessionId)
     }
+    return retired
   }
 
   function cleanup(id: string): Promise<void> {
@@ -203,10 +232,23 @@ export function createSessionLedger({
     return task
   }
 
-  const unsubscribe = runtime?.driver.onExit((id) => {
-    if (stopped) return
-    retire(id)
+  function reap(id: string, reason: string, name: string | null) {
+    const retired = retire(id)
+    if (retired)
+      runtimeLog?.({
+        kind: 'session.container.reaped',
+        sessionId: retired.sessionId,
+        containerId: id,
+        name,
+        reason,
+        monotonicMs: performance.now(),
+      })
     void cleanup(id).catch(() => {})
+  }
+
+  const unsubscribe = runtime?.driver.onExit((id, code) => {
+    if (stopped) return
+    reap(id, `exited with code ${code}`, supervision?.inventory.nameOf(id) ?? null)
   })
 
   async function reconcileSession(id: string) {
@@ -259,6 +301,7 @@ export function createSessionLedger({
         })
         .run()
     })
+    liveness.begin(containerId)
     try {
       const egress = runtime.egress.contribution({ agentGroupId: agent.id, sessionToken: token })
       const result = await runtime.driver.run({
@@ -273,7 +316,8 @@ export function createSessionLedger({
         network: egress.network,
         limits: { cpus: 1, memoryMb: 1024, pids: 256 },
       })
-      if (result.ok && !stopped) {
+      if (result.ok) {
+        liveness.touch(containerId)
         transaction(db, (tx) => {
           tx.update(container)
             .set({ status: 'running' })
@@ -307,6 +351,53 @@ export function createSessionLedger({
     }
   }
 
+  function containerRows(nameOf: (containerId: string) => string): ContainerRow[] {
+    return db
+      .select({
+        id: container.id,
+        sessionId: container.sessionId,
+        status: container.status,
+        sessionStatus: session.status,
+      })
+      .from(container)
+      .innerJoin(session, eq(session.id, container.sessionId))
+      .all()
+      .map((row) => ({
+        id: row.id,
+        name: nameOf(row.id),
+        sessionId: row.sessionId,
+        status: row.status,
+        sessionActive: row.sessionStatus === 'active',
+        liveness: liveness.view(row.id),
+      }))
+  }
+
+  const supervisor =
+    supervision &&
+    createSupervisor({
+      ...supervision,
+      rows: () => containerRows((id) => supervision.inventory.nameOf(id)),
+      accept(row) {
+        const deadline = transaction(db, (tx) => {
+          tx.update(container)
+            .set({ status: 'running' })
+            .where(
+              and(eq(container.id, row.id), inArray(container.status, ['starting', 'running'])),
+            )
+            .run()
+          return tx
+            .select({ at: container.toolDeadlineAt })
+            .from(container)
+            .where(eq(container.id, row.id))
+            .get()?.at
+        })
+        const toolMs = (deadline?.getTime() ?? 0) - Date.now()
+        liveness.begin(row.id, toolMs > 0 ? toolMs : null)
+      },
+      reap,
+      log: (entry) => runtimeLog?.(entry),
+    })
+
   async function pull(
     principal: AgentPrincipal,
     input: PullInput,
@@ -314,7 +405,7 @@ export function createSessionLedger({
   ): Promise<{ messages: Inbound[] }> {
     const { waitMs } = parse(pullInput, input)
     const deadline = performance.now() + waitMs
-    while (true) {
+    for (let arrival = true; ; arrival = false) {
       const notification = Promise.withResolvers<void>()
       const notify = () => notification.resolve()
       const listeners = waiters.get(principal.sessionId) ?? new Set<() => void>()
@@ -324,7 +415,7 @@ export function createSessionLedger({
       let timeout: ReturnType<typeof setTimeout> | undefined
       try {
         const messages = transaction(db, (tx) => {
-          authorize(tx, principal)
+          authorize(tx, principal, { arrival })
           signal?.throwIfAborted()
           const row = tx
             .select()
@@ -474,40 +565,26 @@ export function createSessionLedger({
       if (stopped) throw new Error('session ledger stopped')
       if (enabled) return
       enabled = true
+      await supervisor?.start()
+      if (stopped) return
       timer = setInterval(tick, 100)
       timer.unref()
       tick()
     },
+    adopted: () => supervisor?.adopted ?? Promise.resolve(),
     stop() {
       if (stopping) return stopping
       stopped = true
-      if (timer !== undefined) clearInterval(timer)
+      clearInterval(timer)
       unsubscribe?.()
       for (const id of waiters.keys()) wake(id)
-      for (const row of db.select().from(container).all()) retire(row.id)
-      stopping = (async () => {
-        await Promise.allSettled(
-          db
-            .select()
-            .from(container)
-            .all()
-            .map((row) => cleanup(row.id)),
-        )
-        await Promise.allSettled([...spawning.values(), ...deliveries.values(), ...pulls])
-        const remaining = await Promise.allSettled(
-          db
-            .select()
-            .from(container)
-            .all()
-            .map((row) => cleanup(row.id)),
-        )
-        const failures = remaining.filter((result) => result.status === 'rejected')
-        if (failures.length)
-          throw new AggregateError(
-            failures.map((result) => result.reason),
-            'session cleanup failed',
-          )
-      })()
+      stopping = Promise.allSettled([
+        supervisor?.stop(),
+        ...spawning.values(),
+        ...cleanups.values(),
+        ...deliveries.values(),
+        ...pulls,
+      ]).then(() => {})
       return stopping
     },
     async routeInbound(event) {
@@ -585,7 +662,6 @@ export function createSessionLedger({
       return accepted.receipt
     },
     authenticate(token) {
-      if (stopped) return null
       const row = db
         .select({
           containerId: container.id,
@@ -602,7 +678,7 @@ export function createSessionLedger({
           ),
         )
         .get()
-      return row
+      return row && liveness.has(row.containerId)
         ? { ...row, sessionId: sessionId.parse(row.sessionId), __brand: 'AgentPrincipal' }
         : null
     },
@@ -660,6 +736,7 @@ export function createSessionLedger({
         transaction(db, (tx) => {
           authorize(tx, principal)
           const now = new Date()
+          liveness.declareTool(principal.containerId, heartbeat.toolTimeoutMs)
           tx.update(container)
             .set({
               lastSeenAt: now,

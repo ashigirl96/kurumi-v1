@@ -1,6 +1,7 @@
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
+import { promisify } from 'node:util'
 
 export type ContainerSpec = {
   sessionId: string
@@ -18,16 +19,40 @@ export type ContainerDriver = {
   onExit(listener: (containerId: string, code: number) => void): () => void
 }
 
+export type ListedContainer = {
+  dockerId: string
+  name: string
+  role: 'agent' | 'probe' | null
+  sessionId: string | null
+  containerId: string | null
+  revision: string | null
+  state: string
+}
+export type InventoryChange =
+  | { kind: 'subscribed'; attempt: number }
+  | { kind: 'lost'; code: number | null; retryMs: number }
+  | { kind: 'event' }
+export type ContainerInventory = {
+  sweep(): Promise<ListedContainer[]>
+  adopt(container: ListedContainer): RunResult
+  remove(container: ListedContainer): Promise<void>
+  nameOf(containerId: string): string
+  watch(listener: (change: InventoryChange) => void): () => void
+}
+
 type RunResult = Awaited<ReturnType<ContainerDriver['run']>>
 type Creation = {
   result: Promise<CliResult>
   state: 'pending' | 'settled' | 'unconfirmed'
+  endedAt: number | undefined
   cancel(): void
 }
+type Address = { by: 'name' | 'id'; value: string }
 type AgentContainer = {
   sessionId: string
   containerId: string
   name: string
+  address: Address
   ownership: 'uncertain' | 'confirmed' | 'absent'
   phase: 'starting' | 'running' | 'stopping' | 'failed'
   create: Creation | undefined
@@ -37,14 +62,15 @@ type AgentContainer = {
   emitted: boolean
 }
 type AgentOperation = AgentContainer & {
-  spec: ContainerSpec
   pending: Promise<RunResult>
   watch: Promise<void> | undefined
 }
 
 export type CliResult = { code: number | null; stdout: string; stderr: string }
 export type CliProcess = { result: Promise<CliResult>; kill(): void }
-export type Cli = { start(args: readonly string[]): CliProcess }
+export type Cli = {
+  start(args: readonly string[], options?: { onLine?: (line: string) => void }): CliProcess
+}
 
 const outputLimit = 64 * 1024
 const diagnosticLimit = 16 * 1024
@@ -54,7 +80,7 @@ class CleanupError extends Error {
 }
 
 const nativeCli: Cli = {
-  start(args) {
+  start(args, options = {}) {
     // A signal to the host's process group must not end a create the daemon would still finish.
     const child = spawn('docker', [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     const stdout: Buffer[] = []
@@ -62,16 +88,31 @@ const nativeCli: Cli = {
     let stdoutBytes = 0
     let stderrBytes = 0
     let failure: Error | undefined
+    const overflow = () => {
+      failure ??= new Error(`stdout exceeds ${outputLimit} bytes`)
+      child.kill('SIGKILL')
+    }
+    const { onLine } = options
     const result = new Promise<CliResult>((resolve, reject) => {
-      child.stdout.on('data', (chunk: Buffer) => {
-        if (stdoutBytes + chunk.length > outputLimit) {
-          failure ??= new Error(`stdout exceeds ${outputLimit} bytes`)
-          child.kill('SIGKILL')
-          return
-        }
-        stdoutBytes += chunk.length
-        stdout.push(chunk)
-      })
+      if (onLine) {
+        let partial = ''
+        child.stdout.setEncoding('utf8')
+        child.stdout.on('data', (chunk: string) => {
+          const lines = (partial + chunk).split('\n')
+          partial = lines.pop() ?? ''
+          if (partial.length > outputLimit) overflow()
+          for (const line of lines) onLine(line)
+        })
+      } else {
+        child.stdout.on('data', (chunk: Buffer) => {
+          if (stdoutBytes + chunk.length > outputLimit) {
+            overflow()
+            return
+          }
+          stdoutBytes += chunk.length
+          stdout.push(chunk)
+        })
+      }
       child.stderr.on('data', (chunk: Buffer) => {
         const remaining = diagnosticLimit - stderrBytes
         if (remaining <= 0) return
@@ -102,7 +143,55 @@ const nativeCli: Cli = {
 }
 
 function endedBySignal(exit: CliResult): boolean {
-  return exit.code === null || exit.code > 128
+  // The docker CLI is a Go program, and Go's runtime exits 2 on SIGQUIT and SIGABRT.
+  return exit.code === null || exit.code > 128 || exit.code === 2
+}
+
+async function endForeignWaits(names: ReadonlySet<string>): Promise<void> {
+  const { stdout } = await promisify(execFile)('ps', ['-e', '-o', 'pid=,ppid=,command='], {
+    maxBuffer: 8 * 1024 * 1024,
+  }).catch(() => ({ stdout: '' }))
+  for (const line of stdout.split('\n')) {
+    const [, pid, ppid, command = ''] = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line) ?? []
+    const waited = /(?:^|[\s/])docker wait (\S+)\s*$/.exec(command)?.[1]
+    if (!waited || !names.has(waited) || Number(ppid) === process.pid) continue
+    try {
+      process.kill(Number(pid), 'SIGTERM')
+    } catch {}
+  }
+}
+
+// Each field goes through json so that a label value cannot end its line, and .Labels is left out
+// because it joins labels with commas that a value can also contain.
+const listingFormat =
+  '[{{json .ID}},{{json .Names}},{{json .State}},{{json (.Label "kurumi.role")}},{{json (.Label "kurumi.session")}},{{json (.Label "kurumi.container")}},{{json (.Label "kurumi.revision")}}]'
+
+function parseListing(line: string): ListedContainer | null {
+  let fields: unknown
+  try {
+    fields = JSON.parse(line)
+  } catch {
+    return null
+  }
+  if (
+    !Array.isArray(fields) ||
+    fields.length !== 7 ||
+    !fields.every((field): field is string => typeof field === 'string')
+  )
+    return null
+  const [dockerId = '', names = '', state = '', role, sessionId, containerId, revision] = fields
+  // With --no-trunc, .Names also lists the "<linker>/<alias>" names of legacy links.
+  const [name, ...others] = names.split(',').filter((entry) => !entry.includes('/'))
+  if (!/^[0-9a-f]{64}$/.test(dockerId) || !name || others.length > 0) return null
+  return {
+    dockerId,
+    name,
+    role: role === 'agent' || role === 'probe' ? role : null,
+    sessionId: sessionId || null,
+    containerId: containerId || null,
+    revision: revision || null,
+    state,
+  }
 }
 
 function fetchProgram(timeoutMs: number): string {
@@ -122,15 +211,19 @@ await Bun.write(Bun.stdout, Buffer.concat(chunks));
 
 export function createDockerDriver(options: {
   install: string
+  revision?: string
   image: string
   network?: string
   timeoutMs?: number
   cli?: Cli
-}): ContainerDriver & {
-  probe(url: string, options?: { signal?: AbortSignal }): Promise<string>
-  stop(): Promise<void>
-} {
+}): ContainerDriver &
+  ContainerInventory & {
+    probe(url: string, options?: { signal?: AbortSignal }): Promise<string>
+    stop(): Promise<void>
+    detach(): Promise<void>
+  } {
   const cli = options.cli ?? nativeCli
+  const revision = options.revision ?? null
   const timeoutMs = options.timeoutMs ?? 10_000
   const error = (message: string, cause?: unknown) =>
     new Error(`Docker (${options.image}): ${message}`, { cause })
@@ -151,6 +244,7 @@ export function createDockerDriver(options: {
     let timer: ReturnType<typeof setTimeout> | undefined
     const create: Creation = {
       state: 'pending',
+      endedAt: undefined,
       result: Promise.race([proc.result, deadline.promise])
         .then((exit) => {
           if (create.state === 'pending' && endedBySignal(exit)) create.state = 'unconfirmed'
@@ -173,6 +267,10 @@ export function createDockerDriver(options: {
         }, timeoutMs)
       },
     }
+    const ended = () => {
+      create.endedAt ??= performance.now()
+    }
+    void proc.result.then(ended, ended)
     return create
   }
 
@@ -286,9 +384,34 @@ export function createDockerDriver(options: {
   const residue = new Map<string, AgentContainer>()
   const work = new Set<Promise<unknown>>()
   const listeners = new Set<(containerId: string, code: number) => void>()
+  let watcher: ((change: InventoryChange) => void) | undefined
   const shutdown = new AbortController()
   const commands = new Set<CliProcess>()
+  const detached = new Set<AgentContainer>()
+  const adoptedWaits = new Set<string>()
+  let waitScan: Promise<void> | undefined
   let stopping: Promise<void> | undefined
+
+  function record(
+    identity: Pick<AgentContainer, 'sessionId' | 'containerId' | 'name' | 'ownership' | 'phase'>,
+    address: Address = { by: 'name', value: identity.name },
+  ): AgentOperation {
+    return {
+      ...identity,
+      address,
+      create: undefined,
+      processes: new Set(),
+      removal: undefined,
+      cancelled: false,
+      emitted: false,
+      pending: Promise.resolve({ ok: false, reason: 'not started' }),
+      watch: undefined,
+    }
+  }
+
+  function agentName(containerId: string): string {
+    return `kurumi-agent-${createHash('sha256').update(options.install).update('\0').update(containerId).digest('hex').slice(0, 32)}`
+  }
 
   async function agentCommand(
     args: readonly string[],
@@ -300,6 +423,8 @@ export function createDockerDriver(options: {
     } catch {
       throw error(`${args[0]} failed`)
     }
+    const lastsWithContainer = args[0] === 'wait' || args[0] === 'create'
+    const deadline = lastsWithContainer ? undefined : setTimeout(() => proc.kill(), timeoutMs)
     const tracked = operation?.processes ?? commands
     const create = args[0] === 'create' && operation ? settleCreate(proc) : undefined
     if (create && operation) operation.create = create
@@ -312,6 +437,7 @@ export function createDockerDriver(options: {
     } catch {
       throw error(`${args[0]} failed`)
     } finally {
+      clearTimeout(deadline)
       tracked.delete(proc)
     }
   }
@@ -339,7 +465,7 @@ export function createDockerDriver(options: {
         let removed = false
         let removing = false
         try {
-          const exit = await agentCommand(['rm', '--force', agent.name], agent)
+          const exit = await agentCommand(['rm', '--force', agent.address.value], agent)
           removing =
             exit.code !== 0 &&
             /^(?:Error response from daemon: )?removal (?:of container [^\r\n]+ is )?already in progress\s*$/.test(
@@ -347,7 +473,7 @@ export function createDockerDriver(options: {
             )
           removed =
             (exit.code === 0 &&
-              (agent.ownership !== 'uncertain' || exit.stdout.trim() === agent.name)) ||
+              (agent.ownership !== 'uncertain' || exit.stdout.trim() === agent.address.value)) ||
             (exit.code !== 0 &&
               /^(?:Error response from daemon: )?No such container(?:: [^\r\n]+)?\s*$/.test(
                 exit.stderr,
@@ -357,9 +483,11 @@ export function createDockerDriver(options: {
         }
         if (!removed) {
           const deadline = performance.now() + timeoutMs
+          const { by, value } = agent.address
+          const filter = by === 'id' ? `id=${value}` : `name=^/${value}$`
           while (true) {
             const exit = await agentCommand(
-              ['ps', '-a', '--filter', `name=^/${agent.name}$`, '--format', '{{.Names}}'],
+              ['ps', '-a', '--filter', filter, '--format', '{{.Names}}'],
               agent,
             )
             const names = requireSuccess(exit, 'confirm removal')
@@ -371,7 +499,7 @@ export function createDockerDriver(options: {
         }
         agent.ownership = 'absent'
         if (agents.get(agent.sessionId) === agent) agents.delete(agent.sessionId)
-        residue.delete(agent.name)
+        if (agent.address.by === 'id') residue.delete(agent.address.value)
       })
       .catch((cause: unknown) => {
         agent.phase = 'failed'
@@ -404,17 +532,17 @@ export function createDockerDriver(options: {
     } catch {
       code = -1
     }
+    if (detached.has(agent)) return
     emitExit(agent, code)
     try {
       await removeAgent(agent)
     } catch {}
   }
 
-  async function startAgent(agent: AgentOperation): Promise<RunResult> {
+  async function startAgent(agent: AgentOperation, spec: ContainerSpec): Promise<RunResult> {
     try {
       if (agent.cancelled || shutdown.signal.aborted)
         return { ok: false, reason: error('run cancelled').message }
-      const spec = agent.spec
       const exit = await agentCommand(
         [
           'create',
@@ -428,6 +556,7 @@ export function createDockerDriver(options: {
           'kurumi.role=agent',
           '--label',
           `kurumi.container=${spec.containerId}`,
+          ...(revision === null ? [] : ['--label', `kurumi.revision=${revision}`]),
           '--init',
           '--cap-drop=ALL',
           '--security-opt',
@@ -562,6 +691,151 @@ export function createDockerDriver(options: {
     })
   }
 
+  async function listContainers(filters: readonly string[]): Promise<ListedContainer[]> {
+    const exit = await agentCommand([
+      'ps',
+      '-a',
+      '--no-trunc',
+      ...filters.flatMap((filter) => ['--filter', filter]),
+      '--format',
+      listingFormat,
+    ])
+    return requireSuccess(exit, 'list')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        const container = parseListing(line)
+        if (!container) throw error('invalid container listing')
+        return container
+      })
+  }
+
+  function removeListed(container: ListedContainer, containerId: string): Promise<void> {
+    const { dockerId, name } = container
+    const listed = residue.get(dockerId) ?? {
+      ...record(
+        { sessionId: '', containerId, name, ownership: 'confirmed', phase: 'stopping' },
+        { by: 'id', value: dockerId },
+      ),
+      cancelled: true,
+    }
+    residue.set(dockerId, listed)
+    return removeAgent(listed)
+  }
+
+  const eventWindowMs = 60_000
+  let subscription: CliProcess | undefined
+  let resubscribe: ReturnType<typeof setTimeout> | undefined
+  let losses = 0
+  let announced = false
+  let since: number | undefined
+
+  function subscribe(): void {
+    resubscribe = undefined
+    if (shutdown.signal.aborted || !watcher) return
+    const startedAt = Date.now()
+    const began = performance.now()
+    let proc: CliProcess
+    try {
+      proc = cli.start(
+        [
+          'events',
+          ...[
+            `label=kurumi.install=${options.install}`,
+            'type=container',
+            'event=create',
+            'event=die',
+            'event=destroy',
+          ].flatMap((filter) => ['--filter', filter]),
+          ...(since === undefined ? [] : ['--since', (since / 1000).toFixed(3)]),
+          '--until',
+          ((startedAt + eventWindowMs) / 1000).toFixed(3),
+          '--format',
+          '{{.Action}}',
+        ],
+        {
+          onLine(line) {
+            if (line.trim()) watcher?.({ kind: 'event' })
+          },
+        },
+      )
+    } catch {
+      lost(null, began)
+      return
+    }
+    subscription = proc
+    const attempt = losses
+    const confirmation = setTimeout(() => {
+      if (subscription !== proc || (announced && attempt === 0)) return
+      announced = true
+      watcher?.({ kind: 'subscribed', attempt })
+    }, 1_000)
+    confirmation.unref()
+    void proc.result
+      .then(
+        (exit) => exit.code,
+        () => null,
+      )
+      .then((code) => {
+        clearTimeout(confirmation)
+        if (subscription !== proc) return
+        subscription = undefined
+        if (shutdown.signal.aborted || !watcher) return
+        const ran = performance.now() - began >= 1_000
+        if (ran) since = startedAt - 1_000
+        if (code === 0 && ran) {
+          losses = 0
+          subscribe()
+        } else lost(code, began)
+      })
+      .catch(() => {})
+  }
+
+  function lost(code: number | null, began: number): void {
+    losses = performance.now() - began >= 10_000 ? 1 : losses + 1
+    const retryMs = Math.min(30_000, 1_000 * 2 ** Math.min(losses - 1, 5))
+    watcher?.({ kind: 'lost', code, retryMs })
+    resubscribe = setTimeout(subscribe, retryMs)
+    resubscribe.unref()
+  }
+
+  function endWatch(): void {
+    clearTimeout(resubscribe)
+    resubscribe = undefined
+    if (subscription) void track(subscription.result).catch(() => {})
+    subscription?.kill()
+    announced = false
+    losses = 0
+  }
+
+  function close({ keepRunning }: { keepRunning: boolean }): Promise<void> {
+    if (stopping) return stopping
+    shutdown.abort()
+    endWatch()
+    for (const proc of commands) proc.kill()
+    if (keepRunning)
+      for (const agent of agents.values())
+        if (agent.phase === 'running') {
+          detached.add(agent)
+          for (const proc of agent.processes) proc.kill()
+        }
+    const removals = [...agents.values(), ...residue.values()]
+      .filter((agent) => !detached.has(agent))
+      .map((agent) => removeAgent(agent))
+    const watches = [...agents.values()].map((agent) => agent.watch)
+    stopping = Promise.allSettled([
+      ...removals,
+      ...watches,
+      ...work,
+      ...[...commands].map((proc) => proc.result),
+    ]).then(async () => {
+      await cleanup()
+      if ([...agents.values()].some((agent) => !detached.has(agent)) || residue.size > 0 || owned)
+        throw error('shutdown cleanup unconfirmed')
+    })
+    return stopping
+  }
+
   return {
     run(spec) {
       if (shutdown.signal.aborted)
@@ -580,21 +854,13 @@ export function createDockerDriver(options: {
           ok: false,
           reason: error('container id belongs to another session').message,
         })
-      const agent: AgentOperation = {
-        spec,
+      const agent = record({
         sessionId: spec.sessionId,
         containerId: spec.containerId,
-        name: `kurumi-agent-${createHash('sha256').update(options.install).update('\0').update(spec.containerId).digest('hex').slice(0, 32)}`,
+        name: agentName(spec.containerId),
         ownership: 'uncertain',
         phase: 'starting',
-        create: undefined,
-        processes: new Set(),
-        pending: Promise.resolve({ ok: false, reason: 'not started' }),
-        removal: undefined,
-        watch: undefined,
-        cancelled: false,
-        emitted: false,
-      }
+      })
       if (existing) {
         const removal = removeAgent(existing)
         existing.phase = 'starting'
@@ -605,7 +871,7 @@ export function createDockerDriver(options: {
               if (shutdown.signal.aborted || agent.cancelled)
                 return { ok: false, reason: error('run cancelled').message } satisfies RunResult
               agents.set(spec.sessionId, agent)
-              return startAgent(agent)
+              return startAgent(agent, spec)
             },
             () => ({ ok: false, reason: error('agent cleanup unconfirmed').message }),
           )
@@ -615,7 +881,7 @@ export function createDockerDriver(options: {
         existing.pending = agent.pending
       } else {
         agents.set(spec.sessionId, agent)
-        agent.pending = Promise.resolve().then(() => startAgent(agent))
+        agent.pending = Promise.resolve().then(() => startAgent(agent, spec))
       }
       return track(agent.pending)
     },
@@ -654,37 +920,71 @@ export function createDockerDriver(options: {
             await agent.watch
             return
           }
-          const exit = await agentCommand([
-            'ps',
-            '-a',
-            '--filter',
+          const listed = await listContainers([
             `label=kurumi.install=${options.install}`,
-            '--filter',
             'label=kurumi.role=agent',
-            '--filter',
             `label=kurumi.container=${containerId}`,
-            '--format',
-            '{{.Names}}',
           ])
-          const names = requireSuccess(exit, 'list').trim().split('\n').filter(Boolean)
-          for (const name of names) {
-            const adopted: AgentContainer = residue.get(name) ?? {
-              sessionId: '',
-              containerId,
-              name,
-              ownership: 'confirmed',
-              phase: 'stopping',
-              create: undefined,
-              processes: new Set(),
-              removal: undefined,
-              cancelled: true,
-              emitted: false,
-            }
-            residue.set(name, adopted)
-            await removeAgent(adopted)
-          }
+          for (const container of listed) await removeListed(container, containerId)
         })(),
       )
+    },
+    sweep() {
+      if (shutdown.signal.aborted) return Promise.reject(error('driver stopped'))
+      return track(
+        (async () => {
+          const listedAt = performance.now()
+          const listed = await listContainers([`label=kurumi.install=${options.install}`])
+          const tracked = [...agents.values(), ...replacements.values(), ...residue.values()]
+          for (const create of [owned?.create, ...tracked.map((agent) => agent.create)])
+            if (create?.state === 'unconfirmed' && (create.endedAt ?? Infinity) <= listedAt)
+              create.state = 'settled'
+          return listed.filter(
+            ({ name, dockerId }) =>
+              name !== owned?.name && residue.get(dockerId)?.removal === undefined,
+          )
+        })(),
+      )
+    },
+    adopt(container) {
+      const { name, sessionId, containerId } = container
+      if (shutdown.signal.aborted) return { ok: false, reason: error('driver stopped').message }
+      if (sessionId === null || containerId === null || name !== agentName(containerId))
+        return { ok: false, reason: error('container name does not match its labels').message }
+      if (container.revision !== revision)
+        return { ok: false, reason: error('container was created for another runtime').message }
+      if (agents.has(sessionId))
+        return { ok: false, reason: error('session already has a container').message }
+      const agent = {
+        ...record({ sessionId, containerId, name, ownership: 'confirmed', phase: 'running' }),
+        pending: Promise.resolve<RunResult>({ ok: true }),
+      }
+      agents.set(sessionId, agent)
+      agent.watch = watchAgent(agent)
+      adoptedWaits.add(name)
+      waitScan ??= track(
+        Promise.resolve().then(() => {
+          const names = new Set(adoptedWaits)
+          adoptedWaits.clear()
+          waitScan = undefined
+          return endForeignWaits(names)
+        }),
+      ).catch(() => {})
+      return { ok: true }
+    },
+    remove(container) {
+      if (shutdown.signal.aborted) return Promise.reject(error('driver stopped'))
+      return track(removeListed(container, ''))
+    },
+    nameOf: agentName,
+    watch(listener) {
+      if (watcher) throw error('the inventory already has a watcher')
+      watcher = listener
+      subscribe()
+      return () => {
+        watcher = undefined
+        endWatch()
+      }
     },
     list() {
       if (shutdown.signal.aborted) return Promise.reject(error('driver stopped'))
@@ -727,24 +1027,7 @@ export function createDockerDriver(options: {
         }),
       )
     },
-    stop() {
-      if (stopping) return stopping
-      shutdown.abort()
-      for (const proc of commands) proc.kill()
-      const containers = [...agents.values(), ...residue.values()]
-      const removals = containers.map((agent) => removeAgent(agent))
-      const watches = [...agents.values()].map((agent) => agent.watch)
-      stopping = Promise.allSettled([
-        ...removals,
-        ...watches,
-        ...work,
-        ...[...commands].map((proc) => proc.result),
-      ]).then(async () => {
-        await cleanup()
-        if (agents.size > 0 || residue.size > 0 || owned)
-          throw error('shutdown cleanup unconfirmed')
-      })
-      return stopping
-    },
+    stop: () => close({ keepRunning: false }),
+    detach: () => close({ keepRunning: true }),
   }
 }

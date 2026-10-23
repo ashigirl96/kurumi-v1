@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto'
-import { chmodSync, lstatSync, mkdirSync, realpathSync, rmSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs'
 import { join } from 'node:path'
 
 import { createAccountLedger } from '@kurumi/account/server'
@@ -13,6 +21,7 @@ import {
   createSessionLedger,
   router as sessionRouter,
   type AgentPrincipal,
+  type ContainerEgress,
 } from '@kurumi/session/server'
 import { implement, ORPCError } from '@orpc/server'
 import { RPCHandler } from '@orpc/server/node'
@@ -30,6 +39,9 @@ export const initialGuard: Guard = ({ caller, meta }) =>
     : { kind: 'deny', reason: 'This procedure is not available to agents' }
 
 export async function startHost(config: HostConfig) {
+  process.stdout.write(
+    `${JSON.stringify({ kind: 'host.start', pid: process.pid, timeOrigin: performance.timeOrigin, monotonicMs: performance.now() })}\n`,
+  )
   mkdirSync(config.home, { recursive: true, mode: 0o700 })
   chmodSync(config.home, 0o700)
   const releaseLock = acquireLock(join(config.home, 'kurumi.lock'))
@@ -48,7 +60,7 @@ export async function startHost(config: HostConfig) {
       const results = await Promise.allSettled([
         sessions?.stop(),
         admission?.stop(),
-        driver?.stop(),
+        driver?.detach(),
         listener?.stop(true),
       ])
       try {
@@ -65,19 +77,44 @@ export async function startHost(config: HostConfig) {
     return stopped
   }
   try {
+    const milliseconds = z.coerce.number().int().max(2_147_483_647)
     const environment = z
       .object({
         KURUMI_AGENT_IMAGE: z.string().min(1).default('kurumi-agent:latest'),
         KURUMI_PROBE_IMAGE: z.string().min(1).optional(),
         KURUMI_DOCKER_NETWORK: z.string().min(1).default('bridge'),
+        KURUMI_STALE_AFTER_MS: milliseconds.min(30_000).default(1_800_000),
+        KURUMI_RECONCILE_INTERVAL_MS: milliseconds.min(100).optional(),
       })
       .parse(process.env)
+    const staleAfterMs = environment.KURUMI_STALE_AFTER_MS
+    const intervalMs =
+      environment.KURUMI_RECONCILE_INTERVAL_MS ??
+      Math.min(10_000, Math.floor((staleAfterMs - 26_000) / 3))
+    if (25_000 + 3 * intervalMs > staleAfterMs)
+      throw new Error(
+        'KURUMI_STALE_AFTER_MS must be at least 25000 plus three KURUMI_RECONCILE_INTERVAL_MS, so that one host stall cannot make an idle runner look stale',
+      )
     const install = createHash('sha256')
       .update(realpathSync(config.home))
       .digest('hex')
       .slice(0, 24)
+    const runner = join(config.home, 'runner/runner.js')
+    const egress: ContainerEgress = {
+      env: {
+        KURUMI_URL: `http://host.docker.internal:${config.agentPort.port}`,
+        KURUMI_AGENT_PORT: String(config.agentPort.port),
+      },
+      mounts: [{ hostPath: runner, containerPath: '/app/runner.js', readonly: true }],
+      network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
+    }
     const docker = createDockerDriver({
       install,
+      revision: createHash('sha256')
+        .update(JSON.stringify([environment.KURUMI_AGENT_IMAGE, egress]))
+        .update(existsSync(runner) ? readFileSync(runner) : '')
+        .digest('hex')
+        .slice(0, 16),
       image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
       network: environment.KURUMI_DOCKER_NETWORK,
     })
@@ -112,21 +149,9 @@ export async function startHost(config: HostConfig) {
               since: new Date(),
             }
           },
-          contribution: () => ({
-            env: {
-              KURUMI_URL: `http://host.docker.internal:${config.agentPort.port}`,
-              KURUMI_AGENT_PORT: String(config.agentPort.port),
-            },
-            mounts: [
-              {
-                hostPath: join(config.home, 'runner/runner.js'),
-                containerPath: '/app/runner.js',
-                readonly: true,
-              },
-            ],
-            network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
-          }),
+          contribution: () => egress,
         },
+        supervision: { staleAfterMs, intervalMs },
       },
     })
     sessions = sessionLedger
@@ -166,9 +191,11 @@ export async function startHost(config: HostConfig) {
     })
     const rpc = createRpcFronts(router, contextFor)
     const agentHandler = new RPCHandler(router)
+    const started = sessionLedger.start()
     admission = startAdmission({
-      bind: (probeNonce) =>
-        startAgentPort({
+      bind: async (probeNonce) => {
+        await sessionLedger.adopted()
+        return startAgentPort({
           bind: config.agentPort,
           probeNonce,
           authenticate: (token) => sessionLedger.authenticate(token),
@@ -189,13 +216,13 @@ export async function startHost(config: HostConfig) {
             })
             if (!result.matched) response.writeHead(404).end()
           },
-        }),
+        })
+      },
       probe: (url, options) => docker.probe(url, options),
       log: (message) => {
         process.stdout.write(`${JSON.stringify({ kind: 'gateway.admission', message })}\n`)
       },
     })
-    await sessionLedger.start()
     const stale = lstatSync(socket, { throwIfNoEntry: false })
     if (stale && !stale.isSocket()) throw new Error(`${socket} exists and is not a socket`)
     rmSync(socket, { force: true })
@@ -206,6 +233,7 @@ export async function startHost(config: HostConfig) {
     } finally {
       process.umask(umask)
     }
+    await started
     process.stdout.write(
       `${JSON.stringify({ kind: 'host.runtime', install, agentPort: config.agentPort.port, image: environment.KURUMI_AGENT_IMAGE })}\n`,
     )
@@ -223,20 +251,27 @@ export async function startHost(config: HostConfig) {
 }
 
 if (import.meta.main) {
+  const starting = Promise.resolve().then(() => startHost(loadConfig(process.env)))
+  const shutdown = () => {
+    starting.then(
+      (host) =>
+        host.stop().then(
+          () => process.exit(0),
+          (error: unknown) => {
+            process.stderr.write(`${String(error)}\n`)
+            process.exit(1)
+          },
+        ),
+      () => {},
+    )
+  }
+  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', shutdown)
   try {
-    const host = await startHost(loadConfig(process.env))
-    const shutdown = () => {
-      host
-        .stop()
-        .then(() => process.exit(0))
-        .catch((error: unknown) => {
-          process.stderr.write(`${String(error)}\n`)
-          process.exit(1)
-        })
-    }
-    process.on('SIGTERM', shutdown)
-    process.on('SIGINT', shutdown)
+    await starting
   } catch (error) {
+    process.off('SIGTERM', shutdown)
+    process.off('SIGINT', shutdown)
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
   }
