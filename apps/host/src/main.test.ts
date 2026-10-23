@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -20,8 +20,8 @@ function homeForTest(): string {
   return home
 }
 
-function spawnHost(home: string): Bun.Subprocess<'ignore', 'pipe', 'pipe'> {
-  const child = Bun.spawn([process.execPath, main], {
+function spawnHost(home: string, preload?: string): Bun.Subprocess<'ignore', 'pipe', 'pipe'> {
+  const child = Bun.spawn([process.execPath, ...(preload ? ['--preload', preload] : []), main], {
     env: { ...process.env, KURUMI_HOME: home },
     stdin: 'ignore',
     stdout: 'pipe',
@@ -65,6 +65,43 @@ test('a second host fails at the lock and names the first pid', async () => {
   expect(await first.exited).toBe(0)
   expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
 }, 5000)
+
+test('concurrent host starts name the lock owner before its pid write completes', async () => {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const home = homeForTest()
+    const preload = join(home, 'delay-pid.ts')
+    writeFileSync(
+      preload,
+      `
+      import { mock } from 'bun:test'
+      import * as fs from 'node:fs'
+      const truncate = fs.ftruncateSync
+      mock.module('node:fs', () => ({
+        ...fs,
+        ftruncateSync(fd, length) {
+          truncate(fd, length)
+          Bun.sleepSync(200)
+        },
+      }))
+    `,
+    )
+    const started = performance.now()
+    const pair = [spawnHost(home, preload), spawnHost(home, preload)]
+    const exited = await Promise.race(
+      pair.map(async (child) => ({ child, code: await child.exited })),
+    )
+    const winner = pair.find((child) => child !== exited.child)
+    if (!winner) throw new Error('Expected one lock owner')
+    expect(exited.code).toBe(1)
+    expect(performance.now() - started).toBeLessThan(2000)
+    expect(await new Response(exited.child.stderr).text()).toContain(
+      `kurumi.lock is held by host pid ${winner.pid}`,
+    )
+    await waitForHost(home, winner)
+    winner.kill('SIGTERM')
+    expect(await winner.exited).toBe(0)
+  }
+}, 10000)
 
 test('a killed host leaves a lock and socket that a new host can recover', async () => {
   const home = homeForTest()
