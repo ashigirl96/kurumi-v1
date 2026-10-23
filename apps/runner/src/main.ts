@@ -6,10 +6,14 @@ import { createORPCClient, ORPCError } from '@orpc/client'
 import { RPCLink } from '@orpc/client/fetch'
 import type { ContractRouterClient } from '@orpc/contract'
 
+import { runTurn } from './claude.ts'
+
 type Host = ContractRouterClient<{ session: typeof contract }>
 
-function replyId(inboundId: string): string {
-  const hash = createHash('sha256').update(`kurumi-echo:${inboundId}`).digest('hex')
+const CONTINUATION = 'continuation'
+
+function replyId(inboundId: string, index: number): string {
+  const hash = createHash('sha256').update(`kurumi-reply:${inboundId}:${index}`).digest('hex')
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`
 }
 
@@ -17,6 +21,7 @@ export async function runRunner(options: {
   url: string
   token: string
   signal: AbortSignal
+  heartbeatMs?: number
   onRetry?(entry: { kind: 'runner.retry'; delayMs: number }): void
 }): Promise<void> {
   const { signal } = options
@@ -41,25 +46,51 @@ export async function runRunner(options: {
       }
     }
   }
+  async function post(id: string, inReplyTo: string, text: string): Promise<void> {
+    try {
+      await retry(() =>
+        host.session.channel.post(
+          { id, inReplyTo, to: null, body: { kind: 'text', text } },
+          { signal },
+        ),
+      )
+    } catch (error) {
+      // A turn re-run after a lost container writes new model text under the reply ids the first run already filled.
+      if (!(error instanceof ORPCError && error.code === 'CONFLICT')) throw error
+    }
+  }
+  async function answer(message: { id: string; content: string }): Promise<void> {
+    const saved = await retry(() =>
+      host.session.channel.state.get({ key: CONTINUATION }, { signal }),
+    )
+    const heartbeat = setInterval(() => {
+      host.session.channel
+        .heartbeat({ currentTool: null, toolTimeoutMs: null }, { signal })
+        .catch(() => {})
+    }, options.heartbeatMs ?? 10_000)
+    let replies = 0
+    try {
+      const { continuation } = await runTurn({
+        prompt: message.content,
+        continuation: saved.value,
+        signal,
+        reply: (text) => post(replyId(message.id, replies++), message.id, text),
+      })
+      if (continuation !== null && continuation !== saved.value)
+        await retry(() =>
+          host.session.channel.state.put({ key: CONTINUATION, value: continuation }, { signal }),
+        )
+    } finally {
+      clearInterval(heartbeat)
+    }
+    await retry(() => host.session.channel.complete({ ids: [message.id] }, { signal }))
+  }
   try {
     while (!signal.aborted) {
       const { messages } = await retry(() =>
         host.session.channel.pull({ waitMs: 25_000 }, { signal }),
       )
-      for (const message of messages) {
-        await retry(() =>
-          host.session.channel.post(
-            {
-              id: replyId(message.id),
-              inReplyTo: message.id,
-              to: null,
-              body: { kind: 'text', text: `echo: ${message.content}` },
-            },
-            { signal },
-          ),
-        )
-        await retry(() => host.session.channel.complete({ ids: [message.id] }, { signal }))
-      }
+      for (const message of messages) await answer(message)
     }
   } catch (error) {
     if (!signal.aborted) throw error
