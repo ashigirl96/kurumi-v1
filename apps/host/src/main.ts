@@ -3,8 +3,10 @@ import { join } from 'node:path'
 
 import { createAccountLedger } from '@kurumi/account/server'
 import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
+import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import { hostContract, type Caller } from '@kurumi/rpc/contract'
 import { guardRouter, type Guard, type KurumiContext } from '@kurumi/rpc/server'
+import { createSessionLedger } from '@kurumi/session/server'
 import { implement, ORPCError } from '@orpc/server'
 
 import { loadConfig, type HostConfig } from './config.ts'
@@ -24,18 +26,35 @@ export async function startHost(config: HostConfig) {
   const releaseLock = acquireLock(join(config.home, 'kurumi.lock'))
   let database: KurumiDb | undefined
   let listener: ReturnType<typeof Bun.serve> | undefined
+  let chat: ReturnType<typeof createChatLedger> | undefined
   try {
     const db = openKurumiDb(join(config.home, 'kurumi.db'))
     database = db
     migrateAll(db, migrations)
+    const agentLedger = createAgentLedger({ db, home: config.home })
+    const chatLedger = createChatLedger({
+      db,
+      agentLedger,
+      sink: () => ({ onInbound: (event) => sessionLedger.routeInbound(event) }),
+    })
+    chat = chatLedger
+    const sessionLedger = createSessionLedger({
+      db,
+      agentLedger,
+      chatLedger,
+      log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
+    })
     const ledgers = {
-      agentLedger: createAgentLedger({ db, home: config.home }),
+      agentLedger,
+      chatLedger,
+      sessionLedger,
       accountLedger: createAccountLedger({ db }),
     }
     type HostContext = KurumiContext & typeof ledgers
     const admin = implement(hostContract).$context<HostContext>()
     const router = guardRouter<HostContext>().router({
       agent: agentRouter,
+      chat: chatRouter,
       status: admin.status.handler(() => ({ ready: true })),
       db: {
         query: admin.db.query.handler(({ context, input }) => {
@@ -67,6 +86,7 @@ export async function startHost(config: HostConfig) {
     const server = listener
     return {
       async stop() {
+        chatLedger.stop()
         await server.stop(true)
         rmSync(socket, { force: true })
         db.$client.close()
@@ -74,6 +94,7 @@ export async function startHost(config: HostConfig) {
       },
     }
   } catch (error) {
+    chat?.stop()
     await listener?.stop(true)
     database?.$client.close()
     releaseLock()
