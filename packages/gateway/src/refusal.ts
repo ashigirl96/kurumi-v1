@@ -45,8 +45,6 @@ export function refusalResponse(refusal: GatewayRefusal): {
     headers: {
       'content-type': 'application/json',
       'content-length': String(Buffer.byteLength(body)),
-      // The WebSocket path ends the socket after a refusal, and both paths share these headers.
-      connection: 'close',
       // The Anthropic SDK retries a 409 unless told not to.
       'x-should-retry': 'false',
       'x-kurumi-gateway': code,
@@ -57,6 +55,8 @@ export function refusalResponse(refusal: GatewayRefusal): {
 
 export function refusalHttp(refusal: GatewayRefusal): string {
   const { status, headers, body } = refusalResponse(refusal)
-  const lines = Object.entries(headers).map(([name, value]) => `${name}: ${value}\r\n`)
+  const lines = Object.entries({ ...headers, connection: 'close' }).map(
+    ([name, value]) => `${name}: ${value}\r\n`,
+  )
   return `HTTP/1.1 ${status} ${STATUS_CODES[status]}\r\n${lines.join('')}\r\n${body}`
 }

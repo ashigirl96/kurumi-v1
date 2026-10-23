@@ -66,7 +66,6 @@ test('the headers mark a gateway answer the client must not retry, sized in byte
   expect(headers).toEqual({
     'content-type': 'application/json',
     'content-length': String(Buffer.byteLength(body)),
-    connection: 'close',
     'x-should-retry': 'false',
     'x-kurumi-gateway': 'account_ambiguous',
   })
@@ -81,5 +80,6 @@ test('the raw form is the same response as HTTP/1.1 bytes', () => {
 
   expect(raw.startsWith('HTTP/1.1 404 Not Found\r\n')).toBe(true)
   expect(raw).toContain('\r\nx-should-retry: false\r\n')
+  expect(raw).toContain('\r\nconnection: close\r\n')
   expect(raw.slice(raw.indexOf('\r\n\r\n') + 4)).toBe(body)
 })
