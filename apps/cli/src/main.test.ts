@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:
 import { kc } from '@kurumi/rpc/contract'
 import type { AnyContractRouter } from '@orpc/contract'
 import { z } from 'zod'
+import * as zm from 'zod/mini'
 
 import { cliContract, runCommand, type Stdin } from './main.ts'
 
@@ -219,7 +220,62 @@ describe('a contract field marked stdin', () => {
     expect(calls).toEqual([{ path: ['put'], input: ['n', { secret: 's3cret' }] }])
   })
 
+  test('is read from stdin in a zod mini input, and gets no flag', async () => {
+    const options = zm.object({
+      label: zm.string(),
+      secret: zm.string().check(zm.maxLength(16)).register(zm.globalRegistry, { stdin: true }),
+    })
+    const contract = { put: kc.meta({ cli: true }).input(zm.tuple([zm.string(), options])) }
+
+    expect(await run(['put', 'n', '--label', 'l'], piped('s3cret'), contract)).toBe(0)
+    expect(calls).toEqual([{ path: ['put'], input: ['n', { label: 'l', secret: 's3cret' }] }])
+
+    calls = []
+    expect(await run(['put', 'n', '--label', 'l', '--secret', 'ARGV'], piped(''), contract)).toBe(1)
+    expect(calls).toEqual([])
+  })
+
   const marked = secret.meta({ stdin: true })
+
+  test.each(
+    Object.entries({
+      object: z.object({ inner: marked }),
+      catchall: z.object({}).catchall(marked),
+      array: z.array(marked),
+      tuple: z.tuple([marked]),
+      'tuple rest': z.tuple([z.string()], marked),
+      record: z.record(z.string(), marked),
+      map: z.map(z.string(), marked),
+      set: z.set(marked),
+      union: z.union([marked, z.number()]),
+      'discriminated union': z.discriminatedUnion('kind', [
+        z.object({ kind: z.literal('a'), inner: marked }),
+      ]),
+      intersection: z.intersection(marked, z.string()),
+      'pipe input': marked.pipe(z.string()),
+      'pipe output': z.string().pipe(marked),
+      codec: z.codec(marked, z.string(), { decode: same, encode: same }),
+      preprocess: z.preprocess(same, marked),
+      lazy: z.lazy(() => marked),
+      promise: z.promise(marked),
+      optional: marked.optional(),
+      nullable: marked.nullable(),
+      default: marked.default('unused'),
+      prefault: marked.prefault('unused'),
+      catch: marked.catch('unused'),
+      readonly: marked.readonly(),
+      nonoptional: marked.optional().nonoptional(),
+      success: z.success(marked),
+      function: z.function({ input: [marked], output: z.string() }),
+      'template literal': z.templateLiteral([marked]),
+    }),
+  )('marked inside %s never sends an argv value', async (_, field) => {
+    const contract = { put: put(z.object({ label: z.string(), secret: field })) }
+
+    await run(['put', 'n', '--label', 'l', '--secret', 'ARGV'], piped('s3cret'), contract)
+
+    expect(JSON.stringify(calls)).not.toContain('ARGV')
+  })
 
   test.each([
     [

@@ -272,7 +272,7 @@ type StdinField = {
 class StdinRouteError extends Error {}
 
 function stdinFieldOf(command: string, schema: unknown): StdinField | null {
-  if (!(schema instanceof z.ZodType)) return null
+  if (!(schema instanceof z.core.$ZodType)) return null
   const markers = stdinMarkers(schema)
   const [marker, ...others] = markers
   if (!marker) return null
@@ -282,11 +282,12 @@ function stdinFieldOf(command: string, schema: unknown): StdinField | null {
     throw refuse(`${all} are each marked stdin, but only one field can be`)
   }
   const where = pathOf(marker.at)
-  const items: readonly z.core.$ZodType[] = schema instanceof z.ZodTuple ? schema.def.items : []
+  const items: readonly z.core.$ZodType[] =
+    schema instanceof z.core.$ZodTuple ? schema._zod.def.items : []
   const options = items.at(-1)
   const [owner, property] = marker.at
   if (
-    !(options instanceof z.ZodObject) ||
+    !(options instanceof z.core.$ZodObject) ||
     marker.at.length !== 2 ||
     owner?.kind !== 'index' ||
     owner.index !== items.length - 1 ||
@@ -300,11 +301,11 @@ function stdinFieldOf(command: string, schema: unknown): StdinField | null {
     metadata: z.registry(),
   })
   if (typeof maxLength !== 'number') throw refuse(`${where} needs a maximum length`)
-  const { [property.name]: fieldSchema, ...rest } = options.shape
-  const [first, ...more] = [...items.slice(0, -1), z.object(rest)]
+  const rest = Object.entries(options._zod.def.shape).filter(([name]) => name !== property.name)
+  const [first, ...more] = [...items.slice(0, -1), z.object(Object.fromEntries(rest))]
   return {
     field: property.name,
-    schema: fieldSchema,
+    schema: property.schema,
     maxLength,
     cliSchema: z.tuple([first, ...more]),
   }
@@ -312,7 +313,7 @@ function stdinFieldOf(command: string, schema: unknown): StdinField | null {
 
 type Step =
   | { kind: 'index'; index: number }
-  | { kind: 'property'; name: string }
+  | { kind: 'property'; name: string; schema: z.core.$ZodType }
   | { kind: 'keyword'; name: string }
 
 type Marker = { at: readonly Step[]; schema: z.core.$ZodType }
@@ -352,7 +353,7 @@ function childSchemas(schema: z.core.$ZodType): [Step | null, z.core.$ZodType][]
     ([key, value]): [Step | null, z.core.$ZodType][] => {
       if (key === 'shape') {
         return Object.entries(value as z.core.$ZodShape).map(([name, child]) => [
-          { kind: 'property', name },
+          { kind: 'property', name, schema: child },
           child,
         ])
       }
