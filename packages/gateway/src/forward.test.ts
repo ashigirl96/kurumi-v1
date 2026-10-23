@@ -235,7 +235,6 @@ async function setupCredentials() {
         value,
         authMode,
         autoGrant: true,
-        addedBy: 't',
       }),
     )
   const setDefault = (handle: string) =>

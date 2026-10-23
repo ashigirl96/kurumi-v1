@@ -34,7 +34,6 @@ test.skipIf(!process.env.KURUMI_BENCH)(
         authMode: 'oauth-token',
         value: 'sk-ant-oat01-bench',
         autoGrant: true,
-        addedBy: 'bench',
       }),
     )
     const selector = ledger.containerEnv('g1').CLAUDE_CODE_OAUTH_TOKEN
