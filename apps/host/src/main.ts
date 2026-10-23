@@ -20,6 +20,7 @@ import {
 import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import {
+  credentialInject,
   gatewayContribution,
   loadCertificateAuthority,
   proxyEnv,
@@ -189,7 +190,13 @@ export async function startHost(config: HostConfig) {
               since: new Date(),
             }
           },
-          contribution,
+          contribution: ({ agentGroupId, sessionToken }) => {
+            const container = contribution({ sessionToken })
+            return {
+              ...container,
+              env: { ...accountLedger.containerEnv(agentGroupId), ...container.env },
+            }
+          },
         },
         supervision: { staleAfterMs, intervalMs },
       },
@@ -236,13 +243,13 @@ export async function startHost(config: HostConfig) {
     admission = startAdmission({
       bind: async (probeNonce) => {
         await sessionLedger.adopted()
-        return startAgentPort({
+        return startAgentPort<AgentPrincipal>({
           bind: config.agentPort,
           probeNonce,
           authenticate: (token) => sessionLedger.authenticate(token),
           ca,
           intercepts: isInterceptedHost,
-          forward: { inject: ({ path, headers }) => ({ path, headers }) },
+          forward: { inject: credentialInject(accountLedger) },
           async rpc(request, response, principal, signal) {
             const result = await agentHandler.handle(request, response, {
               prefix: '/rpc',
