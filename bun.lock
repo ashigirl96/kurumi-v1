@@ -19,8 +19,10 @@
         "kurumi": "./src/main.ts",
       },
       "dependencies": {
+        "@kurumi/access": "workspace:*",
         "@kurumi/account": "workspace:*",
         "@kurumi/agent": "workspace:*",
+        "@kurumi/approval": "workspace:*",
         "@kurumi/chat": "workspace:*",
         "@kurumi/gateway": "workspace:*",
         "@kurumi/rpc": "workspace:*",

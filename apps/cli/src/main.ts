@@ -3,12 +3,14 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 
+import { contract as accessContract } from '@kurumi/access/contract'
 import {
   AccountViewSchema,
   AddKeyOutputSchema,
   contract as accountContract,
 } from '@kurumi/account/contract'
 import { contract as agentContract } from '@kurumi/agent/contract'
+import { contract as approvalContract } from '@kurumi/approval/contract'
 import { contract as chatContract, type TerminalEvent } from '@kurumi/chat/contract'
 import {
   EgressLogRowSchema,
@@ -31,6 +33,8 @@ type ForwardingRouter = { [key: string]: ForwardingRouter | AnyProcedure }
 
 export const cliContract = {
   agent: agentContract,
+  access: accessContract,
+  approval: approvalContract,
   account: accountContract,
   gateway: gatewayContract,
   ...hostContract,
