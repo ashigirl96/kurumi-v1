@@ -697,16 +697,13 @@ export function createDockerDriver(options: {
       proc = cli.start(
         [
           'events',
-          '--filter',
-          `label=kurumi.install=${options.install}`,
-          '--filter',
-          'type=container',
-          '--filter',
-          'event=create',
-          '--filter',
-          'event=die',
-          '--filter',
-          'event=destroy',
+          ...[
+            `label=kurumi.install=${options.install}`,
+            'type=container',
+            'event=create',
+            'event=die',
+            'event=destroy',
+          ].flatMap((filter) => ['--filter', filter]),
           ...(since === undefined ? [] : ['--since', epochSeconds(since)]),
           '--until',
           epochSeconds(until),
@@ -751,7 +748,7 @@ export function createDockerDriver(options: {
     const retryMs = Math.min(30_000, 1_000 * 2 ** Math.min(losses - 1, 5))
     announce({ kind: 'lost', code, retryMs })
     resubscribe = setTimeout(subscribe, retryMs)
-    resubscribe.unref?.()
+    resubscribe.unref()
   }
 
   function endWatch(): void {

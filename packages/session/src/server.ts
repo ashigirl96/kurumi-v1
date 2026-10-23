@@ -501,7 +501,13 @@ export function createSessionLedger({
       return
     }
     passing = supervise(supervision.inventory, supervision.staleAfterMs)
-      .catch(() => {})
+      .catch((cause: unknown) => {
+        runtimeLog?.({
+          kind: 'session.reconcile.failed',
+          reason: String(cause),
+          monotonicMs: performance.now(),
+        })
+      })
       .finally(() => {
         passing = undefined
         if (passAgain) {
@@ -682,9 +688,8 @@ export function createSessionLedger({
         const { inventory, staleAfterMs, intervalMs } = supervision
         const startup = supervise(inventory, staleAfterMs)
         passing = startup
-        const counts = await startup.finally(() => {
-          passing = undefined
-        })
+        const counts = await startup
+        passing = undefined
         runtimeLog?.({
           kind: 'session.adoption.done',
           listed: counts.listed,
