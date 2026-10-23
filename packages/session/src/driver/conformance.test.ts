@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite'
 import { afterEach, beforeEach, expect, setSystemTime, test } from 'bun:test'
 import { rejects } from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -855,6 +855,15 @@ test('a subscription that reaches the end of its window continues at once from w
   expect(changes).toEqual([{ kind: 'subscribed', attempt: 0 }])
 })
 
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function supervisedHost(
   docker: ReturnType<typeof fakeDaemon>,
   limits: { staleAfterMs?: number; intervalMs?: number } = {},
@@ -1142,5 +1151,52 @@ test('a listing that gets no answer within the driver timeout fails the sweep in
     expect(docker.commands('ps').map(({ proc }) => proc.killed)).toEqual([true])
   } finally {
     await Promise.all([ledger.stop(), dockerDriver.detach()])
+  }
+})
+
+test('adopting a container ends the docker wait a dead host left for it and no other', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kurumi-orphan-wait-'))
+  writeFileSync(
+    join(dir, 'docker'),
+    `#!/bin/sh\necho $$ > "${dir}/$2.pid"\nwhile :; do sleep 0.05; done\n`,
+    {
+      mode: 0o755,
+    },
+  )
+  const docker = fakeDaemon()
+  const dockerDriver = createDockerDriver({
+    install: 'orphan',
+    image: 'agent-test',
+    cli: docker.daemon,
+  })
+  const name = dockerDriver.nameOf('ctr-adopt')
+  const unrelated = dockerDriver.nameOf('ctr-unrelated')
+  const pidOf = (waited: string) => Number(readFileSync(join(dir, `${waited}.pid`), 'utf8'))
+  try {
+    await Bun.spawn([
+      'sh',
+      '-c',
+      `"${dir}/docker" wait ${name} >/dev/null 2>&1 & "${dir}/docker" wait ${unrelated} >/dev/null 2>&1 &`,
+    ]).exited
+    await until(
+      () => existsSync(join(dir, `${name}.pid`)) && existsSync(join(dir, `${unrelated}.pid`)),
+    )
+    docker.add(name, {
+      'kurumi.install': 'orphan',
+      'kurumi.role': 'agent',
+      'kurumi.session': 'ses-adopt',
+      'kurumi.container': 'ctr-adopt',
+    })
+    const [listed] = await dockerDriver.sweep()
+    if (!listed) throw new Error('the fake daemon did not list the container')
+    expect(dockerDriver.adopt(listed)).toEqual({ ok: true })
+    await until(() => !isAlive(pidOf(name)))
+    expect(isAlive(pidOf(unrelated))).toBe(true)
+  } finally {
+    for (const waited of [name, unrelated])
+      if (existsSync(join(dir, `${waited}.pid`)) && isAlive(pidOf(waited)))
+        process.kill(pidOf(waited), 'SIGTERM')
+    rmSync(dir, { recursive: true, force: true })
+    await dockerDriver.stop()
   }
 })

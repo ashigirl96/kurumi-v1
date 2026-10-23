@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 
@@ -140,6 +140,25 @@ const nativeCli: Cli = {
 function endedBySignal(exit: CliResult): boolean {
   // The docker CLI is a Go program, and Go's runtime exits 2 on SIGQUIT and SIGABRT.
   return exit.code === null || exit.code > 128 || exit.code === 2
+}
+
+function endForeignWaits(name: string): void {
+  execFile(
+    'ps',
+    ['-e', '-o', 'pid=,ppid=,command='],
+    { maxBuffer: 8 * 1024 * 1024 },
+    (failure, stdout) => {
+      if (failure) return
+      for (const line of stdout.split('\n')) {
+        const [, pid, ppid, command = ''] = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line) ?? []
+        const waited = /(?:^|[\s/])docker wait (\S+)\s*$/.exec(command)?.[1]
+        if (waited !== name || Number(ppid) === process.pid) continue
+        try {
+          process.kill(Number(pid), 'SIGTERM')
+        } catch {}
+      }
+    },
+  )
 }
 
 function epochSeconds(ms: number): string {
@@ -937,6 +956,7 @@ export function createDockerDriver(options: {
       }
       agents.set(agent.sessionId, agent)
       agent.watch = watchAgent(agent)
+      endForeignWaits(agent.name)
       return { ok: true }
     },
     remove(name) {
