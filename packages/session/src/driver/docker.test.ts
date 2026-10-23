@@ -890,7 +890,7 @@ test('kill rejects when a replacement create reaches its cleanup deadline', asyn
   const outcome = await Promise.race([killing, Bun.sleep(250).then(() => 'still waiting')])
   create.proc.complete({ code: null })
   expect((await retry).ok).toBe(false)
-  await expect(driver.stop()).rejects.toThrow('cleanup')
+  expect(await driver.stop().catch((cause: unknown) => String(cause))).toContain('cleanup')
   expect(outcome).toContain('cleanup')
 })
 
