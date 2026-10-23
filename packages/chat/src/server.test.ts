@@ -260,6 +260,31 @@ test('abort wakes a parked next and removes its subscription', async () => {
   await rejects(terminalAdapter().post(terminalTarget(), { id: 'out-after-abort', text: 'none' }))
 })
 
+test('return closes a parked router iterator without a separate abort signal', async () => {
+  const events = await client().terminal({ agentGroupId: agentId, text: 'hello', follow: true })
+  await events.next()
+  const pending = events.next()
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  const returning = events.return?.()
+  const deadline = Promise.withResolvers<string>()
+  const timer = setTimeout(() => deadline.resolve('return timed out'), 100)
+  try {
+    expect(await Promise.race([returning, deadline.promise])).toEqual({
+      done: true,
+      value: undefined,
+    })
+    expect((await pending).done).toBe(true)
+    await rejects(
+      terminalAdapter().post(terminalTarget(), { id: 'out-after-return', text: 'none' }),
+    )
+  } finally {
+    clearTimeout(timer)
+    ledger.stop()
+    await returning
+    await pending
+  }
+})
+
 test('already aborted requests do not route or write', async () => {
   const controller = new AbortController()
   controller.abort()

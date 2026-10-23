@@ -1,6 +1,6 @@
 import type { AgentLedger } from '@kurumi/agent/server'
 import type { Db, KurumiContext, Tx } from '@kurumi/rpc/server'
-import { implement, ORPCError } from '@orpc/server'
+import { AsyncIteratorClass, implement, ORPCError } from '@orpc/server'
 import { and, eq } from 'drizzle-orm'
 
 import {
@@ -100,39 +100,48 @@ export function createChatLedger({
         threadId,
       }
     },
-    async *terminal(input, signal) {
-      const receivedAt = performance.now()
-      if (signal?.aborted) return
-      if (!agentLedger.get(input.agentGroupId)) {
-        throw new ORPCError('NOT_FOUND', { message: `agent not found: ${input.agentGroupId}` })
-      }
-      const target: DeliveryTarget = {
-        channel: 'terminal',
-        instance: null,
-        platformId: input.agentGroupId,
-        threadId: null,
-      }
-      const replies = input.follow ? terminalAdapter.subscribe(target, signal) : null
-      try {
-        const receipt = await sink().onInbound({
-          channel: 'terminal',
-          instance: null,
-          platformId: input.agentGroupId,
-          threadId: null,
-          messageId: `in-${crypto.randomUUID()}`,
-          receivedAt,
-          text: input.text,
-          sender: { handle: 'terminal:owner', displayName: 'Owner', isBot: false },
-          isMention: true,
-          isGroup: false,
-          attachments: [],
-        })
-        if (signal?.aborted) return
-        yield { kind: 'queued', ...receipt }
-        if (replies) yield* replies
-      } finally {
-        await replies?.return?.()
-      }
+    terminal(input, signal) {
+      const controller = new AbortController()
+      const cancelled = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+      let routed = false
+      let replies: ReturnType<typeof terminalAdapter.subscribe> | undefined
+      return new AsyncIteratorClass<TerminalEvent, void, void>(
+        async () => {
+          if (cancelled.aborted) return { done: true, value: undefined }
+          if (routed) return replies ? replies.next() : { done: true, value: undefined }
+          routed = true
+          const receivedAt = performance.now()
+          if (!agentLedger.get(input.agentGroupId)) {
+            throw new ORPCError('NOT_FOUND', { message: `agent not found: ${input.agentGroupId}` })
+          }
+          const target: DeliveryTarget = {
+            channel: 'terminal',
+            instance: null,
+            platformId: input.agentGroupId,
+            threadId: null,
+          }
+          replies = input.follow ? terminalAdapter.subscribe(target, cancelled) : undefined
+          const receipt = await sink().onInbound({
+            channel: 'terminal',
+            instance: null,
+            platformId: input.agentGroupId,
+            threadId: null,
+            messageId: `in-${crypto.randomUUID()}`,
+            receivedAt,
+            text: input.text,
+            sender: { handle: 'terminal:owner', displayName: 'Owner', isBot: false },
+            isMention: true,
+            isGroup: false,
+            attachments: [],
+          })
+          if (cancelled.aborted) return { done: true, value: undefined }
+          return { done: false, value: { kind: 'queued', ...receipt } }
+        },
+        async () => {
+          controller.abort()
+          await replies?.return?.()
+        },
+      )
     },
     stop: () => terminalAdapter.stop(),
   }
