@@ -241,8 +241,9 @@ test('a vault key that did not seal the gateway CA stops the host and names the 
   expect(await second.exited).toBe(1)
   const stderr = await new Response(second.stderr).text()
   expect(stderr).toContain(join(home, 'vault.key'))
-  expect(stderr).toContain('did not seal the gateway CA')
-  expect(stderr).toContain('Restore the vault.key that sealed it from your backup')
+  expect(stderr).toContain('cannot open the gateway CA')
+  expect(stderr).toContain('gateway_ca failed authentication')
+  expect(stderr).toContain('restore that one from your backup')
 }, 5000)
 
 test('diagnostic SQL reads a WAL snapshot without writing rows or changing the host connection', () => {

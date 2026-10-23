@@ -125,7 +125,7 @@ export async function startHost(config: HostConfig) {
     }).catch((error: unknown) => {
       if (!(error instanceof VaultError)) throw error
       throw new Error(
-        `${join(config.home, 'vault.key')} did not seal the gateway CA that kurumi.db holds. Restore the vault.key that sealed it from your backup; kurumi does not replace the CA under this key, because the accounts sealed with the original key would stay unreadable.`,
+        `${join(config.home, 'vault.key')} cannot open the gateway CA that kurumi.db holds (${error.message}). If this is not the vault.key that sealed it, restore that one from your backup; kurumi does not replace the CA under this key, because the accounts sealed with the original key would stay unreadable.`,
         { cause: error },
       )
     })
