@@ -344,6 +344,11 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 
 - P07 `gateway/src/admission.ts`: `retry()` の scheduler が例外を投げると Promise は reject する。起動時と timer の呼び出し側で reject を受け、既存の `bind_failed`、`probe_failed`、`nonce_mismatch` を保持する。child process の test が両経路で未処理の reject が無いことを確かめる。
 
+- P08 `access/package.json`: the migration-only `./server` entry points to `migrations/index.ts`. The Files box permits the access schema and migrations but does not include `access/src/server.ts`.
+- P08 `chat/schema.ts`: an absent adapter instance is stored as `''`, with `null` retained at the adapter boundary. `messaging_group_key` therefore compares no NULL values. `wiring_key` makes the messaging-group and agent-group pair unique.
+- P08 `chat/contract.ts` and `chat/terminal.ts`: `terminalAdapter` lives in chat. The shared adapter types live in the contract entry, and text delivery takes `{ id, text }` so a reply retains its durable outbound ID. The terminal procedure requires a host caller and returns an oRPC iterator of `queued` and `reply` events. `follow: false` returns only the receipt; one `follow: true` call can receive replies while later lines use receipt-only calls. A subscriber that buffers 128 replies is disconnected on the next reply instead of silently losing an event. Delivery fails when no subscriber accepts the reply.
+- P08 scope remains incomplete at this foundation. The Files box omits `packages/session/package.json`, `apps/host/package.json`, and `apps/cli/package.json`; Bun's isolated linker requires their dependency and export changes. Session persistence, fake runtime tests, host composition, and the chat CLI await that scope correction. Session caller, channel scope, and session-key decisions remain in the design only.
+
 ## ユーザーが決めたこと（2026-10-22）
 
 - アカウントの接続（OAuth）は Mac の前でだけ行う。web listener は `127.0.0.1` だけに bind し、callback は `http://127.0.0.1:<port>/oauth/callback`。`tailscale serve` は使わない。承認ボタンは Slack の Socket Mode で届くので、iPhone からも押せる。

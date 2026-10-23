@@ -40,6 +40,16 @@
         "zod": "catalog:",
       },
     },
+    "packages/access": {
+      "name": "@kurumi/access",
+      "dependencies": {
+        "@kurumi/agent": "workspace:*",
+        "drizzle-orm": "catalog:",
+      },
+      "devDependencies": {
+        "drizzle-kit": "catalog:",
+      },
+    },
     "packages/account": {
       "name": "@kurumi/account",
       "dependencies": {
@@ -60,6 +70,21 @@
         "zod": "catalog:",
       },
       "devDependencies": {
+        "drizzle-kit": "catalog:",
+      },
+    },
+    "packages/chat": {
+      "name": "@kurumi/chat",
+      "dependencies": {
+        "@kurumi/agent": "workspace:*",
+        "@kurumi/rpc": "workspace:*",
+        "@orpc/contract": "catalog:",
+        "@orpc/server": "catalog:",
+        "drizzle-orm": "catalog:",
+        "zod": "catalog:",
+      },
+      "devDependencies": {
+        "@kurumi/access": "workspace:*",
         "drizzle-kit": "catalog:",
       },
     },
@@ -158,9 +183,13 @@
 
     "@esbuild/win32-x64": ["@esbuild/win32-x64@0.25.12", "", { "os": "win32", "cpu": "x64" }, "sha512-alJC0uCZpTFrSL0CCDjcgleBXPnCrEAhTBILpeAp7M/OFgoqtAetfBzX0xM00MUsVVPpVjlPuMbREqnZCXaTnA=="],
 
+    "@kurumi/access": ["@kurumi/access@workspace:packages/access"],
+
     "@kurumi/account": ["@kurumi/account@workspace:packages/account"],
 
     "@kurumi/agent": ["@kurumi/agent@workspace:packages/agent"],
+
+    "@kurumi/chat": ["@kurumi/chat@workspace:packages/chat"],
 
     "@kurumi/cli": ["@kurumi/cli@workspace:apps/cli"],
 
