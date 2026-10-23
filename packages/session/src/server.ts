@@ -27,9 +27,9 @@ import {
 } from './contract.ts'
 import type { ContainerDriver, ContainerInventory, ContainerSpec } from './driver/docker.ts'
 import {
+  createLiveness,
   createSupervisor,
   type ContainerRow,
-  type Liveness,
   type SupervisionLog,
 } from './reconcile.ts'
 import { container, inboundMessage, outboundMessage, session, sessionState } from './schema.ts'
@@ -62,7 +62,7 @@ export type SessionRuntime = {
   | { driver: ContainerDriver; supervision?: undefined }
   | {
       driver: ContainerDriver & ContainerInventory
-      supervision: { staleAfterMs: number; intervalMs: number }
+      supervision: { staleAfterMs: number; intervalMs: number; revision: string }
     }
 )
 export type InboundLog = {
@@ -147,7 +147,7 @@ export function createSessionLedger({
   const pulls = new Set<Promise<{ messages: Inbound[] }>>()
   const waiters = new Map<string, Set<() => void>>()
   const retries = new Map<string, { attempt: number; due: number }>()
-  const incarnations = new Map<string, Liveness>()
+  const liveness = createLiveness({ maxStepMs: 3 * (runtime?.supervision?.intervalMs ?? Infinity) })
   const supervision = runtime?.supervision
     ? { inventory: runtime.driver, ...runtime.supervision }
     : undefined
@@ -178,12 +178,11 @@ export function createSessionLedger({
       .get()
     if (!row)
       throw new ORPCError('UNAUTHORIZED', { message: 'container incarnation is no longer active' })
-    const liveness = incarnations.get(principal.containerId)
-    if (arrival && liveness) liveness.lastCall = performance.now()
+    if (arrival) liveness.touch(principal.containerId)
   }
 
   function retire(id: string) {
-    incarnations.delete(id)
+    liveness.end(id)
     const retired = transaction(db, (tx) => {
       const row = tx.select().from(container).where(eq(container.id, id)).get()
       if (!row || row.status === 'stopping') return null
@@ -302,7 +301,7 @@ export function createSessionLedger({
         })
         .run()
     })
-    incarnations.set(containerId, { since: performance.now(), lastCall: null, toolDeadline: null })
+    liveness.begin(containerId)
     try {
       const egress = runtime.egress.contribution({ agentGroupId: agent.id, sessionToken: token })
       const result = await runtime.driver.run({
@@ -316,8 +315,10 @@ export function createSessionLedger({
         ],
         network: egress.network,
         limits: { cpus: 1, memoryMb: 1024, pids: 256 },
+        revision: runtime.supervision?.revision,
       })
       if (result.ok) {
+        liveness.touch(containerId)
         transaction(db, (tx) => {
           tx.update(container)
             .set({ status: 'running' })
@@ -358,6 +359,7 @@ export function createSessionLedger({
         sessionId: container.sessionId,
         status: container.status,
         sessionStatus: session.status,
+        toolDeadlineAt: container.toolDeadlineAt,
       })
       .from(container)
       .innerJoin(session, eq(session.id, container.sessionId))
@@ -368,7 +370,8 @@ export function createSessionLedger({
         sessionId: row.sessionId,
         status: row.status,
         sessionActive: row.sessionStatus === 'active',
-        liveness: incarnations.get(row.id) ?? null,
+        toolDeadlineAt: row.toolDeadlineAt?.getTime() ?? null,
+        liveness: liveness.view(row.id),
       }))
   }
 
@@ -378,7 +381,8 @@ export function createSessionLedger({
       ...supervision,
       rows: () => containerRows((id) => supervision.inventory.nameOf(id)),
       accept(row) {
-        incarnations.set(row.id, { since: performance.now(), lastCall: null, toolDeadline: null })
+        const toolMs = (row.toolDeadlineAt ?? 0) - Date.now()
+        liveness.begin(row.id, toolMs > 0 ? toolMs : null)
         transaction(db, (tx) => {
           tx.update(container)
             .set({ status: 'running' })
@@ -389,13 +393,6 @@ export function createSessionLedger({
         })
       },
       reap,
-      restartClocks() {
-        const now = performance.now()
-        for (const liveness of incarnations.values()) {
-          liveness.since = now
-          if (liveness.lastCall !== null) liveness.lastCall = now
-        }
-      },
       log: (entry) => runtimeLog?.(entry),
     })
 
@@ -679,7 +676,7 @@ export function createSessionLedger({
           ),
         )
         .get()
-      return row && incarnations.has(row.containerId)
+      return row && liveness.has(row.containerId)
         ? { ...row, sessionId: sessionId.parse(row.sessionId), __brand: 'AgentPrincipal' }
         : null
     },
@@ -737,10 +734,7 @@ export function createSessionLedger({
         transaction(db, (tx) => {
           authorize(tx, principal)
           const now = new Date()
-          const liveness = incarnations.get(principal.containerId)
-          if (liveness)
-            liveness.toolDeadline =
-              heartbeat.toolTimeoutMs === null ? null : performance.now() + heartbeat.toolTimeoutMs
+          liveness.declareTool(principal.containerId, heartbeat.toolTimeoutMs)
           tx.update(container)
             .set({
               lastSeenAt: now,

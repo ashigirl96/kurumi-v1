@@ -1,6 +1,7 @@
 import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
+import { promisify } from 'node:util'
 
 export type ContainerSpec = {
   sessionId: string
@@ -10,6 +11,7 @@ export type ContainerSpec = {
   mounts: { hostPath: string; containerPath: string; readonly: boolean }[]
   network: { kind: 'default' } | { kind: 'lockdown'; dockerNetwork: string }
   limits: { cpus: number; memoryMb: number; pids: number }
+  revision?: string
 }
 export type ContainerDriver = {
   run(spec: ContainerSpec): Promise<{ ok: true } | { ok: false; reason: string }>
@@ -23,6 +25,7 @@ export type ListedContainer = {
   role: 'agent' | 'probe' | null
   sessionId: string | null
   containerId: string | null
+  revision: string | null
   state: string
 }
 export type InventoryChange =
@@ -142,35 +145,29 @@ function endedBySignal(exit: CliResult): boolean {
   return exit.code === null || exit.code > 128 || exit.code === 2
 }
 
-function endForeignWaits(names: ReadonlySet<string>): Promise<void> {
-  return new Promise((resolve) => {
-    execFile(
-      'ps',
-      ['-e', '-o', 'pid=,ppid=,command='],
-      { maxBuffer: 8 * 1024 * 1024 },
-      (failure, stdout) => {
-        for (const line of failure ? [] : stdout.split('\n')) {
-          const [, pid, ppid, command = ''] = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line) ?? []
-          const waited = /(?:^|[\s/])docker wait (\S+)\s*$/.exec(command)?.[1]
-          if (!waited || !names.has(waited) || Number(ppid) === process.pid) continue
-          try {
-            process.kill(Number(pid), 'SIGTERM')
-          } catch {}
-        }
-        resolve()
-      },
-    )
-  })
+async function endForeignWaits(names: ReadonlySet<string>): Promise<void> {
+  const { stdout } = await promisify(execFile)('ps', ['-e', '-o', 'pid=,ppid=,command='], {
+    maxBuffer: 8 * 1024 * 1024,
+  }).catch(() => ({ stdout: '' }))
+  for (const line of stdout.split('\n')) {
+    const [, pid, ppid, command = ''] = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line) ?? []
+    const waited = /(?:^|[\s/])docker wait (\S+)\s*$/.exec(command)?.[1]
+    if (!waited || !names.has(waited) || Number(ppid) === process.pid) continue
+    try {
+      process.kill(Number(pid), 'SIGTERM')
+    } catch {}
+  }
 }
 
 function parseListing(line: string): ListedContainer {
   const fields = line.split('|')
-  const [role, sessionId, containerId] = fields.length === 5 ? fields.slice(1, 4) : []
+  const [role, sessionId, containerId, revision] = fields.length === 6 ? fields.slice(1, 5) : []
   return {
     name: fields[0] ?? '',
     role: role === 'agent' || role === 'probe' ? role : null,
     sessionId: sessionId || null,
     containerId: containerId || null,
+    revision: revision || null,
     state: fields.at(-1) ?? '',
   }
 }
@@ -367,7 +364,8 @@ export function createDockerDriver(options: {
   const shutdown = new AbortController()
   const commands = new Set<CliProcess>()
   const detached = new Set<AgentContainer>()
-  const foreignWaits = new Set<string>()
+  const adoptedWaits = new Set<string>()
+  let waitScan: Promise<void> | undefined
   let stopping: Promise<void> | undefined
 
   function record(
@@ -530,6 +528,7 @@ export function createDockerDriver(options: {
           'kurumi.role=agent',
           '--label',
           `kurumi.container=${spec.containerId}`,
+          ...(spec.revision === undefined ? [] : ['--label', `kurumi.revision=${spec.revision}`]),
           '--init',
           '--cap-drop=ALL',
           '--security-opt',
@@ -714,15 +713,12 @@ export function createDockerDriver(options: {
     }
     subscription = proc
     const attempt = losses
-    const confirmation =
-      announced && attempt === 0
-        ? undefined
-        : setTimeout(() => {
-            if (subscription !== proc) return
-            announced = true
-            watcher?.({ kind: 'subscribed', attempt })
-          }, 1_000)
-    confirmation?.unref()
+    const confirmation = setTimeout(() => {
+      if (subscription !== proc || (announced && attempt === 0)) return
+      announced = true
+      watcher?.({ kind: 'subscribed', attempt })
+    }, 1_000)
+    confirmation.unref()
     void proc.result
       .then(
         (exit) => exit.code,
@@ -730,10 +726,12 @@ export function createDockerDriver(options: {
       )
       .then((code) => {
         clearTimeout(confirmation)
-        if (subscription === proc) subscription = undefined
+        if (subscription !== proc) return
+        subscription = undefined
         if (shutdown.signal.aborted || !watcher) return
-        since = startedAt - 1_000
-        if (code === 0 && Date.now() - startedAt >= 1_000) {
+        const ran = Date.now() - startedAt >= 1_000
+        if (ran) since = startedAt - 1_000
+        if (code === 0 && ran) {
           losses = 0
           subscribe()
         } else lost(code, startedAt)
@@ -753,6 +751,7 @@ export function createDockerDriver(options: {
     clearTimeout(resubscribe)
     resubscribe = undefined
     subscription?.kill()
+    subscription = undefined
     announced = false
     losses = 0
   }
@@ -899,7 +898,7 @@ export function createDockerDriver(options: {
             '--filter',
             `label=kurumi.install=${options.install}`,
             '--format',
-            '{{.Names}}|{{.Label "kurumi.role"}}|{{.Label "kurumi.session"}}|{{.Label "kurumi.container"}}|{{.State}}',
+            '{{.Names}}|{{.Label "kurumi.role"}}|{{.Label "kurumi.session"}}|{{.Label "kurumi.container"}}|{{.Label "kurumi.revision"}}|{{.State}}',
           ])
           const listed = requireSuccess(exit, 'list').split('\n').filter(Boolean).map(parseListing)
           const tracked = [...agents.values(), ...replacements.values(), ...residue.values()]
@@ -924,15 +923,15 @@ export function createDockerDriver(options: {
       }
       agents.set(sessionId, agent)
       agent.watch = watchAgent(agent)
-      foreignWaits.add(name)
-      if (foreignWaits.size === 1)
-        void track(
-          Promise.resolve().then(() => {
-            const names = new Set(foreignWaits)
-            foreignWaits.clear()
-            return endForeignWaits(names)
-          }),
-        ).catch(() => {})
+      adoptedWaits.add(name)
+      waitScan ??= track(
+        Promise.resolve().then(() => {
+          const names = new Set(adoptedWaits)
+          adoptedWaits.clear()
+          waitScan = undefined
+          return endForeignWaits(names)
+        }),
+      ).catch(() => {})
       return { ok: true }
     },
     remove(name) {

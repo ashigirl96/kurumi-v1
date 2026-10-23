@@ -657,7 +657,14 @@ test('a new driver adopts a running agent from its labels alone and a repeated r
   try {
     const listed = await restarted.sweep()
     expect(listed).toEqual([
-      { name, role: 'agent', sessionId: 'ses-adopt', containerId: 'ctr-adopt', state: 'running' },
+      {
+        name,
+        role: 'agent',
+        sessionId: 'ses-adopt',
+        containerId: 'ctr-adopt',
+        revision: null,
+        state: 'running',
+      },
     ])
     const before = docker.cli.started.length
     expect(listed.map((entry) => restarted.adopt(entry))).toEqual([{ ok: true }])
@@ -684,6 +691,7 @@ test('adoption refuses a container whose name does not follow from its labels', 
     role: 'agent',
     sessionId: 'ses-adopt',
     containerId: 'ctr-adopt',
+    revision: null,
     state: 'running',
   }
   expect(dockerDriver.adopt(forged).ok).toBe(false)
@@ -737,7 +745,14 @@ test('a sweep lists and removes only containers that carry this install label', 
   })
   try {
     expect(await dockerDriver.sweep()).toEqual([
-      { name: 'own-probe', role: 'probe', sessionId: null, containerId: null, state: 'exited' },
+      {
+        name: 'own-probe',
+        role: 'probe',
+        sessionId: null,
+        containerId: null,
+        revision: null,
+        state: 'exited',
+      },
     ])
     await dockerDriver.remove('own-probe')
     await dockerDriver.kill('ctr-adopt', 0)
@@ -813,10 +828,17 @@ test('a driver has one events subscription that follows this install, reports it
   expect(first?.args).not.toContain('--since')
   docker.add('kurumi-agent-new', { 'kurumi.install': 'events' })
   await Bun.sleep(100)
+  const startedAt = Number(first?.args[(first?.args.indexOf('--until') ?? 0) + 1]) - 60
+  setSystemTime(new Date(Date.now() + 2_000))
   first?.proc.complete({ code: null })
+  await Bun.sleep(0)
+  setSystemTime()
   await until(() => changes.length === 3)
   const resumed = docker.commands('events')[1]
-  expect(resumed?.args).toContain('--since')
+  expect(Number(resumed?.args[(resumed?.args.indexOf('--since') ?? 0) + 1])).toBeCloseTo(
+    startedAt - 1,
+    2,
+  )
   expect(changes).toEqual([
     { kind: 'event' },
     { kind: 'lost', code: null, retryMs: 1000 },
@@ -829,7 +851,7 @@ test('a driver has one events subscription that follows this install, reports it
   await dockerDriver.stop()
 })
 
-test('a subscription that reaches the end of its window continues at once from where it ended', async () => {
+test('a subscription that reaches the end of its window resubscribes at once and replays the previous window', async () => {
   const docker = fakeDaemon()
   const dockerDriver = createDockerDriver({
     install: 'events',
@@ -867,7 +889,7 @@ function isAlive(pid: number): boolean {
 
 function supervisedHost(
   docker: ReturnType<typeof fakeDaemon>,
-  limits: { staleAfterMs?: number; intervalMs?: number } = {},
+  limits: { staleAfterMs?: number; intervalMs?: number; revision?: string } = {},
 ) {
   const dockerDriver = createDockerDriver({
     install: 'restart',
@@ -881,7 +903,7 @@ function supervisedHost(
     runtime: {
       ...configured,
       driver: dockerDriver,
-      supervision: { staleAfterMs: 60_000, intervalMs: 60_000, ...limits },
+      supervision: { staleAfterMs: 60_000, intervalMs: 60_000, revision: 'rev-1', ...limits },
     },
     runtimeLog: (entry) => logs.push(entry),
   })
@@ -1061,27 +1083,60 @@ test('a container silent past the stale limit is reaped and the next line starts
   }
 })
 
-test('an adopted container whose runner never calls is reaped within the first-call grace', async () => {
+test('a restart with another image, port or network replaces the container instead of adopting it', async () => {
   await ledger.stop()
   const docker = fakeDaemon()
-  const { token } = await restartedHost(docker)
-  const restarted = supervisedHost(docker, { staleAfterMs: 300, intervalMs: 10 })
+  const { token, who } = await restartedHost(docker)
+  const restartedAt = logs.length
+  const restarted = supervisedHost(docker, { revision: 'rev-2' })
   try {
     await restarted.sessions.start()
-    expect(restarted.sessions.authenticate(token)).not.toBeNull()
-    await until(() => restarted.sessions.authenticate(token) === null)
-    expect(decisions(0)).toContainEqual(
-      expect.objectContaining({
+    expect(restarted.sessions.authenticate(token)).toBeNull()
+    expect(decisions(restartedAt)).toMatchObject([
+      {
         kind: 'session.container.reaped',
-        reason: 'no channel call since start',
-      }),
+        containerId: who.containerId,
+        reason: 'created for another runtime',
+      },
+      { kind: 'session.adoption.done', adopted: 0, reaped: 1 },
+    ])
+    await until(() => docker.containers.size === 0)
+    await restarted.sessions.routeInbound(event('after restart'))
+    await until(() => docker.commands('create').length === 2)
+    expect(
+      flagValues(docker.commands('create')[1]?.args ?? [], '--label').filter((label) =>
+        label.startsWith('kurumi.revision='),
+      ),
+    ).toEqual(['kurumi.revision=rev-2'])
+  } finally {
+    await restarted.stop()
+  }
+})
+
+test('an adopted container keeps the tool deadline its runner declared before the restart', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const first = supervisedHost(docker)
+  await first.sessions.start()
+  await first.sessions.routeInbound(event('long tool'))
+  const [token = ''] = tokens(docker)
+  const { who } = await servedOnce(first, token)
+  first.sessions.channel.heartbeat(who, { currentTool: 'build', toolTimeoutMs: 600_000 })
+  await first.stop()
+  const restarted = supervisedHost(docker, { staleAfterMs: 200, intervalMs: 20 })
+  try {
+    await restarted.sessions.start()
+    await Bun.sleep(500)
+    expect(restarted.sessions.authenticate(token)).not.toBeNull()
+    expect(decisions(0)).not.toContainEqual(
+      expect.objectContaining({ kind: 'session.container.reaped' }),
     )
   } finally {
     await restarted.stop()
   }
 })
 
-test('a pass after a gap far longer than the interval restarts the liveness clocks instead of reaping', async () => {
+test('a host stall counts as at most a few intervals of silence, so a container that called just before it survives', async () => {
   await ledger.stop()
   const docker = fakeDaemon()
   const host = supervisedHost(docker, { staleAfterMs: 400, intervalMs: 50 })
@@ -1198,7 +1253,7 @@ test('a listing that gets no answer within the driver timeout fails the sweep in
     runtime: {
       ...configured,
       driver: dockerDriver,
-      supervision: { staleAfterMs: 60_000, intervalMs: 60_000 },
+      supervision: { staleAfterMs: 60_000, intervalMs: 60_000, revision: 'rev-1' },
     },
     runtimeLog: (entry) => logs.push(entry),
   })
@@ -1243,6 +1298,7 @@ test('adopting a container ends the docker wait a dead host left for it and keep
         role: 'agent',
         sessionId: 'ses-adopt',
         containerId: 'ctr-adopt',
+        revision: null,
         state: 'running',
       }),
     ).toEqual({ ok: true })

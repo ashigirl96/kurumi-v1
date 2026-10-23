@@ -1,18 +1,19 @@
 import type { ContainerInventory, InventoryChange, ListedContainer } from './driver/docker.ts'
 
-export type Liveness = { since: number; lastCall: number | null; toolDeadline: number | null }
+export type LivenessView = { silentMs: number; toolPending: boolean }
 export type ContainerRow = {
   id: string
   name: string
   sessionId: string
   status: 'starting' | 'running' | 'stopping'
   sessionActive: boolean
-  liveness: Liveness | null
+  toolDeadlineAt: number | null
+  liveness: LivenessView | null
 }
 
 export type Reconciliation =
   | { kind: 'adopt'; row: ContainerRow; container: ListedContainer; reason: string }
-  | { kind: 'reap'; row: ContainerRow; container: ListedContainer | null; reason: string }
+  | { kind: 'reap'; row: ContainerRow; reason: string }
   | { kind: 'stop'; container: ListedContainer; reason: string }
 
 export type SupervisionLog =
@@ -35,24 +36,68 @@ export type SupervisionLog =
   | { kind: 'session.events.subscribed'; attempt: number; monotonicMs: number }
   | { kind: 'session.events.lost'; code: number | null; retryMs: number; monotonicMs: number }
 
-const firstCallGraceMs = 60_000
+export type Liveness = ReturnType<typeof createLiveness>
 
-function staleness(liveness: Liveness, now: number, staleAfterMs: number): string | null {
-  if (liveness.lastCall === null)
-    return now - liveness.since > Math.min(staleAfterMs, firstCallGraceMs)
-      ? 'no channel call since start'
-      : null
-  if (liveness.toolDeadline !== null && now <= liveness.toolDeadline) return null
-  return now - liveness.lastCall > staleAfterMs ? 'stale' : null
+// Silence is measured in time the host was running: one gap between observations counts for at
+// most maxStepMs, so a suspended or stalled host never makes its containers look silent.
+export function createLiveness({
+  maxStepMs,
+  now = () => performance.now(),
+}: {
+  maxStepMs: number
+  now?: () => number
+}) {
+  let awake = 0
+  let seen = now()
+  const entries = new Map<string, { last: number; toolDeadline: number | null }>()
+  function clock(): number {
+    const current = now()
+    awake += Math.min(Math.max(0, current - seen), maxStepMs)
+    seen = current
+    return awake
+  }
+  return {
+    begin(id: string, toolTimeoutMs: number | null = null) {
+      const at = clock()
+      entries.set(id, {
+        last: at,
+        toolDeadline: toolTimeoutMs === null ? null : at + toolTimeoutMs,
+      })
+    },
+    touch(id: string) {
+      const entry = entries.get(id)
+      if (entry) entry.last = clock()
+    },
+    declareTool(id: string, toolTimeoutMs: number | null) {
+      const entry = entries.get(id)
+      if (entry) entry.toolDeadline = toolTimeoutMs === null ? null : clock() + toolTimeoutMs
+    },
+    end(id: string) {
+      entries.delete(id)
+    },
+    has(id: string) {
+      return entries.has(id)
+    },
+    view(id: string): LivenessView | null {
+      const entry = entries.get(id)
+      if (!entry) return null
+      const at = clock()
+      return {
+        silentMs: at - entry.last,
+        toolPending: entry.toolDeadline !== null && at <= entry.toolDeadline,
+      }
+    },
+  }
 }
 
-function unadoptable(row: ContainerRow, container: ListedContainer): string | null {
+function unadoptable(row: ContainerRow, container: ListedContainer, revision: string) {
   if (
     container.role !== 'agent' ||
     container.containerId !== row.id ||
     container.sessionId !== row.sessionId
   )
     return 'labels disagree with the row'
+  if (container.revision !== revision) return 'created for another runtime'
   if (!row.sessionActive) return 'session closed'
   if (container.state !== 'running') return 'container not running'
   return null
@@ -76,13 +121,13 @@ function leftover(role: ListedContainer['role']): string {
 export function planReconciliation({
   rows,
   containers,
-  now,
   staleAfterMs,
+  revision,
 }: {
   rows: readonly ContainerRow[]
   containers: readonly ListedContainer[] | null
-  now: number
   staleAfterMs: number
+  revision: string
 }): Reconciliation[] {
   const byName = new Map(containers?.map((container) => [container.name, container]))
   const claimed = new Set<string>()
@@ -92,22 +137,16 @@ export function planReconciliation({
     if (container) claimed.add(container.name)
     if (row.status === 'stopping') continue
     if (row.liveness) {
-      const reason = row.status === 'running' ? staleness(row.liveness, now, staleAfterMs) : null
-      if (reason !== null)
-        decisions.push({ kind: 'reap', row, container: container ?? null, reason })
+      const { silentMs, toolPending } = row.liveness
+      if (row.status === 'running' && !toolPending && silentMs > staleAfterMs)
+        decisions.push({ kind: 'reap', row, reason: 'stale' })
       continue
     }
     if (!containers) continue
-    if (!container) {
-      decisions.push({ kind: 'reap', row, container: null, reason: 'container missing' })
-      continue
-    }
-    const reason = unadoptable(row, container)
-    decisions.push(
-      reason === null
-        ? { kind: 'adopt', row, container, reason: 'running container matches its row' }
-        : { kind: 'reap', row, container, reason },
-    )
+    const reason = container ? unadoptable(row, container, revision) : 'container missing'
+    if (reason !== null) decisions.push({ kind: 'reap', row, reason })
+    else if (container)
+      decisions.push({ kind: 'adopt', row, container, reason: 'running container matches its row' })
   }
   for (const container of containers ?? [])
     if (!claimed.has(container.name))
@@ -119,26 +158,45 @@ export function createSupervisor(deps: {
   inventory: ContainerInventory
   staleAfterMs: number
   intervalMs: number
+  revision: string
   rows(): ContainerRow[]
   accept(row: ContainerRow): void
   reap(rowId: string, reason: string, name: string): void
-  restartClocks(): void
   log(entry: SupervisionLog): void
 }) {
-  const { inventory, staleAfterMs, intervalMs } = deps
+  const { inventory, intervalMs } = deps
+  const firstPass = Promise.withResolvers<void>()
   const adopted = Promise.withResolvers<void>()
   adopted.promise.catch(() => {})
-  let listed = false
   let stopped = false
-  let passing: Promise<void> | undefined
-  let again = false
-  let lastPassEnd: number | undefined
-  let retryMs = 250
-  let retry: ReturnType<typeof setTimeout> | undefined
-  let sweeper: ReturnType<typeof setInterval> | undefined
+  let pokedWhileBusy = false
+  let wake: (() => void) | undefined
+  let loop: Promise<void> | undefined
   let unwatch: (() => void) | undefined
   const failed = (reason: string) =>
     deps.log({ kind: 'session.reconcile.failed', reason, monotonicMs: performance.now() })
+
+  function poke() {
+    if (wake) wake()
+    else pokedWhileBusy = true
+  }
+
+  function pause(ms: number): Promise<void> {
+    if (pokedWhileBusy || stopped) {
+      pokedWhileBusy = false
+      return Promise.resolve()
+    }
+    const { promise, resolve } = Promise.withResolvers<void>()
+    const timer = setTimeout(resolve, ms)
+    timer.unref()
+    wake = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    return promise.finally(() => {
+      wake = undefined
+    })
+  }
 
   function apply(decision: Reconciliation): Reconciliation['kind'] {
     switch (decision.kind) {
@@ -186,57 +244,46 @@ export function createSupervisor(deps: {
     }
   }
 
-  async function pass(): Promise<void> {
-    if (lastPassEnd !== undefined && Date.now() - lastPassEnd > 3 * intervalMs) deps.restartClocks()
-    let containers: ListedContainer[] | null = null
-    try {
-      containers = await inventory.sweep()
-    } catch (cause) {
-      failed(String(cause))
+  async function run() {
+    let listed = false
+    let backoffMs = 250
+    for (;;) {
+      if (stopped) break
+      let containers: ListedContainer[] | null = null
+      try {
+        containers = await inventory.sweep()
+      } catch (cause) {
+        if (!stopped) failed(String(cause))
+      }
+      if (stopped) break
+      const counts = { adopt: 0, reap: 0, stop: 0 }
+      try {
+        for (const decision of planReconciliation({
+          rows: deps.rows(),
+          containers,
+          staleAfterMs: deps.staleAfterMs,
+          revision: deps.revision,
+        }))
+          counts[apply(decision)]++
+      } catch (cause) {
+        failed(String(cause))
+      }
+      if (containers && !listed) {
+        listed = true
+        deps.log({
+          kind: 'session.adoption.done',
+          adopted: counts.adopt,
+          reaped: counts.reap,
+          stopped: counts.stop,
+          monotonicMs: performance.now(),
+        })
+        adopted.resolve()
+      }
+      firstPass.resolve()
+      await pause(listed ? intervalMs : backoffMs)
+      if (!listed) backoffMs = Math.min(backoffMs * 2, intervalMs)
     }
-    if (stopped) return
-    const counts = { adopt: 0, reap: 0, stop: 0 }
-    for (const decision of planReconciliation({
-      rows: deps.rows(),
-      containers,
-      now: performance.now(),
-      staleAfterMs,
-    }))
-      counts[apply(decision)]++
-    lastPassEnd = Date.now()
-    if (listed) return
-    if (containers) {
-      listed = true
-      deps.log({
-        kind: 'session.adoption.done',
-        adopted: counts.adopt,
-        reaped: counts.reap,
-        stopped: counts.stop,
-        monotonicMs: performance.now(),
-      })
-      adopted.resolve()
-      return
-    }
-    retry = setTimeout(request, retryMs)
-    retry.unref()
-    retryMs = Math.min(retryMs * 2, intervalMs)
-  }
-
-  function request(): void {
-    if (stopped) return
-    if (passing) {
-      again = true
-      return
-    }
-    passing = pass()
-      .catch((cause: unknown) => failed(String(cause)))
-      .finally(() => {
-        passing = undefined
-        if (again) {
-          again = false
-          request()
-        }
-      })
+    firstPass.resolve()
   }
 
   function observe(change: InventoryChange) {
@@ -244,7 +291,7 @@ export function createSupervisor(deps: {
     const monotonicMs = performance.now()
     switch (change.kind) {
       case 'event':
-        request()
+        poke()
         return
       case 'lost':
         deps.log({
@@ -256,7 +303,7 @@ export function createSupervisor(deps: {
         return
       case 'subscribed':
         deps.log({ kind: 'session.events.subscribed', attempt: change.attempt, monotonicMs })
-        if (change.attempt > 0) request()
+        if (change.attempt > 0) poke()
         return
       default: {
         const unknown: never = change
@@ -268,20 +315,16 @@ export function createSupervisor(deps: {
   return {
     adopted: adopted.promise,
     async start() {
-      request()
-      await passing
-      if (stopped) return
-      unwatch = inventory.watch(observe)
-      sweeper = setInterval(request, intervalMs)
-      sweeper.unref()
+      loop ??= run()
+      await firstPass.promise
+      if (!stopped) unwatch = inventory.watch(observe)
     },
     stop(): Promise<void> {
       stopped = true
-      clearTimeout(retry)
-      clearInterval(sweeper)
       unwatch?.()
+      poke()
       adopted.reject(new Error('session supervision stopped'))
-      return passing ?? Promise.resolve()
+      return loop ?? Promise.resolve()
     },
   }
 }
