@@ -620,6 +620,8 @@ export function createDockerDriver(options: {
             replacement.create?.cancel()
             for (const proc of replacement.processes) proc.kill()
             await replacement.pending
+            if (replacement.create && replacement.ownership !== 'absent')
+              throw error('agent cleanup unconfirmed')
             return
           }
           const agent = [...agents.values()].find(
