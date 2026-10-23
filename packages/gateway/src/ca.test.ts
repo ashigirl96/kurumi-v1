@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import { X509Certificate } from 'node:crypto'
 
-import { createCertificateAuthority } from './ca.ts'
+import { certificateAuthority, createCertificateAuthority, generateCaMaterial } from './ca.ts'
 
 test('a P-256 leaf names its host and chains to the gateway CA', async () => {
   const ca = await createCertificateAuthority()
@@ -46,4 +46,14 @@ test('an IP leaf has an IP SAN', async () => {
   const ca = await createCertificateAuthority()
   const leaf = await ca.leafFor('127.0.0.1')
   expect(new X509Certificate(leaf.certPem).checkIP('127.0.0.1')).toBe('127.0.0.1')
+})
+
+test('a leaf minted in the last week of its CA expires with the CA', async () => {
+  const start = Date.now()
+  const material = await generateCaMaterial({ now: () => start })
+  const ca = await certificateAuthority(material, { now: () => start + 362 * 24 * 60 * 60 * 1000 })
+  const leaf = new X509Certificate((await ca.mintLeaf('fake.test')).certPem)
+  expect(Date.parse(leaf.validTo)).toBeLessThanOrEqual(
+    Date.parse(new X509Certificate(material.certPem).validTo),
+  )
 })

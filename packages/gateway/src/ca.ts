@@ -61,6 +61,10 @@ export async function generateCaMaterial({ now = Date.now }: Clock = {}): Promis
   return { certPem: certificate.toString('pem'), keyPem: await pkcs8Pem(keys.privateKey) }
 }
 
+export function certificateNotAfter(certPem: string): Date {
+  return new X509Certificate(certPem).notAfter
+}
+
 export async function certificateAuthority(
   material: CaMaterial,
   { now = Date.now }: Clock = {},
@@ -79,7 +83,7 @@ export async function certificateAuthority(
       subject: 'CN=kurumi leaf',
       issuer: certificate.subject,
       notBefore: new Date(now() - 60_000),
-      notAfter: new Date(now() + 7 * day),
+      notAfter: new Date(Math.min(now() + 7 * day, certificate.notAfter.getTime())),
       signingAlgorithm: algorithm,
       publicKey: leafKeys.publicKey,
       signingKey,

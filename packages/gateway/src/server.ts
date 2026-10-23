@@ -6,7 +6,12 @@ import { rootCertificates } from 'node:tls'
 import { open, seal } from '@kurumi/account/server'
 import type { Db } from '@kurumi/rpc/server'
 
-import { certificateAuthority, generateCaMaterial, type CertificateAuthority } from './ca.ts'
+import {
+  certificateAuthority,
+  certificateNotAfter,
+  generateCaMaterial,
+  type CertificateAuthority,
+} from './ca.ts'
 import { gatewayCa } from './schema.ts'
 
 export { migrations } from '../migrations/index.ts'
@@ -17,33 +22,48 @@ export type { CertificateAuthority } from './ca.ts'
 
 const CA_ROW = 1
 const CA_SEAL_ID = 'gateway_ca'
+const CA_RENEWAL_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 const CONTAINER_HOST = 'host.docker.internal'
 const CONTAINER_CA_PATH = '/etc/kurumi/ca.pem'
 const NO_PROXY = [CONTAINER_HOST, 'localhost', '127.0.0.1', '::1'].join(',')
+
+export type CaRenewal = { kind: 'gateway.ca.renewed'; previousNotAfter: string; notAfter: string }
 
 export async function loadCertificateAuthority(deps: {
   db: Db
   vaultKey: Uint8Array
   now?: () => number
+  log(event: CaRenewal): void
 }): Promise<CertificateAuthority> {
-  const create = async () => {
-    const material = await generateCaMaterial({ now: deps.now })
-    return deps.db
+  const now = deps.now ?? Date.now
+  const sealNewCa = async () => {
+    const material = await generateCaMaterial({ now })
+    const row = {
+      certPem: material.certPem,
+      sealedKey: seal(deps.vaultKey, CA_SEAL_ID, material.keyPem),
+      createdAt: new Date(now()),
+    }
+    deps.db
       .insert(gatewayCa)
-      .values({
-        id: CA_ROW,
-        certPem: material.certPem,
-        sealedKey: seal(deps.vaultKey, CA_SEAL_ID, material.keyPem),
-        createdAt: new Date(deps.now?.() ?? Date.now()),
-      })
-      .returning()
-      .get()
+      .values({ id: CA_ROW, ...row })
+      .onConflictDoUpdate({ target: gatewayCa.id, set: row })
+      .run()
+    return material
   }
-  const row = deps.db.select().from(gatewayCa).get() ?? (await create())
-  return certificateAuthority(
-    { certPem: row.certPem, keyPem: open(deps.vaultKey, CA_SEAL_ID, row.sealedKey) },
-    { now: deps.now },
-  )
+  const row = deps.db.select().from(gatewayCa).get()
+  if (!row) return certificateAuthority(await sealNewCa(), { now })
+  const stored = { certPem: row.certPem, keyPem: open(deps.vaultKey, CA_SEAL_ID, row.sealedKey) }
+  const previousNotAfter = certificateNotAfter(stored.certPem)
+  if (previousNotAfter.getTime() - now() > CA_RENEWAL_WINDOW_MS) {
+    return certificateAuthority(stored, { now })
+  }
+  const renewed = await sealNewCa()
+  deps.log({
+    kind: 'gateway.ca.renewed',
+    previousNotAfter: previousNotAfter.toISOString(),
+    notAfter: certificateNotAfter(renewed.certPem).toISOString(),
+  })
+  return certificateAuthority(renewed, { now })
 }
 
 export type CaBundle = { path: string; sha: string }

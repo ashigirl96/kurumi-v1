@@ -117,7 +117,11 @@ export async function startHost(config: HostConfig) {
     database = db
     migrateAll(db, migrations)
     const vaultKey = loadVaultKey(config.home, storedAccounts(db))
-    const ca = await loadCertificateAuthority({ db, vaultKey })
+    const ca = await loadCertificateAuthority({
+      db,
+      vaultKey,
+      log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
+    })
     const caBundle = stageCaBundle(config.home, ca.certPem)
     const runner = join(config.home, 'runner/runner.js')
     const gateway = gatewayContribution({ port: config.agentPort.port, caBundle })
