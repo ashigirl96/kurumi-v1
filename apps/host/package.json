@@ -3,9 +3,12 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@kurumi/access": "workspace:*",
     "@kurumi/account": "workspace:*",
     "@kurumi/agent": "workspace:*",
+    "@kurumi/chat": "workspace:*",
     "@kurumi/rpc": "workspace:*",
+    "@kurumi/session": "workspace:*",
     "@orpc/contract": "catalog:",
     "@orpc/server": "catalog:",
     "drizzle-orm": "catalog:",

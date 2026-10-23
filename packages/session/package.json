@@ -3,6 +3,23 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./server": "./src/server.ts"
+    "./contract": "./src/contract.ts",
+    "./schema": "./src/schema.ts",
+    "./server": "./src/server.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "scripts": {
+    "generate": "drizzle-kit generate"
+  },
+  "dependencies": {
+    "@kurumi/agent": "workspace:*",
+    "@kurumi/chat": "workspace:*",
+    "@kurumi/rpc": "workspace:*",
+    "@orpc/server": "catalog:",
+    "drizzle-orm": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "drizzle-kit": "catalog:"
   }
 }
