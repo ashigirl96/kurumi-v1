@@ -173,7 +173,11 @@ export function createApprovalLedger({
       return 'invalid'
     }
     const payload = procedurePayload.safeParse(row.payload)
-    return payload.success && payload.data.path.join('.') === path.join('.') ? 'valid' : 'invalid'
+    return payload.success &&
+      payload.data.path.length === path.length &&
+      payload.data.path.every((segment, index) => segment === path[index])
+      ? 'valid'
+      : 'invalid'
   }
 
   const request: ApprovalLedger['request'] = (tx, input) => {

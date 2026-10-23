@@ -43,19 +43,9 @@ const allow: Verdict = { kind: 'allow' }
 export function verdict(call: Omit<GuardCall, 'grant'>, facts: VerdictFacts): Verdict {
   const { caller, meta, path } = call
   const name = path.join('.')
-  switch (caller.kind) {
-    case 'host':
-      return allow
-    case 'human':
-      return facts.callerIsOwner
-        ? allow
-        : { kind: 'deny', reason: `only the owner may call ${name}` }
-    case 'agent':
-      break
-    default: {
-      const _exhaustive: never = caller
-      return _exhaustive
-    }
+  if (caller.kind === 'host') return allow
+  if (caller.kind === 'human') {
+    return facts.callerIsOwner ? allow : { kind: 'deny', reason: `only the owner may call ${name}` }
   }
   switch (meta.agent) {
     case undefined:
@@ -134,7 +124,7 @@ export function guardRouter<TContext extends KurumiContext>() {
   return os.$context<TContext>().$meta<Meta>({}).use(guarded)
 }
 
-/** Calls the procedure at `path` through every middleware the router put in front of it. */
+/** Goes through the router's middleware, so a replayed call meets the guard like any other call. */
 export async function callByPath<TContext extends KurumiContext>(
   router: Router<AnyContractRouter, TContext>,
   path: readonly string[],
