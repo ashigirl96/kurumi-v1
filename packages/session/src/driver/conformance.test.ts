@@ -1256,7 +1256,7 @@ test('a container silent past the stale limit is reaped and the next line starts
     await host.sessions.start()
     await host.sessions.routeInbound(event('work'))
     const [token = ''] = tokens(docker)
-    await servedOnce(host, token)
+    const { who } = await servedOnce(host, token)
     await Bun.sleep(200)
     await servedOnce(host, token)
     await Bun.sleep(200)
@@ -1264,6 +1264,10 @@ test('a container silent past the stale limit is reaped and the next line starts
     await until(() => host.sessions.authenticate(token) === null)
     expect(decisions(0)).toContainEqual(
       expect.objectContaining({ kind: 'session.container.reaped', reason: 'stale' }),
+    )
+    await until(
+      () =>
+        db.select().from(container).where(eq(container.id, who.containerId)).get() === undefined,
     )
     await host.sessions.routeInbound(event('after stale'))
     await until(() => docker.commands('create').length === 2)
