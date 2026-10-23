@@ -155,14 +155,15 @@ function duplicatedHeader(
 }
 
 function keyOf(vaultKey: Uint8Array, row: GrantRow): string | null {
+  let plaintext: unknown
   try {
-    const material = accountMaterial.safeParse(
-      JSON.parse(open(vaultKey, row.accountId, row.material)),
-    )
-    return material.success ? material.data.key : null
-  } catch {
-    return null
+    plaintext = JSON.parse(open(vaultKey, row.accountId, row.material))
+  } catch (error) {
+    if (error instanceof VaultError || error instanceof SyntaxError) return null
+    throw error
   }
+  const material = accountMaterial.safeParse(plaintext)
+  return material.success ? material.data.key : null
 }
 
 const pathWithoutQuery = (path: string): string => {
