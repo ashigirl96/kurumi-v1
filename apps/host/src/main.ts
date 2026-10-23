@@ -177,11 +177,11 @@ export async function startHost(config: HostConfig) {
     })
     const rpc = createRpcFronts(router, contextFor)
     const agentHandler = new RPCHandler(router)
-    // A runner whose token is refused exits for good, so adoption finishes before the Agent Port binds.
-    await sessionLedger.start()
+    const adopted = sessionLedger.start()
     admission = startAdmission({
-      bind: (probeNonce) =>
-        startAgentPort({
+      bind: async (probeNonce) => {
+        await adopted
+        return startAgentPort({
           bind: config.agentPort,
           probeNonce,
           authenticate: (token) => sessionLedger.authenticate(token),
@@ -202,12 +202,14 @@ export async function startHost(config: HostConfig) {
             })
             if (!result.matched) response.writeHead(404).end()
           },
-        }),
+        })
+      },
       probe: (url, options) => docker.probe(url, options),
       log: (message) => {
         process.stdout.write(`${JSON.stringify({ kind: 'gateway.admission', message })}\n`)
       },
     })
+    await adopted
     const stale = lstatSync(socket, { throwIfNoEntry: false })
     if (stale && !stale.isSocket()) throw new Error(`${socket} exists and is not a socket`)
     rmSync(socket, { force: true })
