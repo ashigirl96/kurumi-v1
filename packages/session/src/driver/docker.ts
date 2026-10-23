@@ -101,6 +101,10 @@ const nativeCli: Cli = {
   },
 }
 
+function endedBySignal(exit: CliResult): boolean {
+  return exit.code === null || exit.code > 128
+}
+
 function fetchProgram(timeoutMs: number): string {
   return `
 const response = await fetch(Bun.argv.at(-1), { signal: AbortSignal.timeout(${timeoutMs}) });
@@ -149,9 +153,7 @@ export function createDockerDriver(options: {
       state: 'pending',
       result: Promise.race([proc.result, deadline.promise])
         .then((exit) => {
-          // A CLI ended by a signal exits without the daemon's answer while the daemon may still create.
-          if (create.state === 'pending' && (exit.code === null || exit.code > 128))
-            create.state = 'unconfirmed'
+          if (create.state === 'pending' && endedBySignal(exit)) create.state = 'unconfirmed'
           return exit
         })
         .finally(() => {
