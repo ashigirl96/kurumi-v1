@@ -10,7 +10,7 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 
-import { createAccountLedger } from '@kurumi/account/server'
+import { createAccountLedger, router as accountRouter } from '@kurumi/account/server'
 import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import { startAdmission, startAgentPort } from '@kurumi/gateway/server'
@@ -124,7 +124,12 @@ export async function startHost(config: HostConfig) {
     const db = openKurumiDb(join(config.home, 'kurumi.db'))
     database = db
     migrateAll(db, migrations)
-    const agentLedger = createAgentLedger({ db, home: config.home })
+    const accountLedger = createAccountLedger({ db, vaultKey })
+    const agentLedger = createAgentLedger({
+      db,
+      home: config.home,
+      onCreate: (tx, agentGroupId) => accountLedger.grantAutoGrants(tx, agentGroupId),
+    })
     const chatLedger = createChatLedger({
       db,
       agentLedger,
@@ -161,7 +166,7 @@ export async function startHost(config: HostConfig) {
       agentLedger,
       chatLedger,
       sessionLedger,
-      accountLedger: createAccountLedger({ db, vaultKey }),
+      accountLedger,
     }
     type HostContext = KurumiContext &
       typeof ledgers & {
@@ -171,6 +176,7 @@ export async function startHost(config: HostConfig) {
     const admin = implement(hostContract).$context<HostContext>()
     const router = guardRouter<HostContext>().router({
       agent: agentRouter,
+      account: accountRouter,
       chat: chatRouter,
       session: sessionRouter,
       status: admin.status.handler(() => ({ ready: true })),

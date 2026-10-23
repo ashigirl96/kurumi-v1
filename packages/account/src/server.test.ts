@@ -1,12 +1,20 @@
-import { beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { randomBytes } from 'node:crypto'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
+import { createAgentLedger } from '@kurumi/agent/server'
+import type { Caller } from '@kurumi/rpc/contract'
+import { guardRouter, type KurumiContext } from '@kurumi/rpc/server'
+import { createRouterClient, ORPCError } from '@orpc/server'
 import { sql } from 'drizzle-orm'
 
 import { account, accountGrant, defaultAccount } from './schema.ts'
 import {
   accountHandle,
   createAccountLedger,
+  router,
   selectAccount,
   type AccountLedger,
   type AddKeyInput,
@@ -386,6 +394,166 @@ describe('key accounts', () => {
 
     expect(defaultRows().map(({ agentGroupId }) => agentGroupId)).toEqual(['g2'])
     expect(ledger.candidates('g1', 'gmail')).toHaveLength(3)
+  })
+})
+
+describe('auto-grant on agent create', () => {
+  let home: string
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'kurumi-account-'))
+  })
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  test('a new agent group gets every auto-grant account in the create transaction', () => {
+    addKey({ autoGrant: true })
+    addKey({ vendor: 'github', label: 'gh' })
+    const agents = createAgentLedger({
+      db,
+      home,
+      onCreate: (tx, agentGroupId) => ledger.grantAutoGrants(tx, agentGroupId),
+    })
+
+    const created = agents.create({ name: 'home' })
+
+    expect(
+      grantRows()
+        .filter((row) => row.agentGroupId === created.id)
+        .map(({ accountId, service, grantedBy }) => ({ accountId, service, grantedBy })),
+    ).toEqual([
+      {
+        accountId: accountRow('main')?.id ?? '',
+        service: 'anthropic-api',
+        grantedBy: 'auto-grant',
+      },
+    ])
+  })
+})
+
+const client = (caller: Caller = { kind: 'host' }) =>
+  createRouterClient(
+    guardRouter<KurumiContext & { accountLedger: AccountLedger }>().router(router),
+    {
+      context: {
+        db,
+        caller,
+        guard: () => ({ kind: 'allow' }),
+        grant: null,
+        accountLedger: ledger,
+      },
+    },
+  )
+
+const failure = async (call: Promise<unknown>) => {
+  try {
+    await call
+  } catch (error) {
+    if (error instanceof ORPCError) return { code: error.code, message: error.message }
+    throw error
+  }
+  throw new Error('expected the call to fail')
+}
+
+describe('the account router', () => {
+  test('add-key returns the handle and records who added it', async () => {
+    expect(
+      await client({ kind: 'human', userId: 'u1' }).addKey([
+        'anthropic',
+        { label: 'main', value: secret, autoGrant: true, auth: 'oauth-token' },
+      ]),
+    ).toEqual({ handle: 'anthropic/main' })
+    expect(grantRows().map(({ grantedBy }) => grantedBy)).toEqual([
+      'human:u1',
+      'human:u1',
+      'human:u1',
+    ])
+    expect(await client().list()).toContainEqual({
+      handle: 'anthropic/main',
+      kind: 'key',
+      authMode: 'oauth-token',
+      services: ['anthropic-api'],
+      autoGrant: true,
+    })
+  })
+
+  test('a duplicate label is a CONFLICT naming the handle and never the key', async () => {
+    await client().addKey(['anthropic', { label: 'main', value: secret }])
+
+    const error = await failure(client().addKey(['anthropic', { label: 'main', value: secret }]))
+
+    expect(error).toEqual({ code: 'CONFLICT', message: 'anthropic/main already exists' })
+  })
+
+  test('an auth mode the vendor lacks is a BAD_REQUEST', async () => {
+    expect(
+      await failure(client().addKey(['github', { label: 'gh', value: secret, auth: 'api-key' }])),
+    ).toEqual({ code: 'BAD_REQUEST', message: 'github has no auth mode api-key; it takes none' })
+  })
+
+  test('grant, set and clear a default, revoke and remove, each by handle', async () => {
+    const target = { service: 'gmail', agentGroupId: 'g3' } as const
+
+    await client().grant(['google/a@work.example', target])
+    await client().setDefault(['google/a@work.example', target])
+    expect(ledger.candidates('g3', 'gmail')).toEqual([
+      { accountId: 'acc-a', handle: handleA, isDefault: true, status: 'active' },
+    ])
+    expect(grantRows().find((row) => row.agentGroupId === 'g3')?.grantedBy).toBe('host')
+
+    await client().clearDefault(target)
+    expect(defaultRows()).toEqual([])
+
+    await client().revoke(['google/a@work.example', target])
+    expect(grantRows()).toEqual([])
+
+    await client().remove(['google/a@work.example'])
+    expect(accountRow('a@work.example')).toBeUndefined()
+  })
+
+  test('refusals map to NOT_FOUND for a missing account or group and BAD_REQUEST otherwise', async () => {
+    const target = { service: 'gmail', agentGroupId: 'g1' } as const
+
+    expect(await failure(client().grant(['google/nobody', target]))).toEqual({
+      code: 'NOT_FOUND',
+      message: 'no account google/nobody',
+    })
+    expect(
+      await failure(
+        client().grant(['google/a@work.example', { ...target, agentGroupId: 'g-missing' }]),
+      ),
+    ).toEqual({ code: 'NOT_FOUND', message: 'no agent group g-missing' })
+    expect(
+      await failure(
+        client().grant(['google/c@work.example', { ...target, service: 'google-calendar' }]),
+      ),
+    ).toEqual({
+      code: 'BAD_REQUEST',
+      message: 'google/c@work.example does not cover google-calendar',
+    })
+    expect(await failure(client().setDefault(['google/a@work.example', target]))).toEqual({
+      code: 'BAD_REQUEST',
+      message: 'google/a@work.example is not granted gmail for g1',
+    })
+    expect(await failure(client().remove(['nope/x']))).toEqual({
+      code: 'BAD_REQUEST',
+      message: 'nope/x is not <vendor>/<label> with a known vendor',
+    })
+  })
+
+  test('an agent caller is refused every procedure', async () => {
+    const agent = client({ kind: 'agent', agentGroupId: 'g1', sessionId: 's1' })
+
+    for (const call of [
+      agent.list(),
+      agent.addKey(['anthropic', { label: 'main', value: secret }]),
+      agent.remove(['google/a@work.example']),
+    ]) {
+      expect((await failure(call)).code).toBe('FORBIDDEN')
+    }
+    expect(accountRow('main')).toBeUndefined()
   })
 })
 

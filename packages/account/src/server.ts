@@ -1,5 +1,7 @@
 import { agentGroup } from '@kurumi/agent/schema'
-import type { Db, Tx } from '@kurumi/rpc/server'
+import type { Caller } from '@kurumi/rpc/contract'
+import { transaction, type Db, type KurumiContext, type Tx } from '@kurumi/rpc/server'
+import { implement, ORPCError } from '@orpc/server'
 import { and, eq, sql } from 'drizzle-orm'
 
 import {
@@ -11,6 +13,7 @@ import {
   type ServiceId,
   type VendorId,
 } from './catalog.ts'
+import { contract } from './contract.ts'
 import { account, accountGrant, defaultAccount } from './schema.ts'
 import {
   accountHandle,
@@ -288,3 +291,118 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
     },
   }
 }
+
+type Refusal = AddKeyRefusal | HandleRefusal | GrantRefusal | 'grant_not_found'
+
+type RefusalSubject = {
+  handle: string
+  authMode?: AuthMode
+  service?: ServiceId
+  agentGroupId?: string
+}
+
+function refusalError(
+  refusal: Refusal,
+  { handle, authMode, service, agentGroupId }: RefusalSubject,
+): ORPCError<string, unknown> {
+  switch (refusal) {
+    case 'label_taken':
+      return new ORPCError('CONFLICT', { message: `${handle} already exists` })
+    case 'account_not_found':
+      return new ORPCError('NOT_FOUND', { message: `no account ${handle}` })
+    case 'agent_group_not_found':
+      return new ORPCError('NOT_FOUND', { message: `no agent group ${agentGroupId}` })
+    case 'invalid_handle':
+      return new ORPCError('BAD_REQUEST', {
+        message: `${handle} is not <vendor>/<label> with a known vendor`,
+      })
+    case 'auth_mode_not_supported': {
+      const vendor = parseAccountHandle(handle)?.vendor
+      const modes = vendor ? authModesOf(vendor) : []
+      const accepted = modes.length > 0 ? `use one of ${modes.join(', ')}` : 'it takes none'
+      return new ORPCError('BAD_REQUEST', {
+        message: `${vendor} has no auth mode ${authMode}; ${accepted}`,
+      })
+    }
+    case 'service_not_covered':
+      return new ORPCError('BAD_REQUEST', { message: `${handle} does not cover ${service}` })
+    case 'grant_not_found':
+      return new ORPCError('BAD_REQUEST', {
+        message: `${handle} is not granted ${service} for ${agentGroupId}`,
+      })
+  }
+}
+
+function actorOf(caller: Caller): string {
+  switch (caller.kind) {
+    case 'host':
+      return 'host'
+    case 'human':
+      return `human:${caller.userId}`
+    case 'agent':
+      throw new ORPCError('FORBIDDEN', { message: 'agents may not change accounts' })
+  }
+}
+
+function existingAccountId(ledger: AccountLedger, tx: Tx, handle: string): string {
+  const found = ledger.accountIdOf(tx, handle)
+  if (!found.ok) throw refusalError(found.refusal, { handle })
+  return found.accountId
+}
+
+const os = implement(contract).$context<KurumiContext & { accountLedger: AccountLedger }>()
+
+export const router = os.router({
+  addKey: os.addKey.handler(({ context, input: [vendor, { label, auth, autoGrant, value }] }) => {
+    const addedBy = actorOf(context.caller)
+    const result = transaction(context.db, (tx) =>
+      context.accountLedger.addKey(tx, {
+        vendor,
+        label,
+        authMode: auth,
+        value,
+        autoGrant,
+        addedBy,
+      }),
+    )
+    if (!result.ok)
+      throw refusalError(result.refusal, { handle: `${vendor}/${label}`, authMode: auth })
+    return { handle: result.handle }
+  }),
+  list: os.list.handler(({ context }) => context.accountLedger.list()),
+  remove: os.remove.handler(({ context, input: [handle] }) => {
+    transaction(context.db, (tx) => {
+      const result = context.accountLedger.remove(tx, handle)
+      if (!result.ok) throw refusalError(result.refusal, { handle })
+    })
+  }),
+  grant: os.grant.handler(({ context, input: [handle, { service, agentGroupId }] }) => {
+    const grantedBy = actorOf(context.caller)
+    transaction(context.db, (tx) => {
+      const ledger = context.accountLedger
+      const accountId = existingAccountId(ledger, tx, handle)
+      const result = ledger.grant(tx, { agentGroupId, accountId, service, grantedBy })
+      if (!result.ok) throw refusalError(result.refusal, { handle, service, agentGroupId })
+    })
+  }),
+  revoke: os.revoke.handler(({ context, input: [handle, { service, agentGroupId }] }) => {
+    transaction(context.db, (tx) => {
+      const ledger = context.accountLedger
+      const accountId = existingAccountId(ledger, tx, handle)
+      ledger.revoke(tx, { agentGroupId, accountId, service })
+    })
+  }),
+  setDefault: os.setDefault.handler(({ context, input: [handle, { service, agentGroupId }] }) => {
+    transaction(context.db, (tx) => {
+      const ledger = context.accountLedger
+      const accountId = existingAccountId(ledger, tx, handle)
+      const result = ledger.setDefault(tx, { agentGroupId, accountId, service })
+      if (!result.ok) throw refusalError(result.refusal, { handle, service, agentGroupId })
+    })
+  }),
+  clearDefault: os.clearDefault.handler(({ context, input }) => {
+    transaction(context.db, (tx) => {
+      context.accountLedger.clearDefault(tx, input)
+    })
+  }),
+})
