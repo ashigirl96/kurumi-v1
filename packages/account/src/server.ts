@@ -24,6 +24,8 @@ import {
 import { open, seal, VaultError } from './vault.ts'
 
 export { migrations } from '../migrations/index.ts'
+export { isInterceptedHost } from './catalog.ts'
+export { open, seal, VaultError } from './vault.ts'
 export { accountHandle, parseAccountHandle, selectAccount } from './select.ts'
 export type {
   AccountHandle,
