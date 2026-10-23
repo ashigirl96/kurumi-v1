@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 
 import { createDockerDriver } from '../server.ts'
+import type { Cli } from './docker.ts'
 import { FakeCli } from './fake-cli.ts'
 
 const image = 'kurumi-agent:test'
@@ -870,3 +871,69 @@ test('kill aborts a replacement create after its predecessor cleanup finishes', 
   await driver.stop()
   expect(cancelled).toBe(true)
 })
+
+test.each(['agent', 'probe'] as const)(
+  'stop removes a late daemon create for %s even when killing its CLI would finish first',
+  async (role) => {
+    const cli = new FakeCli()
+    const containers = new Set<string>()
+    const created = Promise.withResolvers<void>()
+    const daemon: Cli = {
+      start(args) {
+        const proc = cli.start(args)
+        if (args[0] === 'create') {
+          const name = containerName([...args])
+          setTimeout(() => {
+            containers.add(name)
+            proc.complete({ stdout: name })
+            created.resolve()
+          }, 50)
+          return {
+            result: proc.result,
+            kill() {
+              proc.kill()
+              proc.complete({ code: null })
+            },
+          }
+        }
+        if (args[0] === 'rm') {
+          const name = args.at(-1) ?? ''
+          proc.complete(
+            containers.delete(name)
+              ? { stdout: name }
+              : { code: 1, stderr: `No such container: ${name}` },
+          )
+        }
+        return proc
+      },
+    }
+    const driver = createDockerDriver({ install: 'test-install', image, cli: daemon })
+    const pending = role === 'agent' ? driver.run(agentSpec()) : observe(driver.probe(url))
+    await call(cli, 0)
+    await driver.stop()
+    await pending
+    await created.promise
+    expect([...containers]).toEqual([])
+    expect(cli.started.some(({ args }) => args[0] === 'start')).toBe(false)
+  },
+)
+
+test.each(['agent', 'probe'] as const)(
+  'stop reports unconfirmed cleanup within its bound when %s create never settles',
+  async (role) => {
+    const cli = new FakeCli()
+    const driver = createDockerDriver({ install: 'test', image, cli, timeoutMs: 30 })
+    const pending = role === 'agent' ? driver.run(agentSpec()) : observe(driver.probe(url))
+    const create = await call(cli, 0)
+    const stopped = driver.stop().then(
+      () => 'success',
+      (error: unknown) => String(error),
+    )
+    const result = await Promise.race([stopped, Bun.sleep(250).then(() => 'still waiting')])
+    expect(result).toContain('cleanup')
+    expect(create.proc.killed).toBe(true)
+    expect(cli.started.some(({ args }) => args[0] === 'start')).toBe(false)
+    create.proc.complete({ code: null })
+    await pending
+  },
+)
