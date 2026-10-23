@@ -1,6 +1,7 @@
 import { Database } from 'bun:sqlite'
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { rejects } from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -475,11 +476,33 @@ function flagValues(args: readonly string[], flag: string): string[] {
   return args.flatMap((arg, index) => (arg === flag ? [args[index + 1] ?? ''] : []))
 }
 
-type DaemonContainer = { labels: Map<string, string>; state: string; waits: Set<FakeProcess> }
+type DaemonContainer = {
+  id: string
+  labels: Map<string, string>
+  state: string
+  waits: Set<FakeProcess>
+}
+
+function render(format: string, name: string, entry: DaemonContainer, noTrunc: boolean): string {
+  const field = (expression: string) => {
+    const label = /^\(?\.Label "([^"]+)"\)?$/.exec(expression)?.[1]
+    if (label !== undefined) return entry.labels.get(label) ?? ''
+    if (expression === '.ID') return noTrunc ? entry.id : entry.id.slice(0, 12)
+    if (expression === '.Names') return name
+    if (expression === '.State') return entry.state
+    throw new Error(`the fake daemon cannot render ${expression}`)
+  }
+  return format.replace(
+    /\{\{(json )?(.+?)\}\}/g,
+    (_match, json: string | undefined, expression: string) =>
+      json ? JSON.stringify(field(expression)) : field(expression),
+  )
+}
 
 function fakeDaemon() {
   const cli = new FakeCli()
   const containers = new Map<string, DaemonContainer>()
+  const images = new Map<string, Record<string, string>>()
   const streams = new Set<(line: string) => void>()
   const held = new Map<string, (() => void)[]>()
   const failing = new Set<string>()
@@ -488,8 +511,17 @@ function fakeDaemon() {
     for (const stream of streams) stream(`${action} ${name}`)
   }
   function add(name: string, labels: Record<string, string>, state = 'running') {
-    containers.set(name, { labels: new Map(Object.entries(labels)), state, waits: new Set() })
+    containers.set(name, {
+      id: randomBytes(32).toString('hex'),
+      labels: new Map(Object.entries(labels)),
+      state,
+      waits: new Set(),
+    })
     emit('create', name)
+  }
+  function resolve(reference: string): string {
+    for (const [name, entry] of containers) if (entry.id === reference) return name
+    return reference
   }
   function exit(name: string, code: number) {
     const entry = containers.get(name)
@@ -512,6 +544,7 @@ function fakeDaemon() {
     return [...containers].filter(([name, entry]) =>
       filters.every((filter) => {
         if (filter.startsWith('name=')) return filter === `name=^/${name}$`
+        if (filter.startsWith('id=')) return entry.id.includes(filter.slice('id='.length))
         if (!filter.startsWith('label=')) return true
         const [key = '', value = ''] = filter.slice('label='.length).split(/=(.*)/s)
         return entry.labels.get(key) === value
@@ -520,15 +553,19 @@ function fakeDaemon() {
   }
   function act(args: readonly string[], proc: FakeProcess, onLine?: (line: string) => void) {
     const [command] = args
-    const name = args.at(-1) ?? ''
+    const reference = args.at(-1) ?? ''
+    const name = resolve(reference)
     const answer = (result: Partial<CliResult>) => proc.complete(result)
     const missing = () =>
-      answer({ code: 1, stderr: `Error response from daemon: No such entry: ${name}` })
+      answer({ code: 1, stderr: `Error response from daemon: No such entry: ${reference}` })
     if (command === 'create') {
       const created = flagValues(args, '--name')[0] ?? ''
-      const labels = Object.fromEntries(
-        flagValues(args, '--label').map((label) => label.split(/=(.*)/s).slice(0, 2)),
-      )
+      const labels = {
+        ...images.get(args[args.indexOf('bun') - 1] ?? ''),
+        ...Object.fromEntries(
+          flagValues(args, '--label').map((label) => label.split(/=(.*)/s).slice(0, 2)),
+        ),
+      }
       if (late !== undefined) {
         const code = late
         late = undefined
@@ -556,22 +593,15 @@ function fakeDaemon() {
       exit(name, 143)
       answer({})
     } else if (command === 'rm') {
-      if (remove(name)) answer({ stdout: `${name}\n` })
+      if (remove(name)) answer({ stdout: `${reference}\n` })
       else missing()
     } else if (command === 'ps') {
       const format = flagValues(args, '--format')[0] ?? '{{.Names}}'
       answer({
         stdout: selected(args)
-          .map(([listed, entry]) =>
-            format
-              .replaceAll('{{.Names}}', listed)
-              .replaceAll('{{.State}}', entry.state)
-              .replace(
-                /\{\{\.Label "([^"]+)"\}\}/g,
-                (_match, key: string) => entry.labels.get(key) ?? '',
-              ),
+          .map(
+            ([listed, entry]) => `${render(format, listed, entry, args.includes('--no-trunc'))}\n`,
           )
-          .map((line) => `${line}\n`)
           .join(''),
       })
     } else if (command === 'events' && onLine) {
@@ -607,6 +637,9 @@ function fakeDaemon() {
     add,
     exit,
     remove,
+    labelImage(image: string, labels: Record<string, string>) {
+      images.set(image, labels)
+    },
     hold(command: string) {
       held.set(command, [])
     },
@@ -1086,6 +1119,128 @@ test('a restarted host stops containers without a live row and never touches ano
     expect(docker.cli.joined().join('\n')).not.toMatch(/kurumi-agent-other|kurumi\.install=other/)
   } finally {
     await host.stop()
+  }
+})
+
+test('a label value that carries a newline and other names never makes the sweep remove those containers', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  docker.add('kurumi-agent-other', {
+    'kurumi.install': 'other',
+    'kurumi.role': 'agent',
+    'kurumi.session': 'ses-other',
+    'kurumi.container': 'ctr-other',
+  })
+  docker.add('unlabelled', {})
+  docker.add('injector', {
+    'kurumi.install': 'restart',
+    'kurumi.role': 'x\nkurumi-agent-other\nunlabelled',
+  })
+  const host = supervisedHost(docker)
+  try {
+    await host.sessions.start()
+    await until(() => !docker.containers.has('injector'))
+    await Bun.sleep(50)
+    expect([...docker.containers.keys()]).toEqual(['kurumi-agent-other', 'unlabelled'])
+    expect(docker.cli.joined().join('\n')).not.toMatch(/kurumi-agent-other|unlabelled/)
+  } finally {
+    await host.stop()
+  }
+})
+
+test('a probe image label that carries a newline and another name never makes the sweep remove that container', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  docker.add('unlabelled', {})
+  docker.labelImage('agent-test', { 'kurumi.session': 'x\nunlabelled' })
+  docker.hold('start')
+  const host = supervisedHost(docker)
+  const probing = host.dockerDriver.probe('http://host.docker.internal:1/probe/nonce').catch(String)
+  try {
+    await until(() => docker.commands('start').length === 1)
+    await host.sessions.start()
+    await host.sessions.adopted()
+    await Bun.sleep(50)
+    docker.release('start')
+    expect(await probing).toBe('probe-body')
+    expect([...docker.containers.keys()]).toEqual(['unlabelled'])
+    expect(docker.cli.joined().join('\n')).not.toMatch(/unlabelled/)
+  } finally {
+    await host.stop()
+  }
+})
+
+test('a forged listing line naming a running agent with other labels never makes the restarted host reap it', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const { token, who, first } = await restartedHost(docker)
+  const name = first.dockerDriver.nameOf(who.containerId)
+  docker.add('injector', {
+    'kurumi.install': 'restart',
+    'kurumi.revision': `x\n${name}|agent|ses-forged|${who.containerId}|rev-1`,
+  })
+  const restartedAt = logs.length
+  const restarted = supervisedHost(docker)
+  try {
+    await restarted.sessions.start()
+    await restarted.sessions.adopted()
+    await until(() => !docker.containers.has('injector'))
+    await Bun.sleep(50)
+    expect(restarted.sessions.authenticate(token)).not.toBeNull()
+    expect(docker.containers.get(name)?.state).toBe('running')
+    expect(docker.commands('rm').map(({ args }) => args.at(-1))).not.toContain(name)
+    expect(decisions(restartedAt)).toContainEqual(
+      expect.objectContaining({ kind: 'session.container.adopted', name }),
+    )
+  } finally {
+    await restarted.stop()
+  }
+})
+
+test('a forged listing line never makes the restarted host adopt a container outside its listing or end a docker wait for it', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const { who, first } = await restartedHost(docker)
+  const name = first.dockerDriver.nameOf(who.containerId)
+  docker.remove(name)
+  docker.add(name, {})
+  docker.add('injector', {
+    'kurumi.install': 'restart',
+    'kurumi.revision': `x\n${name}|agent|${who.sessionId}|${who.containerId}|rev-1`,
+  })
+  const dir = mkdtempSync(join(tmpdir(), 'kurumi-forged-wait-'))
+  writeFileSync(join(dir, 'docker'), '#!/bin/sh\nwhile :; do sleep 0.05; done\n', { mode: 0o755 })
+  const spawned = Bun.spawn(
+    ['sh', '-c', `"${dir}/docker" wait ${name} >/dev/null 2>&1 & echo $!`],
+    { stdout: 'pipe' },
+  )
+  const foreign = Number((await new Response(spawned.stdout).text()).trim())
+  const restartedAt = logs.length
+  const before = docker.cli.started.length
+  const restarted = supervisedHost(docker)
+  try {
+    await restarted.sessions.start()
+    await restarted.sessions.adopted()
+    await until(() => !docker.containers.has('injector'))
+    await Bun.sleep(200)
+    expect(isAlive(foreign)).toBe(true)
+    expect(
+      docker.cli
+        .joined()
+        .slice(before)
+        .filter((line) => line.includes(name)),
+    ).toEqual([])
+    expect(decisions(restartedAt)).toContainEqual(
+      expect.objectContaining({
+        kind: 'session.container.reaped',
+        containerId: who.containerId,
+        reason: 'container missing',
+      }),
+    )
+  } finally {
+    if (isAlive(foreign)) process.kill(foreign, 'SIGTERM')
+    await restarted.stop()
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 
