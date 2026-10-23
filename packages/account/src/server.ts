@@ -173,19 +173,20 @@ const pathWithoutQuery = (path: string): string => {
 
 function injectionFor({
   service,
+  slotHeaders,
   row,
   secret,
   stripped,
   requested,
 }: {
   service: ServiceId
+  slotHeaders: readonly string[]
   row: GrantRow
   secret: string
   stripped: { headers: Headers; url: URL }
   requested: { path: string; url: URL }
 }): Injection {
   const { slot } = placementOf(service, row.authMode)
-  const slotHeaders = slotHeadersOf(service)
   return Object.freeze({
     handle: row.handle,
     accountId: row.accountId,
@@ -485,7 +486,8 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
       const located = serviceFor(request.host, request.path)
       if (!located) return { kind: 'pass' }
       const { vendor, service } = located
-      const header = duplicatedHeader(slotHeadersOf(service), request.rawHeaders)
+      const slotHeaders = slotHeadersOf(service)
+      const header = duplicatedHeader(slotHeaders, request.rawHeaders)
       if (header !== undefined) {
         return { kind: 'refuse', refusal: { code: 'duplicate_slot', service, header } }
       }
@@ -512,6 +514,7 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
         kind: 'inject',
         injection: injectionFor({
           service,
+          slotHeaders,
           row,
           secret,
           stripped,
