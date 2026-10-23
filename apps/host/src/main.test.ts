@@ -1,5 +1,6 @@
 import { Database } from 'bun:sqlite'
 import { afterEach, expect, test } from 'bun:test'
+import { randomBytes } from 'node:crypto'
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -321,28 +322,86 @@ test('the temporary host guard allows host and human callers and only agent chan
   }
 })
 
-test('a host whose kurumi.db holds accounts refuses to start without vault.key and writes no new key', async () => {
+async function cli(home: string, args: string[], stdin = ''): Promise<void> {
+  const child = Bun.spawn(
+    [process.execPath, join(import.meta.dir, '../../cli/src/main.ts'), ...args],
+    {
+      env: { ...process.env, KURUMI_HOME: home },
+      stdin: new Blob([stdin]),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  )
+  expect({
+    args,
+    exit: await child.exited,
+    stderr: await new Response(child.stderr).text(),
+  }).toEqual({ args, exit: 0, stderr: '' })
+}
+
+async function homeWithGrantedAccount(): Promise<{ home: string; key: Buffer }> {
   const home = homeForTest()
   const first = spawnHost(home)
   await waitForHost(home, first)
+  await cli(home, ['agent', 'create', '--name', 'work'])
+  await cli(
+    home,
+    ['account', 'add-key', 'anthropic', '--label', 'main', '--auto-grant'],
+    'sk-ant-one\n',
+  )
   first.kill('SIGTERM')
   expect(await first.exited).toBe(0)
-  const sqlite = new Database(join(home, 'kurumi.db'))
-  sqlite.run(
-    `INSERT INTO account (id, vendor, label, kind, auth_mode, services, material, status, created_at)
-     VALUES ('acc-a', 'anthropic', 'main', 'key', 'api-key', '["anthropic-api"]', x'00', 'active', 0)`,
-  )
-  sqlite.close()
+  const key = readFileSync(join(home, 'vault.key'))
+  return { home, key }
+}
+
+test('a host whose kurumi.db holds accounts refuses to start without vault.key and writes no new key', async () => {
+  const { home } = await homeWithGrantedAccount()
   rmSync(join(home, 'vault.key'))
 
   const second = spawnHost(home)
 
   expect(await second.exited).toBe(1)
   expect(await new Response(second.stderr).text()).toContain(
-    `${join(home, 'vault.key')} is missing, but kurumi.db holds 1 sealed account`,
+    `${join(home, 'vault.key')} is missing, but ${join(home, 'kurumi.db')} holds 1 account sealed with it`,
   )
   expect(existsSync(join(home, 'vault.key'))).toBe(false)
 }, 5000)
+
+test('a host refuses to start with a vault.key that did not seal its accounts', async () => {
+  const { home } = await homeWithGrantedAccount()
+  writeFileSync(join(home, 'vault.key'), randomBytes(32))
+
+  const second = spawnHost(home)
+
+  expect(await second.exited).toBe(1)
+  expect(await new Response(second.stderr).text()).toContain(
+    `${join(home, 'vault.key')} cannot open the 1 account in ${join(home, 'kurumi.db')}`,
+  )
+}, 5000)
+
+test('the start-over command a missing vault.key names lets the host start with a new key', async () => {
+  const { home, key } = await homeWithGrantedAccount()
+  rmSync(join(home, 'vault.key'))
+  const refused = spawnHost(home)
+  expect(await refused.exited).toBe(1)
+  const command = /run sqlite3 (\S+) '([^']+)'/.exec(await new Response(refused.stderr).text())
+  if (!command?.[1] || !command[2]) throw new Error('the refusal names no sqlite3 command')
+
+  const sqlite = new Database(command[1])
+  sqlite.run(command[2])
+  sqlite.close()
+  const host = spawnHost(home)
+  await waitForHost(home, host)
+  host.kill('SIGTERM')
+  expect(await host.exited).toBe(0)
+
+  expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(false)
+  const after = new Database(join(home, 'kurumi.db'), { readonly: true })
+  expect(after.query('SELECT count(*) AS n FROM account').get()).toEqual({ n: 0 })
+  expect(after.query('SELECT count(*) AS n FROM account_grant').get()).toEqual({ n: 0 })
+  after.close()
+}, 10000)
 
 test('a FIFO at vault.key is refused as not a regular file instead of blocking start', async () => {
   const home = homeForTest()

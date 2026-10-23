@@ -17,6 +17,7 @@ import {
   createAccountLedger,
   router,
   selectAccount,
+  storedAccounts,
   type AccountLedger,
   type AddKeyInput,
   type Selector,
@@ -394,6 +395,27 @@ describe('key accounts', () => {
 
     expect(defaultRows().map(({ agentGroupId }) => agentGroupId)).toEqual(['g2'])
     expect(ledger.candidates('g1', 'gmail')).toHaveLength(3)
+  })
+})
+
+describe('stored accounts', () => {
+  test('are sealed with the key that added them and not with another key', () => {
+    const stored = inMemoryDb()
+    const keyLedger = createAccountLedger({ db: stored, vaultKey })
+    for (const label of ['main', 'spare']) {
+      stored.transaction((tx) =>
+        keyLedger.addKey(tx, { vendor: 'anthropic', label, value: secret, autoGrant: false }),
+      )
+    }
+
+    expect(storedAccounts(stored).count).toBe(2)
+    expect(storedAccounts(stored).sealedWith(vaultKey)).toBe(true)
+    expect(storedAccounts(stored).sealedWith(randomBytes(32))).toBe(false)
+  })
+
+  test('none means any key will do', () => {
+    expect(storedAccounts(inMemoryDb()).count).toBe(0)
+    expect(storedAccounts(inMemoryDb()).sealedWith(randomBytes(32))).toBe(true)
   })
 })
 

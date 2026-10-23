@@ -21,7 +21,7 @@ import {
   type AccountHandle,
   type GrantedCandidate,
 } from './select.ts'
-import { seal } from './vault.ts'
+import { open, seal, VaultError } from './vault.ts'
 
 export { migrations } from '../migrations/index.ts'
 export { accountHandle, parseAccountHandle, selectAccount } from './select.ts'
@@ -126,6 +126,26 @@ function grant(tx: Tx, { agentGroupId, accountId, service, grantedBy }: GrantInp
     .onConflictDoNothing()
     .run()
   return { ok: true }
+}
+
+export type StoredAccounts = { count: number; sealedWith: (vaultKey: Uint8Array) => boolean }
+
+export function storedAccounts(db: Db): StoredAccounts {
+  const sealed = db.select({ id: account.id, material: account.material }).from(account).all()
+  const [first] = sealed
+  return {
+    count: sealed.length,
+    sealedWith(vaultKey) {
+      if (!first) return true
+      try {
+        open(vaultKey, first.id, first.material)
+        return true
+      } catch (error) {
+        if (error instanceof VaultError) return false
+        throw error
+      }
+    },
+  }
 }
 
 export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): AccountLedger {

@@ -10,8 +10,11 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 
-import { account } from '@kurumi/account/schema'
-import { createAccountLedger, router as accountRouter } from '@kurumi/account/server'
+import {
+  createAccountLedger,
+  router as accountRouter,
+  storedAccounts,
+} from '@kurumi/account/server'
 import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import { startAdmission, startAgentPort } from '@kurumi/gateway/server'
@@ -26,7 +29,6 @@ import {
 } from '@kurumi/session/server'
 import { implement, ORPCError } from '@orpc/server'
 import { RPCHandler } from '@orpc/server/node'
-import { count } from 'drizzle-orm'
 import { z } from 'zod'
 
 import { loadConfig, type HostConfig } from './config.ts'
@@ -125,8 +127,7 @@ export async function startHost(config: HostConfig) {
     const db = openKurumiDb(join(config.home, 'kurumi.db'))
     database = db
     migrateAll(db, migrations)
-    const sealedAccounts = db.select({ n: count() }).from(account).get()?.n ?? 0
-    const vaultKey = loadVaultKey(config.home, { sealedAccounts })
+    const vaultKey = loadVaultKey(config.home, storedAccounts(db))
     const accountLedger = createAccountLedger({ db, vaultKey })
     const agentLedger = createAgentLedger({
       db,

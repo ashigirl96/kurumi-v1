@@ -13,6 +13,8 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 
+import type { StoredAccounts } from '@kurumi/account/server'
+
 const KEY_BYTES = 32
 
 const hasCode = (error: unknown, code: string): boolean =>
@@ -78,14 +80,24 @@ function createKeyAtomically(home: string, path: string): void {
   syncDirectory(home)
 }
 
-export function loadVaultKey(home: string, { sealedAccounts }: { sealedAccounts: number }): Buffer {
+export function loadVaultKey(home: string, accounts: StoredAccounts): Buffer {
   const path = join(home, 'vault.key')
+  const db = join(home, 'kurumi.db')
+  const counted = accounts.count === 1 ? '1 account' : `${accounts.count} accounts`
+  const them = accounts.count === 1 ? 'it' : 'them'
+  const startOver = `With no backup the stored keys are lost: to start over, keep the host stopped, run sqlite3 ${db} 'PRAGMA foreign_keys = ON; DELETE FROM account;' (or delete kurumi.db with its -wal and -shm files to reset all host state), start the host, and add the keys again.`
   const existing = readKey(path)
-  if (existing) return existing
-  if (sealedAccounts > 0) {
-    const accounts = sealedAccounts === 1 ? '1 sealed account' : `${sealedAccounts} sealed accounts`
+  if (existing) {
+    if (!accounts.sealedWith(existing)) {
+      throw new Error(
+        `${path} cannot open the ${counted} in ${db}, so it is not the key that sealed ${them}. Put back the vault.key that sealed ${them} from your backup and start the host again. ${startOver}`,
+      )
+    }
+    return existing
+  }
+  if (accounts.count > 0) {
     throw new Error(
-      `${path} is missing, but kurumi.db holds ${accounts} that only it can open. Restore vault.key from your backup; a new key could not open what is stored, so none is created.`,
+      `${path} is missing, but ${db} holds ${counted} sealed with it, and a new key could not open ${them}, so none is created. Restore vault.key from your backup and start the host again. ${startOver}`,
     )
   }
   createKeyAtomically(home, path)
