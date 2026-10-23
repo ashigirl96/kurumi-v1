@@ -234,8 +234,8 @@ if (import.meta.main) {
           process.exit(1)
         })
     }
-    process.once('SIGTERM', shutdown)
-    process.once('SIGINT', shutdown)
+    process.on('SIGTERM', shutdown)
+    process.on('SIGINT', shutdown)
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
