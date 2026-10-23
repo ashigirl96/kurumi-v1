@@ -1,0 +1,17 @@
+{
+  "name": "@kurumi/cli",
+  "private": true,
+  "bin": {
+    "kurumi": "./src/main.ts"
+  },
+  "type": "module",
+  "dependencies": {
+    "@kurumi/agent": "workspace:*",
+    "@kurumi/rpc": "workspace:*",
+    "@orpc/client": "catalog:",
+    "@orpc/contract": "catalog:",
+    "@orpc/server": "catalog:",
+    "trpc-cli": "catalog:",
+    "zod": "catalog:"
+  }
+}

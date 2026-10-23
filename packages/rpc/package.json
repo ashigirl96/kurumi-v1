@@ -3,9 +3,13 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./contract": "./src/contract.ts",
     "./server": "./src/server.ts"
   },
   "dependencies": {
-    "drizzle-orm": "catalog:"
+    "@orpc/contract": "catalog:",
+    "@orpc/server": "catalog:",
+    "drizzle-orm": "catalog:",
+    "zod": "catalog:"
   }
 }

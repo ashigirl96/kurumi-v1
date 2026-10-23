@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import { join } from 'node:path'
 
 import { startAdmission, type AdmissionState } from './admission.ts'
 import { startAgentPort } from './port.ts'
@@ -99,6 +100,70 @@ test('retries from completed failures at exact exponentially capped delays', asy
   await admission.stop()
   expect(clock.pending()).toBe(0)
 })
+
+test.each([
+  [false, 'bind'],
+  [true, 'bind'],
+  [false, 'probe'],
+  [true, 'probe'],
+  [false, 'nonce'],
+  [true, 'nonce'],
+] as const)(
+  'background retry preserves failure without an unhandled rejection (%s, %s)',
+  async (fromTimer, failure) => {
+    const source = `
+    import { startAdmission } from ${JSON.stringify(join(import.meta.dir, 'admission.ts'))}
+    let scheduled
+    let schedules = 0
+    const admission = startAdmission({
+      bind: async () => {
+        if (${JSON.stringify(failure)} === 'bind') throw Object.assign(new Error('Address in use'), { code: 'EADDRINUSE' })
+        return { port: 43126, stop: async () => {} }
+      },
+      probe: async () => {
+        if (${JSON.stringify(failure)} === 'probe') throw new Error('Docker unavailable')
+        return 'wrong'
+      },
+      schedule: (callback) => {
+        if (!${fromTimer} || schedules++ > 0) throw new Error('Retry timer unavailable')
+        scheduled = callback
+        return () => {}
+      },
+    })
+    await Bun.sleep(0)
+    if (${fromTimer}) {
+      scheduled()
+      await Bun.sleep(0)
+    }
+    process.stdout.write(JSON.stringify(admission.status().state))
+    await admission.stop()
+  `
+    const child = Bun.spawn([process.execPath, '--eval', source], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const [output, errors, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect({ code, errors }).toEqual({ code: 0, errors: '' })
+    expect(JSON.parse(output)).toEqual(
+      failure === 'bind'
+        ? { kind: 'bind_failed', reason: { message: 'Address in use', code: 'EADDRINUSE' } }
+        : {
+            kind: 'unreachable',
+            reason:
+              failure === 'probe'
+                ? { kind: 'probe_failed', message: 'Docker unavailable' }
+                : {
+                    kind: 'nonce_mismatch',
+                    message: 'Probe response did not match admission nonce',
+                  },
+          },
+    )
+  },
+)
 
 test('manual retry cancels the pending timer and active retries share one promise', async () => {
   const clock = retryClock()
@@ -211,7 +276,7 @@ test('stop during bind waits for and closes the late listener without probing', 
   let finished = false
   const stopped = admission.stop()
   expect(admission.stop()).toBe(stopped)
-  void stopped.then(() => {
+  const observedStop = stopped.then(() => {
     finished = true
   })
   await Promise.resolve()
@@ -221,7 +286,7 @@ test('stop during bind waits for and closes the late listener without probing', 
       closed = true
     }),
   )
-  await stopped
+  await observedStop
   expect(closed).toBe(true)
   expect(probes).toBe(0)
   expect(admission.status().state).toEqual(stoppedState)

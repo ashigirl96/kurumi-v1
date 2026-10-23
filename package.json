@@ -15,7 +15,12 @@
       "oxlint": "1.86.0",
       "oxlint-tsgolint": "7.0.2003",
       "reflect-metadata": "0.2.2",
-      "typescript": "7.0.2"
+      "typescript": "7.0.2",
+      "@orpc/client": "1.15.4",
+      "@orpc/contract": "1.15.4",
+      "@orpc/server": "1.15.4",
+      "trpc-cli": "0.17.1",
+      "zod": "4.6.5"
     }
   },
   "type": "module",

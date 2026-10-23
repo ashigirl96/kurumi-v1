@@ -12,6 +12,7 @@
     "kurumi/disable-reason": "error",
     "kurumi/no-relative-package-import": "error",
     "kurumi/sync-transaction": "error",
+    "typescript/no-floating-promises": ["error", { "ignoreVoid": false }],
     // 指定しないと oxlint は import type だけでできた循環を見逃す。
     "import/no-cycle": ["error", { "ignoreTypes": false }],
     // 名前の _ だけで判断するので、外が決めた名前にも当たる。
