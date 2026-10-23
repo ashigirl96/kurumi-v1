@@ -14,8 +14,10 @@ import {
 } from './catalog.ts'
 import {
   accountHandle,
+  groupSelector,
   readSelector,
   selectAccount,
+  unnamedIfGroupSelector,
   type AccountHandle,
   type GrantedCandidate,
   type Selection,
@@ -1024,5 +1026,41 @@ describe('awkward handles through every slot', () => {
         selector,
       ),
     ).toMatchObject({ ok: true, handle: 'google/a%41b', how: 'named' })
+  })
+})
+
+describe('the Group Selector', () => {
+  test('is the vendor alone in the vendor selector shape', () => {
+    expect(groupSelector('anthropic')).toBe('sk-ant-kurumi-YW50aHJvcGlj')
+    expect(groupSelector('github')).toBe('kurumi:github')
+  })
+
+  describe.each(
+    slotTargets.map((target) => [`${target.vendor} ${target.slot.kind}`, target] as const),
+  )('written into the %s slot', (_slot, target) => {
+    test.each(placementsOf(target.slot).map((placement) => [placement.name, placement] as const))(
+      'as %s reads as no account named',
+      (_name, placement) => {
+        const { selector } = readSelector(
+          target.shape,
+          target.slot,
+          request({
+            headers: { [headerOf(target.slot)]: placement.wrap(groupSelector(target.vendor)) },
+          }),
+        )
+
+        expect(unnamedIfGroupSelector(target.vendor, selector)).toEqual(none)
+      },
+    )
+  })
+
+  test.each([
+    ['a handle', named('anthropic/main')],
+    ['the vendor followed by a slash', named('anthropic/')],
+    ['another vendor alone', named('google')],
+    ['an unreadable selector', { kind: 'unreadable', written: 'kurumi:anthropic' } as const],
+    ['no selector', none],
+  ])('%s is left as it was', (_name, selector) => {
+    expect(unnamedIfGroupSelector('anthropic', selector)).toEqual(selector)
   })
 })
