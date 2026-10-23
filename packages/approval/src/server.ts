@@ -86,7 +86,7 @@ export type ApprovalLog = {
 }
 
 const MAX_HELD_INPUT_BYTES = 64 * 1024
-const MAX_PENDING_PER_AGENT_GROUP = 20
+const MAX_HELD_PER_AGENT_GROUP = 20
 
 export type ApprovalLedger = {
   request(tx: Tx, input: ApprovalRequest): { approvalId: string }
@@ -140,7 +140,11 @@ function escapeInvisible(text: string): string {
 }
 
 function errorText(error: unknown): string {
-  return escapeInvisible(error instanceof Error ? error.message : String(error))
+  try {
+    return escapeInvisible(String(error instanceof Error ? error.message : error))
+  } catch {
+    return 'an error with no text'
+  }
 }
 
 function canonicalJson(value: unknown): string {
@@ -259,23 +263,6 @@ export function createApprovalLedger({
     input: ApprovalRequest,
     dedupeKey: string | null,
   ): { approvalId: string } => {
-    if (input.agentGroupId !== null) {
-      const open = tx
-        .select({ pending: count() })
-        .from(pendingApproval)
-        .where(
-          and(
-            eq(pendingApproval.agentGroupId, input.agentGroupId),
-            eq(pendingApproval.status, 'pending'),
-          ),
-        )
-        .get()
-      if ((open?.pending ?? 0) >= MAX_PENDING_PER_AGENT_GROUP) {
-        throw new ORPCError('TOO_MANY_REQUESTS', {
-          message: `agent group ${input.agentGroupId} already waits on ${MAX_PENDING_PER_AGENT_GROUP} pending approvals`,
-        })
-      }
-    }
     const approvalId = `apr-${Bun.randomUUIDv7()}`
     tx.insert(pendingApproval)
       .values({
@@ -314,6 +301,22 @@ export function createApprovalLedger({
         .where(and(eq(pendingApproval.dedupeKey, dedupeKey), eq(pendingApproval.status, 'pending')))
         .get()
       if (pending !== undefined) return { approvalId: pending.id }
+      const open = tx
+        .select({ held: count() })
+        .from(pendingApproval)
+        .where(
+          and(
+            eq(pendingApproval.agentGroupId, caller.agentGroupId),
+            eq(pendingApproval.status, 'pending'),
+            eq(pendingApproval.kind, 'procedure'),
+          ),
+        )
+        .get()
+      if ((open?.held ?? 0) >= MAX_HELD_PER_AGENT_GROUP) {
+        throw new ORPCError('TOO_MANY_REQUESTS', {
+          message: `agent group ${caller.agentGroupId} already waits on ${MAX_HELD_PER_AGENT_GROUP} held calls`,
+        })
+      }
       return insert(
         tx,
         {

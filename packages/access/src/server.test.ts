@@ -98,4 +98,10 @@ test('creating a user takes the kind from the id and is idempotent on the id', (
   expect(ledger.createUser({ id: 'slack:U1', displayName: 'Robert' }).displayName).toBe('Bob')
   expect(db.select().from(user).all()).toHaveLength(1)
   expect(() => ledger.createUser({ id: 'U1', displayName: 'Bob' })).toThrow('<kind>:<handle>')
+  for (const hidden of ['\u202e', '\u200b', '\u3164', '\ufe0f', '\u0085']) {
+    expect(() => ledger.createUser({ id: `slack:U1${hidden}x`, displayName: 'Bob' })).toThrow(
+      'invisible',
+    )
+  }
+  expect(db.select().from(user).all()).toHaveLength(1)
 })

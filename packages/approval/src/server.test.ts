@@ -513,7 +513,7 @@ test('invisible code points are escaped in the stored title, body, and handler e
   const db = openDb()
   const { router, contextFor, held } = composedHost(db)
   const heldId = await held(agent, 'access/users/create', {
-    id: `slack:U1${invisible.replace('\u2028', '')}`,
+    id: 'slack:U1',
     displayName: `Bob${invisible}approved by host`,
   })
   const { ledger } = recordingLedger(db, crash(`boom${invisible}`))
@@ -645,9 +645,24 @@ test('held calls that differ only in ignored keys, key order, or untrimmed strin
   })
 })
 
-test('an agent group with 20 pending approvals is refused a new one with 429 and no row', async () => {
+test('an agent group with 20 pending held calls is refused another with 429 and no row, while other kinds still request', async () => {
   const db = openDb()
   const { post, held } = composedHost(db)
+  const { ledger } = recordingLedger(db)
+  const requestGateway = () =>
+    transaction(
+      db,
+      (tx) =>
+        ledger.request(tx, {
+          kind: 'gateway.request',
+          agentGroupId: 'ag-a',
+          sessionId: 'session-a',
+          title: 'gateway',
+          body: [],
+          payload: { url: 'https://example.com' },
+        }).approvalId,
+    )
+  requestGateway()
   const pending: string[] = []
   for (let n = 0; n < 20; n++) pending.push(await held(agent, 'access/users/create', create(n)))
 
@@ -661,9 +676,10 @@ test('an agent group with 20 pending approvals is refused a new one with 429 and
   expect(await held(agent, 'access/users/create', create(0))).toBe(pending.at(0) ?? 'none')
   const otherGroup = { kind: 'agent', agentGroupId: 'ag-b', sessionId: 'session-b' } as const
   expect(await held(otherGroup, 'access/users/create', create(20))).toMatch(/^apr-/)
+  expect(requestGateway()).toMatch(/^apr-/)
   expect(
     db.select().from(pendingApproval).where(eq(pendingApproval.agentGroupId, 'ag-a')).all(),
-  ).toHaveLength(20)
+  ).toHaveLength(22)
 })
 
 test('a decided row whose payload does not parse is recorded as a failed handler, and start still settles the rest', async () => {
@@ -695,6 +711,34 @@ test('a decided row whose payload does not parse is recorded as a failed handler
     ['approval.handler.failed', unparsable],
   ])
 })
+
+test.each([
+  ['a null-prototype object', () => Object.create(null) as unknown, 'an error with no text'],
+  [
+    'an error whose message is a number',
+    () => Object.defineProperty(new Error('replaced'), 'message', { value: 42 }),
+    '42',
+  ],
+])(
+  'a handler that rejects with %s is recorded as failed, and start settles the next row',
+  async (_name, thrown, recorded) => {
+    const db = openDb()
+    const { ledger: requester } = recordingLedger(db)
+    const odd = requestProcedure(db, requester)
+    const healthy = requestProcedure(db, requester)
+    decideBehindTheLedger(db, odd)
+    decideBehindTheLedger(db, healthy)
+    let calls = 0
+    const { ledger } = recordingLedger(db, () =>
+      calls++ === 0 ? Promise.reject(thrown()) : Promise.resolve(),
+    )
+
+    await ledger.start()
+
+    expect(ledger.show(odd)).toMatchObject({ handledAt: expect.any(Date), handlerError: recorded })
+    expect(ledger.show(healthy)).toMatchObject({ handledAt: expect.any(Date), handlerError: null })
+  },
+)
 
 test('a handler that throws synchronously is recorded as failed at decide and at start', async () => {
   const db = openDb()

@@ -5,6 +5,10 @@ const userId = z
   .string()
   .max(255)
   .regex(/^[^:\s]+:\S+$/, 'user id must look like <kind>:<handle>, for example slack:U123')
+  .regex(
+    /^[^\p{C}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]*$/u,
+    'user id must not contain control, format, or invisible characters',
+  )
 
 export const createUserInput = z.object({
   id: userId,
