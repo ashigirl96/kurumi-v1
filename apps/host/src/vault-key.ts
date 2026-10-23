@@ -21,7 +21,7 @@ const hasCode = (error: unknown, code: string): boolean =>
 function readKey(path: string): Buffer | null {
   let fd: number
   try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   } catch (error) {
     if (hasCode(error, 'ENOENT')) return null
     if (hasCode(error, 'ELOOP')) {
@@ -78,10 +78,16 @@ function createKeyAtomically(home: string, path: string): void {
   syncDirectory(home)
 }
 
-export function loadVaultKey(home: string): Buffer {
+export function loadVaultKey(home: string, { sealedAccounts }: { sealedAccounts: number }): Buffer {
   const path = join(home, 'vault.key')
   const existing = readKey(path)
   if (existing) return existing
+  if (sealedAccounts > 0) {
+    const accounts = sealedAccounts === 1 ? '1 sealed account' : `${sealedAccounts} sealed accounts`
+    throw new Error(
+      `${path} is missing, but kurumi.db holds ${accounts} that only it can open. Restore vault.key from your backup; a new key could not open them, so none is created.`,
+    )
+  }
   createKeyAtomically(home, path)
   const created = readKey(path)
   if (!created) throw new Error(`${path} vanished right after it was created`)

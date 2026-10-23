@@ -1,3 +1,4 @@
+import { Database } from 'bun:sqlite'
 import { afterEach, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -319,3 +320,38 @@ test('the temporary host guard allows host and human callers and only agent chan
     expect(initialGuard({ ...common, caller, meta }).kind).toBe('deny')
   }
 })
+
+test('a host whose kurumi.db holds accounts refuses to start without vault.key and writes no new key', async () => {
+  const home = homeForTest()
+  const first = spawnHost(home)
+  await waitForHost(home, first)
+  first.kill('SIGTERM')
+  expect(await first.exited).toBe(0)
+  const sqlite = new Database(join(home, 'kurumi.db'))
+  sqlite.run(
+    `INSERT INTO account (id, vendor, label, kind, auth_mode, services, material, status, created_at)
+     VALUES ('acc-a', 'anthropic', 'main', 'key', 'api-key', '["anthropic-api"]', x'00', 'active', 0)`,
+  )
+  sqlite.close()
+  rmSync(join(home, 'vault.key'))
+
+  const second = spawnHost(home)
+
+  expect(await second.exited).toBe(1)
+  expect(await new Response(second.stderr).text()).toContain(
+    `${join(home, 'vault.key')} is missing, but kurumi.db holds 1 sealed account`,
+  )
+  expect(existsSync(join(home, 'vault.key'))).toBe(false)
+}, 5000)
+
+test('a FIFO at vault.key is refused as not a regular file instead of blocking start', async () => {
+  const home = homeForTest()
+  expect(Bun.spawnSync(['mkfifo', '-m', '600', join(home, 'vault.key')]).exitCode).toBe(0)
+
+  const host = spawnHost(home)
+
+  expect(await host.exited).toBe(1)
+  expect(await new Response(host.stderr).text()).toContain(
+    `${join(home, 'vault.key')} is not a regular file`,
+  )
+}, 5000)
