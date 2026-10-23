@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -29,6 +29,30 @@ function spawnHost(home: string, preload?: string): Bun.Subprocess<'ignore', 'pi
   })
   children.push(child)
   return child
+}
+
+function probeSocketBind(home: string, fail = false): string {
+  const preload = join(home, 'probe-bind.ts')
+  writeFileSync(
+    preload,
+    `
+    import { statSync, writeFileSync } from 'node:fs'
+    const serve = Bun.serve
+    process.umask(0o022)
+    Bun.serve = (options) => {
+      try {
+        if (${fail}) throw new Error('forced bind failure')
+        const server = serve(options)
+        writeFileSync(${JSON.stringify(join(home, 'bind-mode'))}, (statSync(options.unix).mode & 0o777).toString(8))
+        Bun.sleepSync(30)
+        return server
+      } finally {
+        queueMicrotask(() => writeFileSync(${JSON.stringify(join(home, 'restored-umask'))}, process.umask().toString(8)))
+      }
+    }
+  `,
+  )
+  return preload
 }
 
 async function waitForHost(home: string, child: Bun.Subprocess): Promise<void> {
@@ -102,6 +126,55 @@ test('concurrent host starts name the lock owner before its pid write completes'
     expect(await winner.exited).toBe(0)
   }
 }, 10000)
+
+test('the socket is mode 0600 from bind while another process polls before startup', async () => {
+  const home = homeForTest()
+  const poller = Bun.spawn(
+    [
+      process.execPath,
+      '-e',
+      `
+    import { existsSync, lstatSync, writeFileSync } from 'node:fs'
+    const home = ${JSON.stringify(home)}
+    const modes = new Set()
+    const deadline = performance.now() + 4000
+    writeFileSync(home + '/polling', '')
+    while (!existsSync(home + '/stop-polling') && performance.now() < deadline) {
+      const stat = lstatSync(home + '/kurumi.sock', { throwIfNoEntry: false })
+      if (stat) modes.add((stat.mode & 0o777).toString(8))
+      Bun.sleepSync(1)
+    }
+    console.log([...modes].join(','))
+  `,
+    ],
+    { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+  )
+  children.push(poller)
+  for (let attempt = 0; !existsSync(join(home, 'polling')); attempt++) {
+    if (attempt === 100) throw new Error('socket poller did not start')
+    await Bun.sleep(10)
+  }
+  const host = spawnHost(home, probeSocketBind(home))
+  await waitForHost(home, host)
+  writeFileSync(join(home, 'stop-polling'), '')
+  const observed = (await new Response(poller.stdout).text()).trim()
+  expect(await poller.exited).toBe(0)
+  expect({ observed, bound: readFileSync(join(home, 'bind-mode'), 'utf8') }).toEqual({
+    observed: '600',
+    bound: '600',
+  })
+  expect(readFileSync(join(home, 'restored-umask'), 'utf8')).toBe('22')
+  host.kill('SIGTERM')
+  expect(await host.exited).toBe(0)
+}, 5000)
+
+test('a failed socket bind restores the process umask', async () => {
+  const home = homeForTest()
+  const host = spawnHost(home, probeSocketBind(home, true))
+  expect(await host.exited).toBe(1)
+  expect(await new Response(host.stderr).text()).toContain('forced bind failure')
+  expect(readFileSync(join(home, 'restored-umask'), 'utf8')).toBe('22')
+})
 
 test('a killed host leaves a lock and socket that a new host can recover', async () => {
   const home = homeForTest()
