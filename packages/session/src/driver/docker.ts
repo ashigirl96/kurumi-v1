@@ -354,6 +354,7 @@ export function createDockerDriver(options: {
   async function agentCommand(
     args: readonly string[],
     operation?: AgentContainer,
+    deadlineMs?: number,
   ): Promise<CliResult> {
     let proc: CliProcess
     try {
@@ -361,6 +362,8 @@ export function createDockerDriver(options: {
     } catch {
       throw error(`${args[0]} failed`)
     }
+    const deadline =
+      deadlineMs === undefined ? undefined : setTimeout(() => proc.kill(), deadlineMs)
     const tracked = operation?.processes ?? commands
     const create = args[0] === 'create' && operation ? settleCreate(proc) : undefined
     if (create && operation) operation.create = create
@@ -373,6 +376,7 @@ export function createDockerDriver(options: {
     } catch {
       throw error(`${args[0]} failed`)
     } finally {
+      clearTimeout(deadline)
       tracked.delete(proc)
     }
   }
@@ -882,14 +886,18 @@ export function createDockerDriver(options: {
       return track(
         (async () => {
           const listedAt = performance.now()
-          const exit = await agentCommand([
-            'ps',
-            '-a',
-            '--filter',
-            `label=kurumi.install=${options.install}`,
-            '--format',
-            '{{.Names}}|{{.Label "kurumi.role"}}|{{.Label "kurumi.session"}}|{{.Label "kurumi.container"}}|{{.State}}',
-          ])
+          const exit = await agentCommand(
+            [
+              'ps',
+              '-a',
+              '--filter',
+              `label=kurumi.install=${options.install}`,
+              '--format',
+              '{{.Names}}|{{.Label "kurumi.role"}}|{{.Label "kurumi.session"}}|{{.Label "kurumi.container"}}|{{.State}}',
+            ],
+            undefined,
+            timeoutMs,
+          )
           const listed = requireSuccess(exit, 'list').split('\n').filter(Boolean).map(parseListing)
           for (const create of creations())
             if (

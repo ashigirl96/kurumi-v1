@@ -1114,3 +1114,33 @@ test('a row from an earlier host cannot authenticate until a listing adopts its 
     await restarted.stop()
   }
 })
+
+test('a listing that gets no answer within the driver timeout fails the sweep instead of hanging startup', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  docker.hold('ps')
+  const dockerDriver = createDockerDriver({
+    install: 'restart',
+    image: 'agent-test',
+    cli: docker.daemon,
+    timeoutMs: 30,
+  })
+  ledger = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: {
+      ...configured,
+      driver: dockerDriver,
+      supervision: { inventory: dockerDriver, staleAfterMs: 60_000, intervalMs: 60_000 },
+    },
+    runtimeLog: (entry) => logs.push(entry),
+  })
+  try {
+    await ledger.start()
+    expect(decisions(0)[0]).toMatchObject({ kind: 'session.adoption.done', listed: false })
+    expect(docker.commands('ps').map(({ proc }) => proc.killed)).toEqual([true])
+  } finally {
+    await Promise.all([ledger.stop(), dockerDriver.detach()])
+  }
+})
