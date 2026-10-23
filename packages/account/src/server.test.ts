@@ -961,6 +961,44 @@ describe('the container env as the client credential', () => {
   })
 })
 
+test('the selector a container got at spawn follows every later grant change', () => {
+  const [selector = ''] = Object.values(ledger.containerEnv('g1'))
+  const decideAsSpawned = () =>
+    decide('g1', anthropicApi([['Authorization', `Bearer ${selector}`]]))
+  const main = accountHandle('anthropic', 'main')
+  const second = accountHandle('anthropic', 'second')
+
+  addKey({ authMode: 'oauth-token', autoGrant: true })
+  expect(sent(decideAsSpawned())).toMatchObject({
+    handle: main,
+    headers: { authorization: `Bearer ${secret}` },
+  })
+
+  addKey({ label: 'second', value: secondSecret, authMode: 'oauth-token', autoGrant: true })
+  expect(decideAsSpawned()).toEqual({
+    kind: 'refuse',
+    refusal: { code: 'account_ambiguous', service: 'anthropic-api', granted: [main, second] },
+  })
+
+  setDefault('g1', idOf('second'), 'anthropic-api')
+  expect(sent(decideAsSpawned())).toMatchObject({
+    handle: second,
+    headers: { authorization: `Bearer ${secondSecret}` },
+  })
+
+  revoke('g1', idOf('second'), 'anthropic-api')
+  expect(sent(decideAsSpawned())).toMatchObject({ handle: main })
+
+  db.transaction((tx) => {
+    ledger.remove(tx, main)
+    ledger.remove(tx, second)
+  })
+  expect(decideAsSpawned()).toEqual({
+    kind: 'refuse',
+    refusal: { code: 'account_not_connected', service: 'anthropic-api' },
+  })
+})
+
 describe('the container env', () => {
   test('with no grant holds the Group Selector in the vendor default mode', () => {
     expect(ledger.containerEnv('g1')).toEqual({ ANTHROPIC_API_KEY: anthropicGroupSelector })
