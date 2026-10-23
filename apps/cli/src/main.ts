@@ -310,6 +310,9 @@ function withField(input: unknown, field: string, value: string): unknown[] {
   return [...input.slice(0, -1), { ...last, [field]: value }]
 }
 
+const MAX_UTF8_BYTES_PER_UTF16_UNIT = 3
+const TRAILING_CRLF_BYTES = 2
+
 async function readStdinValue(
   stdin: Stdin,
   command: string,
@@ -320,8 +323,7 @@ async function readStdinValue(
       `BAD_REQUEST: ${field} is read from stdin, so pipe it in, for example: pbpaste | kurumi ${command} ...`,
     )
   }
-  // A UTF-16 unit takes at most 3 UTF-8 bytes, and the value may end in a CRLF.
-  const byteLimit = maxLength * 3 + 2
+  const byteLimit = maxLength * MAX_UTF8_BYTES_PER_UTF16_UNIT + TRAILING_CRLF_BYTES
   const chunks: Uint8Array[] = []
   let bytes = 0
   for await (const chunk of stdin.chunks) {

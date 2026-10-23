@@ -8,7 +8,7 @@ export const HandleSchema = z.string().min(1).describe('handle')
 
 export const KEY_MAX_LENGTH = 4096
 
-/** A key ends up in an HTTP header or query string, which carry only visible ASCII safely. */
+/** A key ends up in an HTTP header value, which carries only visible ASCII safely. */
 const KeyValueSchema = z
   .string()
   .min(1, 'value is empty')
