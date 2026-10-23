@@ -132,19 +132,20 @@ export type StoredAccounts = { count: number; sealedWith: (vaultKey: Uint8Array)
 
 export function storedAccounts(db: Db): StoredAccounts {
   const sealed = db.select({ id: account.id, material: account.material }).from(account).all()
-  const [first] = sealed
   return {
     count: sealed.length,
-    sealedWith(vaultKey) {
-      if (!first) return true
-      try {
-        open(vaultKey, first.id, first.material)
-        return true
-      } catch (error) {
-        if (error instanceof VaultError) return false
-        throw error
-      }
-    },
+    sealedWith: (vaultKey) =>
+      sealed.length === 0 || sealed.some(({ id, material }) => opens(vaultKey, id, material)),
+  }
+}
+
+function opens(vaultKey: Uint8Array, accountId: string, material: Uint8Array): boolean {
+  try {
+    open(vaultKey, accountId, material)
+    return true
+  } catch (error) {
+    if (error instanceof VaultError) return false
+    throw error
   }
 }
 

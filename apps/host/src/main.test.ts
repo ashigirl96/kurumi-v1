@@ -16,8 +16,8 @@ const homes: string[] = []
 const children: Bun.Subprocess[] = []
 const main = join(import.meta.dir, 'main.ts')
 
-function homeForTest(): string {
-  const home = mkdtempSync(join(tmpdir(), 'kurumi-host-'))
+function homeForTest(prefix = 'kurumi-host-'): string {
+  const home = mkdtempSync(join(tmpdir(), prefix))
   homes.push(home)
   return home
 }
@@ -339,8 +339,8 @@ async function cli(home: string, args: string[], stdin = ''): Promise<void> {
   }).toEqual({ args, exit: 0, stderr: '' })
 }
 
-async function homeWithGrantedAccount(): Promise<{ home: string; key: Buffer }> {
-  const home = homeForTest()
+async function homeWithGrantedAccount(prefix?: string): Promise<{ home: string; key: Buffer }> {
+  const home = homeForTest(prefix)
   const first = spawnHost(home)
   await waitForHost(home, first)
   await cli(home, ['agent', 'create', '--name', 'work'])
@@ -376,21 +376,21 @@ test('a host refuses to start with a vault.key that did not seal its accounts', 
 
   expect(await second.exited).toBe(1)
   expect(await new Response(second.stderr).text()).toContain(
-    `${join(home, 'vault.key')} cannot open the 1 account in ${join(home, 'kurumi.db')}`,
+    `${join(home, 'vault.key')} does not match the key that sealed the 1 account in ${join(home, 'kurumi.db')}`,
   )
 }, 5000)
 
-test('the start-over command a missing vault.key names lets the host start with a new key', async () => {
-  const { home, key } = await homeWithGrantedAccount()
+test('the start-over command a missing vault.key prints, run as printed, lets the host start with a new key', async () => {
+  const { home, key } = await homeWithGrantedAccount("kurumi host's ")
   rmSync(join(home, 'vault.key'))
   const refused = spawnHost(home)
   expect(await refused.exited).toBe(1)
-  const command = /run sqlite3 (\S+) '([^']+)'/.exec(await new Response(refused.stderr).text())
-  if (!command?.[1] || !command[2]) throw new Error('the refusal names no sqlite3 command')
+  const printed = / run (sqlite3 .+;') \(or delete /.exec(
+    await new Response(refused.stderr).text(),
+  )?.[1]
+  if (!printed) throw new Error('the refusal prints no sqlite3 command')
 
-  const sqlite = new Database(command[1])
-  sqlite.run(command[2])
-  sqlite.close()
+  expect(Bun.spawnSync(['sh', '-c', printed]).exitCode).toBe(0)
   const host = spawnHost(home)
   await waitForHost(home, host)
   host.kill('SIGTERM')

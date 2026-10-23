@@ -413,6 +413,24 @@ describe('stored accounts', () => {
     expect(storedAccounts(stored).sealedWith(randomBytes(32))).toBe(false)
   })
 
+  test('a damaged row does not make the key that sealed the others a mismatch', () => {
+    const stored = inMemoryDb()
+    insertAccount(stored, {
+      id: 'acc-damaged',
+      vendor: 'anthropic',
+      label: 'old',
+      services: ['anthropic-api'],
+    })
+    const keyLedger = createAccountLedger({ db: stored, vaultKey })
+    stored.transaction((tx) =>
+      keyLedger.addKey(tx, { vendor: 'anthropic', label: 'main', value: secret, autoGrant: false }),
+    )
+
+    expect(storedAccounts(stored).count).toBe(2)
+    expect(storedAccounts(stored).sealedWith(vaultKey)).toBe(true)
+    expect(storedAccounts(stored).sealedWith(randomBytes(32))).toBe(false)
+  })
+
   test('none means any key will do', () => {
     expect(storedAccounts(inMemoryDb()).count).toBe(0)
     expect(storedAccounts(inMemoryDb()).sealedWith(randomBytes(32))).toBe(true)

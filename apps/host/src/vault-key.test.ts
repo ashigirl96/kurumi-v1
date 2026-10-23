@@ -87,7 +87,7 @@ test('a missing key while accounts are stored is refused with both recoveries an
   const db = join(home, 'kurumi.db')
 
   expect(() => loadVaultKey(home, { count: 2, sealedWith: () => false })).toThrow(
-    `${path} is missing, but ${db} holds 2 accounts sealed with it, and a new key could not open them, so none is created. Restore vault.key from your backup and start the host again. With no backup the stored keys are lost: to start over, keep the host stopped, run sqlite3 ${db} 'PRAGMA foreign_keys = ON; DELETE FROM account;' (or delete kurumi.db with its -wal and -shm files to reset all host state), start the host, and add the keys again.`,
+    `${path} is missing, but ${db} holds 2 accounts sealed with it, and a new key could not open them, so none is created. Restore vault.key from your backup and start the host again. With no backup the stored keys are lost: to start over, keep the host stopped, run sqlite3 '${db}' 'PRAGMA foreign_keys = ON; DELETE FROM account;' (or delete kurumi.db with its -wal and -shm files to reset all host state), start the host, and add the keys again.`,
   )
   expect(readdirSync(home)).toEqual([])
 })
@@ -106,7 +106,7 @@ test('a key that did not seal the stored accounts is refused with both recoverie
       },
     }),
   ).toThrow(
-    `${path} cannot open the 1 account in ${db}, so it is not the key that sealed it. Put back the vault.key that sealed it from your backup and start the host again. With no backup the stored keys are lost: to start over, keep the host stopped, run sqlite3 ${db} 'PRAGMA foreign_keys = ON; DELETE FROM account;' (or delete kurumi.db with its -wal and -shm files to reset all host state), start the host, and add the keys again.`,
+    `${path} does not match the key that sealed the 1 account in ${db}, so it cannot open it. Put back the vault.key that sealed it from your backup and start the host again. With no backup the stored keys are lost: to start over, keep the host stopped, run sqlite3 '${db}' 'PRAGMA foreign_keys = ON; DELETE FROM account;' (or delete kurumi.db with its -wal and -shm files to reset all host state), start the host, and add the keys again.`,
   )
   expect(tried).toEqual([key])
 })

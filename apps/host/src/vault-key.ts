@@ -85,12 +85,13 @@ export function loadVaultKey(home: string, accounts: StoredAccounts): Buffer {
   const db = join(home, 'kurumi.db')
   const counted = accounts.count === 1 ? '1 account' : `${accounts.count} accounts`
   const them = accounts.count === 1 ? 'it' : 'them'
-  const startOver = `With no backup the stored keys are lost: to start over, keep the host stopped, run sqlite3 ${db} 'PRAGMA foreign_keys = ON; DELETE FROM account;' (or delete kurumi.db with its -wal and -shm files to reset all host state), start the host, and add the keys again.`
+  const quotedDb = `'${db.replaceAll("'", `'\\''`)}'`
+  const startOver = `With no backup the stored keys are lost: to start over, keep the host stopped, run sqlite3 ${quotedDb} 'PRAGMA foreign_keys = ON; DELETE FROM account;' (or delete kurumi.db with its -wal and -shm files to reset all host state), start the host, and add the keys again.`
   const existing = readKey(path)
   if (existing) {
     if (!accounts.sealedWith(existing)) {
       throw new Error(
-        `${path} cannot open the ${counted} in ${db}, so it is not the key that sealed ${them}. Put back the vault.key that sealed ${them} from your backup and start the host again. ${startOver}`,
+        `${path} does not match the key that sealed the ${counted} in ${db}, so it cannot open ${them}. Put back the vault.key that sealed ${them} from your backup and start the host again. ${startOver}`,
       )
     }
     return existing
