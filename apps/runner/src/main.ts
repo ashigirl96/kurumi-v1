@@ -12,6 +12,10 @@ type Host = ContractRouterClient<{ session: typeof contract }>
 
 const CONTINUATION = 'continuation'
 
+function replyAlreadyFilled(error: unknown): boolean {
+  return error instanceof ORPCError && error.code === 'CONFLICT'
+}
+
 function replyId(inboundId: string, index: number): string {
   const hash = createHash('sha256').update(`kurumi-reply:${inboundId}:${index}`).digest('hex')
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`
@@ -55,8 +59,7 @@ export async function runRunner(options: {
         ),
       )
     } catch (error) {
-      // A turn re-run after a lost container writes new model text under the reply ids the first run already filled.
-      if (!(error instanceof ORPCError && error.code === 'CONFLICT')) throw error
+      if (!replyAlreadyFilled(error)) throw error
     }
   }
   async function answer(message: { id: string; content: string }): Promise<void> {

@@ -28,7 +28,6 @@ function options(continuation: string | null, abortController: AbortController):
     allowDangerouslySkipPermissions: true,
     env: {
       ...process.env,
-      // Transcripts must outlive the container so a replacement can resume, and only the workspace is mounted.
       CLAUDE_CONFIG_DIR: join(workspace, '.claude'),
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       // Claude Code refuses bypassPermissions as root unless it is told the container is the sandbox.
