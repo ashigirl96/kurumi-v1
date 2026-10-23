@@ -253,6 +253,23 @@ test.each([
   expect(response).toContain(`a ${reason} address`)
 })
 
+test('CONNECT to a name that resolves to an address of a host interface is refused before connecting', async () => {
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: (token) => (token === 'test-token' ? {} : null),
+    intercepts: () => false,
+    hostAddresses: () => ['203.0.113.7'],
+    resolve: () => Promise.resolve([{ address: '203.0.113.7', family: 4 }]),
+    forward: { inject: ({ path, headers }) => ({ path, headers }) },
+  })
+  stops.push(gateway.stop)
+
+  const response = await rawConnect(gateway.port, 'own.test:443')
+
+  expect(response).toStartWith('HTTP/1.1 403 Forbidden')
+  expect(response).toContain('own.test: it resolves to a host interface address')
+})
+
 test('CONNECT to an intercepted host after the CA has expired is refused with the reason', async () => {
   const material = await generateCaMaterial()
   const end = Date.parse(new X509Certificate(material.certPem).validTo)

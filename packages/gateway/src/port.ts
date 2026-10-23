@@ -6,7 +6,7 @@ import { connect, type LookupFunction, type Server } from 'node:net'
 import { pipeline, type Duplex } from 'node:stream'
 import { createServer as createTlsServer } from 'node:tls'
 
-import { addressRefusal } from './address.ts'
+import { addressRefusal, hostAddresses } from './address.ts'
 import {
   CaExpiredError,
   createCertificateAuthority,
@@ -92,7 +92,8 @@ export async function startAgentPort<Principal extends object>(deps: {
   bind: { host: string; port: number }
   authenticate(token: string): Principal | null | Promise<Principal | null>
   intercepts(host: string): boolean
-  addressRefusal?: (address: string) => string | null
+  addressRefusal?: (address: string, host: readonly string[]) => string | null
+  hostAddresses?: () => readonly string[]
   resolve?: (host: string) => Promise<LookupAddress[]>
   forward: ForwardDeps<Principal>
   ca?: CertificateAuthority
@@ -107,6 +108,7 @@ export async function startAgentPort<Principal extends object>(deps: {
 }): Promise<AgentPort> {
   const ca = deps.ca ?? (await createCertificateAuthority())
   const refusal = deps.addressRefusal ?? addressRefusal
+  const readHostAddresses = deps.hostAddresses ?? hostAddresses
   const resolve = deps.resolve ?? ((host: string) => lookup(host, { all: true }))
   const listeners = new Map<string, Promise<HostListener<Principal>>>()
   const sockets = new Map<Duplex, (() => void) | undefined>()
@@ -241,7 +243,10 @@ export async function startAgentPort<Principal extends object>(deps: {
     deps.onConnect?.(target)
     const listener = deps.intercepts(target.host) ? await listenerFor(target.host) : undefined
     const addresses = listener ? [] : await resolve(target.host)
-    const reason = addresses.map(({ address }) => refusal(address)).find((found) => found !== null)
+    const host = listener ? [] : readHostAddresses()
+    const reason = addresses
+      .map(({ address }) => refusal(address, host))
+      .find((found) => found !== null)
     if (reason) {
       rejectConnect(
         client,

@@ -68,10 +68,7 @@ export function hostAddresses(): string[] {
   )
 }
 
-export function addressRefusal(
-  address: string,
-  host: readonly string[] = hostAddresses(),
-): string | null {
+export function addressRefusal(address: string, host: readonly string[]): string | null {
   const bare = address.replace(/%.*$/, '')
   const family = isIP(bare)
   if (family === 0) return 'unparseable'
