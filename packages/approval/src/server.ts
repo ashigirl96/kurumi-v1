@@ -98,6 +98,7 @@ export type ApprovalLedger = {
 }
 
 type Row = typeof pendingApproval.$inferSelect
+type Settled = { recorded: true } | { recorded: false; reason: string }
 
 const decisionOf = { approved: 'approve', denied: 'deny' } as const
 
@@ -202,12 +203,11 @@ export function createApprovalLedger({
     return approvalView.parse(row)
   }
 
-  /** Returns why the outcome could not be recorded, in which case the next start runs the handler again. */
   const settle = async (
     id: string,
     decision: ApprovalDecision,
     load: () => ApprovalRecord,
-  ): Promise<string | null> => {
+  ): Promise<Settled> => {
     const handlerError = await (async () => dispatch(handlers(), load(), decision))().then(
       () => null,
       errorText,
@@ -220,11 +220,11 @@ export function createApprovalLedger({
         .set({ handledAt: new Date(), handlerError })
         .where(and(eq(pendingApproval.id, id), isNull(pendingApproval.handledAt)))
         .run()
-      return null
+      return { recorded: true }
     } catch (error) {
-      const unrecorded = errorText(error)
-      log({ kind: 'approval.outcome.unrecorded', approvalId: id, error: unrecorded })
-      return unrecorded
+      const reason = errorText(error)
+      log({ kind: 'approval.outcome.unrecorded', approvalId: id, error: reason })
+      return { recorded: false, reason }
     }
   }
 
@@ -374,12 +374,11 @@ export function createApprovalLedger({
         return { changed: false, message: `already ${summary(approval)}`, approval }
       }
       const { row } = transition
-      const unrecorded = await settle(id, decision, () => recordOf(row))
+      const settled = await settle(id, decision, () => recordOf(row))
       const approval = show(id)
-      const message =
-        unrecorded === null
-          ? summary(approval)
-          : `${summary(approval)}, but recording its outcome failed, so its handler runs again at the next host start: ${unrecorded}`
+      const message = settled.recorded
+        ? summary(approval)
+        : `${summary(approval)}, but recording its outcome failed, so its handler runs again at the next host start: ${settled.reason}`
       return { changed: true, message, approval }
     },
     guard(call) {
