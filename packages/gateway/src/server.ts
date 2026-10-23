@@ -52,7 +52,7 @@ export type CaBundle = { path: string; sha: string }
  * next to the kurumi CA. The name is content-addressed because a running container pins the file it mounted.
  */
 export function stageCaBundle(home: string, caPem: string): CaBundle {
-  const content = `${[...rootCertificates, caPem.trim()].join('\n')}\n`
+  const content = `${[caPem.trim(), ...rootCertificates].join('\n')}\n`
   const sha = createHash('sha256').update(content).digest('hex')
   const directory = join(home, 'ca')
   mkdirSync(directory, { recursive: true, mode: 0o700 })

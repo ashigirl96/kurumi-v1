@@ -85,7 +85,9 @@ test('the CA bundle holds the public roots and the CA under a content-addressed 
 
   expect(bundle.path).toBe(join(home, 'ca', `combined-${bundle.sha}.pem`))
   expect(new Bun.CryptoHasher('sha256').update(content).digest('hex')).toBe(bundle.sha)
-  expect(content).toContain(ca.certPem.trim())
+  expect(new X509Certificate(content).fingerprint256).toBe(
+    new X509Certificate(ca.certPem).fingerprint256,
+  )
   expect(content).toContain(rootCertificates[0]?.trim() ?? 'no roots')
   expect(statSync(bundle.path).mode & 0o777).toBe(0o644)
   expect(stageCaBundle(home, ca.certPem)).toEqual(bundle)
