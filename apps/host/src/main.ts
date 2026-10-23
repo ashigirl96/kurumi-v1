@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto'
-import { chmodSync, lstatSync, mkdirSync, realpathSync, rmSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs'
 import { join } from 'node:path'
 
 import { createAccountLedger } from '@kurumi/account/server'
@@ -13,6 +21,7 @@ import {
   createSessionLedger,
   router as sessionRouter,
   type AgentPrincipal,
+  type ContainerEgress,
 } from '@kurumi/session/server'
 import { implement, ORPCError } from '@orpc/server'
 import { RPCHandler } from '@orpc/server/node'
@@ -75,15 +84,37 @@ export async function startHost(config: HostConfig) {
         KURUMI_PROBE_IMAGE: z.string().min(1).optional(),
         KURUMI_DOCKER_NETWORK: z.string().min(1).default('bridge'),
         KURUMI_STALE_AFTER_MS: milliseconds.min(30_000).default(1_800_000),
-        KURUMI_RECONCILE_INTERVAL_MS: milliseconds.min(100).default(10_000),
+        KURUMI_RECONCILE_INTERVAL_MS: milliseconds.min(100).optional(),
       })
       .parse(process.env)
+    const staleAfterMs = environment.KURUMI_STALE_AFTER_MS
+    const intervalMs =
+      environment.KURUMI_RECONCILE_INTERVAL_MS ??
+      Math.min(10_000, Math.floor((staleAfterMs - 26_000) / 3))
+    if (25_000 + 3 * intervalMs > staleAfterMs)
+      throw new Error(
+        'KURUMI_STALE_AFTER_MS must be at least 25000 plus three KURUMI_RECONCILE_INTERVAL_MS, so that one host stall cannot make an idle runner look stale',
+      )
     const install = createHash('sha256')
       .update(realpathSync(config.home))
       .digest('hex')
       .slice(0, 24)
+    const runner = join(config.home, 'runner/runner.js')
+    const egress: ContainerEgress = {
+      env: {
+        KURUMI_URL: `http://host.docker.internal:${config.agentPort.port}`,
+        KURUMI_AGENT_PORT: String(config.agentPort.port),
+      },
+      mounts: [{ hostPath: runner, containerPath: '/app/runner.js', readonly: true }],
+      network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
+    }
     const docker = createDockerDriver({
       install,
+      revision: createHash('sha256')
+        .update(JSON.stringify([environment.KURUMI_AGENT_IMAGE, egress]))
+        .update(existsSync(runner) ? readFileSync(runner) : '')
+        .digest('hex')
+        .slice(0, 16),
       image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
       network: environment.KURUMI_DOCKER_NETWORK,
     })
@@ -118,35 +149,9 @@ export async function startHost(config: HostConfig) {
               since: new Date(),
             }
           },
-          contribution: () => ({
-            env: {
-              KURUMI_URL: `http://host.docker.internal:${config.agentPort.port}`,
-              KURUMI_AGENT_PORT: String(config.agentPort.port),
-            },
-            mounts: [
-              {
-                hostPath: join(config.home, 'runner/runner.js'),
-                containerPath: '/app/runner.js',
-                readonly: true,
-              },
-            ],
-            network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
-          }),
+          contribution: () => egress,
         },
-        supervision: {
-          staleAfterMs: environment.KURUMI_STALE_AFTER_MS,
-          intervalMs: environment.KURUMI_RECONCILE_INTERVAL_MS,
-          revision: createHash('sha256')
-            .update(
-              JSON.stringify([
-                environment.KURUMI_AGENT_IMAGE,
-                config.agentPort.port,
-                environment.KURUMI_DOCKER_NETWORK,
-              ]),
-            )
-            .digest('hex')
-            .slice(0, 16),
-        },
+        supervision: { staleAfterMs, intervalMs },
       },
     })
     sessions = sessionLedger
