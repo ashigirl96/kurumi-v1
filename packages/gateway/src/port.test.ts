@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { once } from 'node:events'
 import { request } from 'node:http'
-import { connect } from 'node:net'
+import { connect, createServer, type AddressInfo } from 'node:net'
 import { join } from 'node:path'
 
 import { createCertificateAuthority } from './ca.ts'
@@ -121,10 +121,16 @@ test('one MITM tunnel injects both keep-alive requests', async () => {
   expect(gateway.connects).toEqual([{ host: 'fake.test', port: 443 }])
 })
 
-test('an unintercepted host keeps the upstream certificate and receives no injection', async () => {
+test('an unintercepted public address keeps the upstream certificate and receives no injection', async () => {
   const upstream = await startFakeUpstream({ host: '127.0.0.1' })
   stops.push(upstream.stop)
-  const gateway = await startTestGateway({ port: 0, token: 'test-token', intercepts: new Set() })
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: (token) => (token === 'test-token' ? {} : null),
+    intercepts: () => false,
+    addressRefusal: () => null,
+    forward: { inject: ({ path, headers }) => ({ path, headers }) },
+  })
   stops.push(gateway.stop)
   const tunnel = await openTestTunnel({
     proxyPort: gateway.port,
@@ -138,6 +144,64 @@ test('an unintercepted host keeps the upstream certificate and receives no injec
   )
   expect((await sendTestRequest(tunnel, { path: '/echo' })).status).toBe(200)
   expect(upstream.requests[0]?.headers['x-injected']).toBeUndefined()
+})
+
+async function rawConnect(proxyPort: number, authority: string): Promise<string> {
+  const client = connect({ host: '127.0.0.1', port: proxyPort })
+  stops.push(() => {
+    client.destroy()
+  })
+  let response = ''
+  client.on('data', (chunk: Buffer) => {
+    response += chunk.toString()
+  })
+  await once(client, 'connect')
+  const closed = once(client, 'close')
+  const credential = Buffer.from('s:test-token').toString('base64')
+  client.write(
+    `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\nProxy-Authorization: Basic ${credential}\r\n\r\n`,
+  )
+  await closed
+  return response
+}
+
+test.each([
+  ['127.0.0.1', 'loopback'],
+  ['localhost', 'loopback'],
+  ['[::ffff:127.0.0.1]', 'loopback'],
+  ['0.0.0.0', 'unspecified'],
+])('CONNECT to %s on the host is refused as %s before any connection', async (host, reason) => {
+  const { gateway } = await setup()
+  const service = createServer((socket) => socket.destroy())
+  let accepts = 0
+  service.on('connection', () => accepts++)
+  service.listen(0, '127.0.0.1')
+  await once(service, 'listening')
+  stops.push(() => new Promise<void>((resolve) => service.close(() => resolve())))
+  const { port } = service.address() as AddressInfo
+
+  const response = await rawConnect(gateway.port, `${host}:${port}`)
+
+  expect(response).toStartWith('HTTP/1.1 403 Forbidden')
+  expect(response).toContain(`a ${reason} address`)
+  await Bun.sleep(50)
+  expect(accepts).toBe(0)
+})
+
+test.each([
+  ['10.0.0.1:443', 'private'],
+  ['192.168.65.254:443', 'private'],
+  ['100.64.0.1:443', 'carrier-grade NAT'],
+  ['169.254.169.254:80', 'link-local'],
+  ['[fe80::1]:443', 'link-local'],
+  ['[fc00::1]:443', 'unique local'],
+  ['[::1]:443', 'loopback'],
+  ['224.0.0.1:443', 'multicast'],
+])('CONNECT to %s is refused as %s', async (authority, reason) => {
+  const { gateway } = await setup()
+  const response = await rawConnect(gateway.port, authority)
+  expect(response).toStartWith('HTTP/1.1 403 Forbidden')
+  expect(response).toContain(`a ${reason} address`)
 })
 
 test('concurrent tunnels on the same host retain distinct principals and destination ports', async () => {
