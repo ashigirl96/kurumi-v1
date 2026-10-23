@@ -569,7 +569,8 @@ export function createDockerDriver(options: {
       return track(agent.pending)
     },
     kill(containerId, graceMs) {
-      if (shutdown.signal.aborted) return Promise.resolve()
+      if (shutdown.signal.aborted)
+        return stopping ?? Promise.reject(error('shutdown cleanup has not completed'))
       return track(
         (async () => {
           const replacement = replacements.get(containerId)

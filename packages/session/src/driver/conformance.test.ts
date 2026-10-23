@@ -394,6 +394,36 @@ test('Docker exit revokes channel authority before removal completes', async () 
   expect(db.select().from(container).all()).toEqual([])
 })
 
+test('concurrent host shutdown retains the stopping row when Docker cannot confirm removal', async () => {
+  await ledger.stop()
+  const cli = new FakeCli()
+  cli.responses.push(
+    { match: /^(create|start) /, result: {} },
+    { match: /^(rm|ps) /, result: { code: 1, stderr: 'daemon unavailable' } },
+  )
+  const docker = createDockerDriver({ install: 'shutdown-conformance', image: 'probe', cli })
+  const active = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: { ...configured, driver: docker },
+  })
+  await active.routeInbound(event('work'))
+  const row = db.select().from(container).get()
+  expect(row?.status).toBe('running')
+  const stopping = Promise.allSettled([active.stop(), docker.stop()])
+  for (const entry of cli.started) if (entry.args[0] === 'wait') entry.proc.complete({ code: null })
+  const outcomes = await stopping
+  expect(
+    db
+      .select()
+      .from(container)
+      .all()
+      .map((entry) => entry.status),
+  ).toEqual(['stopping'])
+  expect(outcomes.map((outcome) => outcome.status)).toEqual(['rejected', 'rejected'])
+})
+
 test('late startup success cannot restore a revoked token and stop joins its completion', async () => {
   const startup = Promise.withResolvers<void>()
   driver.beforeRun = () => startup.promise
