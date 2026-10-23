@@ -65,6 +65,19 @@ export type SessionRuntime = {
       supervision: { staleAfterMs: number; intervalMs: number }
     }
 )
+/** The token differs per container, so the revision hashes the contribution made with an empty one. */
+export function containerRevision(input: {
+  image: string
+  contribution: SessionRuntime['egress']['contribution']
+  runner: Uint8Array
+}): string {
+  const egress = input.contribution({ agentGroupId: '', sessionToken: '' })
+  return createHash('sha256')
+    .update(JSON.stringify([input.image, egress]))
+    .update(input.runner)
+    .digest('hex')
+    .slice(0, 16)
+}
 export type InboundLog = {
   kind: 'session.inbound.received' | 'session.inbound.committed'
   inboundId: string

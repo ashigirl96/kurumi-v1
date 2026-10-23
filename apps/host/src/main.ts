@@ -12,15 +12,23 @@ import { join } from 'node:path'
 
 import {
   createAccountLedger,
+  isInterceptedHost,
   router as accountRouter,
   storedAccounts,
 } from '@kurumi/account/server'
 import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
-import { startAdmission, startAgentPort } from '@kurumi/gateway/server'
+import {
+  gatewayContribution,
+  loadCertificateAuthority,
+  stageCaBundle,
+  startAdmission,
+  startAgentPort,
+} from '@kurumi/gateway/server'
 import { hostContract, type Caller } from '@kurumi/rpc/contract'
 import { guardRouter, type Guard, type KurumiContext } from '@kurumi/rpc/server'
 import {
+  containerRevision,
   createDockerDriver,
   createSessionLedger,
   router as sessionRouter,
@@ -104,30 +112,35 @@ export async function startHost(config: HostConfig) {
       .update(realpathSync(config.home))
       .digest('hex')
       .slice(0, 24)
-    const runner = join(config.home, 'runner/runner.js')
-    const egress: ContainerEgress = {
-      env: {
-        KURUMI_URL: `http://host.docker.internal:${config.agentPort.port}`,
-        KURUMI_AGENT_PORT: String(config.agentPort.port),
-      },
-      mounts: [{ hostPath: runner, containerPath: '/app/runner.js', readonly: true }],
-      network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
-    }
-    const docker = createDockerDriver({
-      install,
-      revision: createHash('sha256')
-        .update(JSON.stringify([environment.KURUMI_AGENT_IMAGE, egress]))
-        .update(existsSync(runner) ? readFileSync(runner) : '')
-        .digest('hex')
-        .slice(0, 16),
-      image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
-      network: environment.KURUMI_DOCKER_NETWORK,
-    })
-    driver = docker
     const db = openKurumiDb(join(config.home, 'kurumi.db'))
     database = db
     migrateAll(db, migrations)
     const vaultKey = loadVaultKey(config.home, storedAccounts(db))
+    const ca = await loadCertificateAuthority({ db, vaultKey })
+    const caBundle = stageCaBundle(config.home, ca.certPem)
+    const runner = join(config.home, 'runner/runner.js')
+    const contribution = ({ sessionToken }: { sessionToken: string }): ContainerEgress => {
+      const gateway = gatewayContribution({ port: config.agentPort.port, caBundle, sessionToken })
+      return {
+        env: gateway.env,
+        mounts: [
+          { hostPath: runner, containerPath: '/app/runner.js', readonly: true },
+          ...gateway.mounts,
+        ],
+        network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
+      }
+    }
+    const docker = createDockerDriver({
+      install,
+      revision: containerRevision({
+        image: environment.KURUMI_AGENT_IMAGE,
+        contribution,
+        runner: existsSync(runner) ? readFileSync(runner) : new Uint8Array(),
+      }),
+      image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
+      network: environment.KURUMI_DOCKER_NETWORK,
+    })
+    driver = docker
     const accountLedger = createAccountLedger({ db, vaultKey })
     const agentLedger = createAgentLedger({
       db,
@@ -160,7 +173,7 @@ export async function startHost(config: HostConfig) {
               since: new Date(),
             }
           },
-          contribution: () => egress,
+          contribution,
         },
         supervision: { staleAfterMs, intervalMs },
       },
@@ -211,7 +224,8 @@ export async function startHost(config: HostConfig) {
           bind: config.agentPort,
           probeNonce,
           authenticate: (token) => sessionLedger.authenticate(token),
-          intercepts: () => false,
+          ca,
+          intercepts: isInterceptedHost,
           forward: { inject: ({ path, headers }) => ({ path, headers }) },
           async rpc(request, response, principal, signal) {
             const result = await agentHandler.handle(request, response, {
