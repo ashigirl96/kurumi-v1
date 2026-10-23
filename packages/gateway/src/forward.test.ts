@@ -492,7 +492,8 @@ async function setupResolving(
   {
     host = 'localhost',
     addressRefusal,
-  }: Pick<ForwardDeps<unknown>, 'addressRefusal'> & {
+    hostAddresses,
+  }: Pick<ForwardDeps<unknown>, 'addressRefusal' | 'hostAddresses'> & {
     host?: string
   } = {},
 ) {
@@ -512,7 +513,12 @@ async function setupResolving(
     bind: { host: '127.0.0.1', port: 0 },
     authenticate: () => ({}),
     intercepts: () => true,
-    forward: { resolve, addressRefusal, inject: ({ path, headers }) => ({ path, headers }) },
+    forward: {
+      resolve,
+      addressRefusal,
+      hostAddresses,
+      inject: ({ path, headers }) => ({ path, headers }),
+    },
   })
   stops.push(gateway.stop)
   // The system resolver also answers localhost, so a gateway that ignored `resolve` would dial the listener.
@@ -555,6 +561,24 @@ test.each([
     expect(dials()).toBe(0)
   },
 )
+
+test('an intercepted host resolving to one of the host interface addresses is refused and never dialed', async () => {
+  const { tunnel, dials } = await setupResolving(
+    async () => [{ address: '203.0.113.7', family: 4 }],
+    {
+      hostAddresses: () => ['203.0.113.7'],
+    },
+  )
+
+  const response = await sendTestRequest(tunnel, { path: '/v1/models' })
+
+  expect(response.status).toBe(403)
+  expect(JSON.parse(response.body)).toMatchObject({
+    error: 'upstream_not_public',
+    reason: 'host interface',
+  })
+  expect(dials()).toBe(0)
+})
 
 test('a WebSocket upgrade to an intercepted host resolving to loopback is refused', async () => {
   const { tunnel, dials } = await setupResolving(async () => [{ address: '127.0.0.1', family: 4 }])

@@ -7,7 +7,7 @@ import { PassThrough, pipeline, type Duplex } from 'node:stream'
 
 import type { AccountHandle, AccountLedger, CredentialPrincipal } from '@kurumi/account/server'
 
-import { addressRefusal } from './address.ts'
+import { addressRefusal, hostAddresses } from './address.ts'
 import { refusalHttp, refusalResponse, type GatewayRefusal } from './refusal.ts'
 
 export type ConnectTarget = { host: string; port: number }
@@ -35,7 +35,8 @@ export type ForwardDeps<Principal> = {
   inject(input: InjectionInput<Principal>): Injected | Promise<Injected>
   upstream?: UpstreamDestination
   resolve?: (host: string) => Promise<LookupAddress[]>
-  addressRefusal?: (address: string) => string | null
+  addressRefusal?: (address: string, host: readonly string[]) => string | null
+  hostAddresses?: () => readonly string[]
 }
 
 const resolveAll = (host: string) => lookup(host, { all: true })
@@ -59,7 +60,8 @@ async function pinPublicUpstream(
   {
     resolve = resolveAll,
     addressRefusal: refusalOf = addressRefusal,
-  }: Pick<ForwardDeps<unknown>, 'resolve' | 'addressRefusal'>,
+    hostAddresses: readHostAddresses = hostAddresses,
+  }: Pick<ForwardDeps<unknown>, 'resolve' | 'addressRefusal' | 'hostAddresses'>,
 ): Promise<Pinned> {
   let addresses: LookupAddress[]
   try {
@@ -68,7 +70,10 @@ async function pinPublicUpstream(
     return { kind: 'unreachable' }
   }
   if (addresses.length === 0) return { kind: 'unreachable' }
-  const reason = addresses.map(({ address }) => refusalOf(address)).find((found) => found !== null)
+  const ownAddresses = readHostAddresses()
+  const reason = addresses
+    .map(({ address }) => refusalOf(address, ownAddresses))
+    .find((found) => found !== null)
   if (reason) return { kind: 'refused', refusal: { code: 'upstream_not_public', host, reason } }
   return { kind: 'pinned', lookup: pinnedLookup(addresses) }
 }
