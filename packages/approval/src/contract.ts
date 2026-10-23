@@ -27,6 +27,7 @@ export const approvalView = z.discriminatedUnion('status', [
     decidedBy: z.string(),
     decidedAt: z.date(),
     handledAt: z.date().nullable(),
+    handlerError: z.string().nullable(),
   }),
 ])
 export type ApprovalView = z.infer<typeof approvalView>

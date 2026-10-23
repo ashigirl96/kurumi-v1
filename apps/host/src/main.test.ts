@@ -566,6 +566,7 @@ test('the host router answers gateway status and log for the host and refuses th
     db,
     accessLedger,
     handlers: () => ({ procedure: async () => {}, 'gateway.request': async () => {} }),
+    decidePath: ['approval', 'decide'],
   })
   const status = {
     admission: 'open',

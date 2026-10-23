@@ -19,15 +19,30 @@ export const pendingApproval = sqliteTable(
     createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
     decidedAt: integer('decided_at', { mode: 'timestamp_ms' }),
     handledAt: integer('handled_at', { mode: 'timestamp_ms' }),
+    handlerError: text('handler_error'),
   },
   (t) => [
+    check('pending_approval_kind', sql`${t.kind} IN ${oneOf(approvalKinds)}`),
+    check('pending_approval_status', sql`${t.status} IN ${oneOf(approvalStatuses)}`),
     check(
-      'pending_approval_decided_iff_not_pending',
-      sql`(${t.status} = 'pending') = (${t.decidedBy} IS NULL AND ${t.decidedAt} IS NULL)`,
+      'pending_approval_decided_by_iff_decided',
+      sql`(${t.status} = 'pending') = (${t.decidedBy} IS NULL)`,
+    ),
+    check(
+      'pending_approval_decided_at_iff_decided',
+      sql`(${t.status} = 'pending') = (${t.decidedAt} IS NULL)`,
     ),
     check(
       'pending_approval_handled_only_when_decided',
       sql`${t.handledAt} IS NULL OR ${t.status} <> 'pending'`,
     ),
+    check(
+      'pending_approval_handler_error_only_when_handled',
+      sql`${t.handlerError} IS NULL OR ${t.handledAt} IS NOT NULL`,
+    ),
   ],
 )
+
+function oneOf(values: readonly string[]) {
+  return sql.raw(`(${values.map((value) => `'${value}'`).join(', ')})`)
+}

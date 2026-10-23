@@ -3,6 +3,7 @@ import { z } from 'zod'
 
 const userId = z
   .string()
+  .max(255)
   .regex(/^[^:\s]+:\S+$/, 'user id must look like <kind>:<handle>, for example slack:U123')
 
 export const createUserInput = z.object({

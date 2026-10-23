@@ -215,6 +215,7 @@ export async function startHost(config: HostConfig) {
       db,
       accessLedger,
       handlers: () => approvalHandlers,
+      decidePath: ['approval', 'decide'],
     })
     const chatLedger = createChatLedger({
       db,
@@ -292,11 +293,7 @@ export async function startHost(config: HostConfig) {
     }
     const rpc = createRpcFronts(hostRouter, contextFor)
     const agentHandler = new RPCHandler(hostRouter)
-    for (const { approvalId, error } of await approvalLedger.start()) {
-      process.stdout.write(
-        `${JSON.stringify({ kind: 'approval.handler.failed', approvalId, message: String(error) })}\n`,
-      )
-    }
+    await approvalLedger.start()
     const started = sessionLedger.start()
     admission = startAdmission({
       bind: async (probeNonce) => {

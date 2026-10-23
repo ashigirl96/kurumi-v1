@@ -11,7 +11,7 @@ import {
   type Tx,
 } from '@kurumi/rpc/server'
 import { implement, ORPCError } from '@orpc/server'
-import { and, eq, isNull, ne } from 'drizzle-orm'
+import { and, eq, isNull, ne, type SQL } from 'drizzle-orm'
 import { z } from 'zod'
 
 import {
@@ -55,7 +55,7 @@ export type ApprovalRecord<K extends ApprovalKind = ApprovalKind> = K extends Ap
   ? ApprovalFields & { kind: K; payload: ApprovalPayloads[K] }
   : never
 
-/** Runs after the decision commits, and again at the next start if it did not finish, so it must be idempotent. */
+/** Runs after the decision commits, and again at the next start if the host died before it finished. */
 export type ApprovalDecisionHandler<K extends ApprovalKind = ApprovalKind> = (
   approval: ApprovalRecord<K>,
   decision: ApprovalDecision,
@@ -76,7 +76,7 @@ export type ApprovalRequest = {
 
 export type DecideResult = { changed: boolean; message: string; approval: ApprovalView }
 
-export type HandlerFailure = { approvalId: string; error: unknown }
+const MAX_HELD_INPUT_BYTES = 64 * 1024
 
 export type ApprovalLedger = {
   request(tx: Tx, input: ApprovalRequest): { approvalId: string }
@@ -84,7 +84,7 @@ export type ApprovalLedger = {
   list(filter: 'pending' | 'decided'): ApprovalView[]
   show(id: string): ApprovalView
   guard: Guard
-  start(): Promise<HandlerFailure[]>
+  start(): Promise<void>
 }
 
 type Row = typeof pendingApproval.$inferSelect
@@ -110,9 +110,18 @@ function recordOf(row: Row): ApprovalRecord {
 }
 
 function summary(view: ApprovalView): string {
-  return view.status === 'pending'
-    ? 'pending'
-    : `${view.status} by ${view.decidedBy} at ${view.decidedAt.toISOString()}`
+  if (view.status === 'pending') return 'pending'
+  const decided = `${view.status} by ${view.decidedBy} at ${view.decidedAt.toISOString()}`
+  return view.handlerError === null
+    ? decided
+    : `${decided}, but its handler failed: ${view.handlerError}`
+}
+
+function escapeInvisible(text: string): string {
+  return text.replace(
+    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu,
+    (char) => `\\u{${char.codePointAt(0)?.toString(16)}}`,
+  )
 }
 
 function holdBody(caller: AgentCaller, title: string, input: unknown): string[] {
@@ -120,6 +129,24 @@ function holdBody(caller: AgentCaller, title: string, input: unknown): string[] 
     `Agent group ${caller.agentGroupId} (session ${caller.sessionId}) asks to run ${title}.`,
     `Input: ${JSON.stringify(input ?? null)}`,
   ]
+}
+
+const decideTarget = z.tuple([z.string()]).rest(z.unknown())
+
+function samePath(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((segment, index) => segment === b[index])
+}
+
+function procedureRow(
+  reader: Db | Tx,
+  where: SQL | undefined,
+  payload: ProcedurePayload,
+): Row | undefined {
+  return reader
+    .select()
+    .from(pendingApproval)
+    .where(and(where, eq(pendingApproval.kind, 'procedure'), eq(pendingApproval.payload, payload)))
+    .get()
 }
 
 function dispatch(
@@ -139,10 +166,13 @@ export function createApprovalLedger({
   db,
   accessLedger,
   handlers,
+  decidePath,
 }: {
   db: Db
   accessLedger: AccessLedger
   handlers: () => ApprovalHandlers
+  /** Where the host mounts `router.decide`; a human named as approver may call only this path. */
+  decidePath: readonly string[]
 }): ApprovalLedger {
   const rowOf = (id: string): Row | undefined =>
     db.select().from(pendingApproval).where(eq(pendingApproval.id, id)).get()
@@ -155,27 +185,37 @@ export function createApprovalLedger({
   }
 
   const settle = async (row: Row, decision: ApprovalDecision): Promise<void> => {
-    await dispatch(handlers(), recordOf(row), decision)
+    const handlerError = await dispatch(handlers(), recordOf(row), decision).then(
+      () => null,
+      (error: unknown) => escapeInvisible(error instanceof Error ? error.message : String(error)),
+    )
     transaction(db, (tx) => {
       tx.update(pendingApproval)
-        .set({ handledAt: new Date() })
+        .set({ handledAt: new Date(), handlerError })
         .where(and(eq(pendingApproval.id, row.id), isNull(pendingApproval.handledAt)))
         .run()
     })
   }
 
-  const grantFact = ({ grant, path }: GuardCall): GrantFact => {
+  const grantFact = ({ grant, path, input, caller }: GuardCall): GrantFact => {
     if (grant === null) return 'none'
-    const row = rowOf(grant.approvalId)
-    if (row?.kind !== 'procedure' || row.status !== 'approved' || row.handledAt !== null) {
-      return 'invalid'
-    }
-    const payload = procedurePayload.safeParse(row.payload)
-    return payload.success &&
-      payload.data.path.length === path.length &&
-      payload.data.path.every((segment, index) => segment === path[index])
-      ? 'valid'
-      : 'invalid'
+    const granted = procedureRow(
+      db,
+      and(
+        eq(pendingApproval.id, grant.approvalId),
+        eq(pendingApproval.status, 'approved'),
+        isNull(pendingApproval.handledAt),
+      ),
+      { path: [...path], input, caller },
+    )
+    return granted === undefined ? 'invalid' : 'valid'
+  }
+
+  const callerIsApprover = ({ caller, path, input }: GuardCall): boolean => {
+    const target = decideTarget.safeParse(input)
+    if (caller.kind !== 'human' || !samePath(path, decidePath) || !target.success) return false
+    const row = rowOf(target.data[0])
+    return row !== undefined && accessLedger.isApprover(caller, row.approvers)
   }
 
   const request: ApprovalLedger['request'] = (tx, input) => {
@@ -184,12 +224,36 @@ export function createApprovalLedger({
       .values({
         ...input,
         id: approvalId,
+        body: input.body.map(escapeInvisible),
         approvers: accessLedger.approverChain(input.agentGroupId),
         status: 'pending',
         createdAt: new Date(),
       })
       .run()
     return { approvalId }
+  }
+
+  const hold = (caller: AgentCaller, { path, input }: GuardCall): { approvalId: string } => {
+    const bytes = Buffer.byteLength(JSON.stringify(input) ?? '')
+    if (bytes > MAX_HELD_INPUT_BYTES) {
+      throw new ORPCError('PAYLOAD_TOO_LARGE', {
+        message: `a held call's input may be at most ${MAX_HELD_INPUT_BYTES} bytes; this one is ${bytes}`,
+      })
+    }
+    const title = path.join('.')
+    const payload = { path: [...path], input, caller }
+    return transaction(db, (tx) => {
+      const pending = procedureRow(tx, eq(pendingApproval.status, 'pending'), payload)
+      if (pending !== undefined) return { approvalId: pending.id }
+      return request(tx, {
+        kind: 'procedure',
+        agentGroupId: caller.agentGroupId,
+        sessionId: caller.sessionId,
+        title,
+        body: holdBody(caller, title, input),
+        payload,
+      })
+    })
   }
 
   return {
@@ -236,48 +300,22 @@ export function createApprovalLedger({
         const approval = approvalView.parse(transition.row)
         return { changed: false, message: `already ${summary(approval)}`, approval }
       }
-      try {
-        await settle(transition.row, decision)
-      } catch (error) {
-        const approval = show(id)
-        const reason = error instanceof Error ? error.message : String(error)
-        return {
-          changed: true,
-          message: `${summary(approval)}, but its handler failed and runs again at the next host start: ${reason}`,
-          approval,
-        }
-      }
+      await settle(transition.row, decision)
       const approval = show(id)
       return { changed: true, message: summary(approval), approval }
     },
     guard(call) {
       const result = verdict(call, {
         callerIsOwner: accessLedger.isOwner(call.caller),
+        callerIsApprover: callerIsApprover(call),
         grant: grantFact(call),
       })
       switch (result.kind) {
         case 'allow':
         case 'deny':
           return result
-        case 'hold': {
-          const { caller } = result
-          const title = call.path.join('.')
-          return {
-            kind: 'held',
-            approvalId: transaction(
-              db,
-              (tx) =>
-                request(tx, {
-                  kind: 'procedure',
-                  agentGroupId: caller.agentGroupId,
-                  sessionId: caller.sessionId,
-                  title,
-                  body: holdBody(caller, title, call.input),
-                  payload: { path: [...call.path], input: call.input, caller },
-                }).approvalId,
-            ),
-          }
-        }
+        case 'hold':
+          return { kind: 'hold', request: () => hold(result.caller, call) }
       }
     },
     async start() {
@@ -287,16 +325,9 @@ export function createApprovalLedger({
         .where(and(ne(pendingApproval.status, 'pending'), isNull(pendingApproval.handledAt)))
         .orderBy(pendingApproval.createdAt, pendingApproval.id)
         .all()
-      const failures: HandlerFailure[] = []
       for (const row of unhandled) {
-        if (row.status === 'pending') continue
-        try {
-          await settle(row, decisionOf[row.status])
-        } catch (error) {
-          failures.push({ approvalId: row.id, error })
-        }
+        if (row.status !== 'pending') await settle(row, decisionOf[row.status])
       }
-      return failures
     },
   }
 }

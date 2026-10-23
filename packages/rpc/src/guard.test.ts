@@ -15,6 +15,8 @@ import {
   transaction,
   verdict,
   type GrantFact,
+  type GuardCall,
+  type GuardOutcome,
   type KurumiContext,
   type Verdict,
 } from './server.ts'
@@ -77,7 +79,10 @@ test('a held call returns APPROVAL_PENDING with HTTP status 409 and the approval
     }),
   })
   const client = createRouterClient(router, {
-    context: { ...context, guard: () => ({ kind: 'held', approvalId: 'approval-test' }) },
+    context: {
+      ...context,
+      guard: () => ({ kind: 'hold', request: () => ({ approvalId: 'approval-test' }) }),
+    },
   })
 
   const error = await client.action().catch((caught: unknown) => caught)
@@ -186,6 +191,7 @@ const request = ({ caller, call }: VerdictCase) => ({
 test.each(verdictCases)('the verdict for $callerName calling $call.name', (testCase) => {
   const result = verdict(request(testCase), {
     callerIsOwner: testCase.caller === callers.owner,
+    callerIsApprover: false,
     grant: testCase.call.grant,
   })
   expect(result.kind).toBe(testCase.expected)
@@ -195,16 +201,23 @@ test.each(verdictCases)('the verdict for $callerName calling $call.name', (testC
 test.each(verdictCases)(
   'a grant never loosens a deny for $callerName calling $call.name',
   (testCase) => {
-    const callerIsOwner = testCase.caller === callers.owner
-    if (verdict(request(testCase), { callerIsOwner, grant: 'none' }).kind !== 'deny') return
+    const facts = { callerIsOwner: testCase.caller === callers.owner, callerIsApprover: false }
+    if (verdict(request(testCase), { ...facts, grant: 'none' }).kind !== 'deny') return
     for (const grant of ['valid', 'invalid'] as const) {
-      expect(verdict(request(testCase), { callerIsOwner, grant }).kind).toBe('deny')
+      expect(verdict(request(testCase), { ...facts, grant }).kind).toBe('deny')
     }
   },
 )
 
-test('a malformed held call is a 400 and the guard never runs', async () => {
-  let guardedCalls = 0
+test('a human the approval names as approver passes the verdict, other humans do not', () => {
+  const call = { path: ['approval', 'decide'], meta: {}, caller: callers.member, input: ['apr-1'] }
+  const grant = 'none'
+  expect(verdict(call, { callerIsOwner: false, callerIsApprover: true, grant }).kind).toBe('allow')
+  expect(verdict(call, { callerIsOwner: false, callerIsApprover: false, grant }).kind).toBe('deny')
+})
+
+test('a malformed held call is a 400 and records no approval', async () => {
+  let requested = 0
   let handled = false
   const router = guardRouter<KurumiContext>().router({
     users: {
@@ -226,17 +239,61 @@ test('a malformed held call is a 400 and the guard never runs', async () => {
       prefix: '/rpc',
       context: {
         ...context,
-        guard: () => {
-          guardedCalls++
-          return { kind: 'held', approvalId: 'approval-test' }
-        },
+        guard: () => ({
+          kind: 'hold',
+          request: () => {
+            requested++
+            return { approvalId: 'approval-test' }
+          },
+        }),
       },
     },
   )
   expect(response.response?.status).toBe(400)
-  expect(guardedCalls).toBe(0)
+  expect(requested).toBe(0)
   expect(handled).toBe(false)
 })
+
+test.each([
+  ['an agent calling a scoped procedure', callers.agent, { agent: 'scoped' }],
+  ['a non-owner human', callers.member, { agent: 'hold' }],
+] as const)(
+  'malformed input from %s is refused as 403 without the schema issues',
+  async (_name, caller, meta) => {
+    const router = guardRouter<KurumiContext>().router({
+      agents: {
+        create: base
+          .meta(meta)
+          .input(z.object({ name: z.string() }))
+          .handler(() => 'ran'),
+      },
+    })
+    const response = await new RPCHandler(router).handle(
+      new Request('http://agent.invalid/rpc/agents/create', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ json: { name: 42 } }),
+      }),
+      {
+        prefix: '/rpc',
+        context: {
+          ...context,
+          caller,
+          guard: verdictGuard,
+        },
+      },
+    )
+    expect(response.response?.status).toBe(403)
+    expect(await response.response?.text()).not.toContain('issues')
+  },
+)
+
+function verdictGuard(call: GuardCall): GuardOutcome {
+  const result = verdict(call, { callerIsOwner: false, callerIsApprover: false, grant: 'none' })
+  return result.kind === 'hold'
+    ? { kind: 'hold', request: () => ({ approvalId: 'approval-test' }) }
+    : result
+}
 
 test('the transaction helper returns synchronous values and rolls back failed writes', () => {
   sqlite.run('CREATE TABLE transaction_probe (value TEXT)')

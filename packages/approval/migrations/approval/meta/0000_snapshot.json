@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "1a396bdc-a579-4424-9910-9947ba2b52e7",
+  "id": "d3848aac-ef43-4a46-8261-92223beba2d2",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "pending_approval": {
@@ -97,6 +97,13 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "handler_error": {
+          "name": "handler_error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         }
       },
       "indexes": {},
@@ -104,13 +111,29 @@
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {
-        "pending_approval_decided_iff_not_pending": {
-          "name": "pending_approval_decided_iff_not_pending",
-          "value": "(\"pending_approval\".\"status\" = 'pending') = (\"pending_approval\".\"decided_by\" IS NULL AND \"pending_approval\".\"decided_at\" IS NULL)"
+        "pending_approval_kind": {
+          "name": "pending_approval_kind",
+          "value": "\"pending_approval\".\"kind\" IN ('procedure', 'gateway.request')"
+        },
+        "pending_approval_status": {
+          "name": "pending_approval_status",
+          "value": "\"pending_approval\".\"status\" IN ('pending', 'approved', 'denied')"
+        },
+        "pending_approval_decided_by_iff_decided": {
+          "name": "pending_approval_decided_by_iff_decided",
+          "value": "(\"pending_approval\".\"status\" = 'pending') = (\"pending_approval\".\"decided_by\" IS NULL)"
+        },
+        "pending_approval_decided_at_iff_decided": {
+          "name": "pending_approval_decided_at_iff_decided",
+          "value": "(\"pending_approval\".\"status\" = 'pending') = (\"pending_approval\".\"decided_at\" IS NULL)"
         },
         "pending_approval_handled_only_when_decided": {
           "name": "pending_approval_handled_only_when_decided",
           "value": "\"pending_approval\".\"handled_at\" IS NULL OR \"pending_approval\".\"status\" <> 'pending'"
+        },
+        "pending_approval_handler_error_only_when_handled": {
+          "name": "pending_approval_handler_error_only_when_handled",
+          "value": "\"pending_approval\".\"handler_error\" IS NULL OR \"pending_approval\".\"handled_at\" IS NOT NULL"
         }
       }
     }
