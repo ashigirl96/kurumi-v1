@@ -1,6 +1,10 @@
 import { expect, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { createDockerDriver } from '../server.ts'
+import type { Cli } from './docker.ts'
 import { FakeCli } from './fake-cli.ts'
 
 const image = 'kurumi-agent:test'
@@ -145,7 +149,7 @@ test('a signal aborted before probe allocates no container', async () => {
 })
 
 test.each(['success', 'failure'])(
-  'abort kills create and joins its late %s before cleanup',
+  'abort lets create settle with late %s before cleanup',
   async (late) => {
     const { cli, driver } = setup()
     const abort = new AbortController()
@@ -155,7 +159,7 @@ test.each(['success', 'failure'])(
     })
     const create = await call(cli, 0)
     abort.abort()
-    expect(create.proc.killed).toBe(true)
+    expect(create.proc.killed).toBe(false)
     expect(settled).toBe(false)
     expect(cli.started).toHaveLength(1)
     if (late === 'success') create.proc.complete({ stdout: 'late-container' })
@@ -538,5 +542,515 @@ test('the fetch program bounds the body before writing proof', async () => {
     expect(await new Response(child.stdout).text()).toBe('')
   } finally {
     await server.stop(true)
+  }
+})
+
+function agentSpec() {
+  return {
+    sessionId: 'ses-one',
+    containerId: 'ctr-one',
+    image,
+    env: { KURUMI_TOKEN: 'never-print-this-token', KURUMI_AGENT_PORT: '1234' },
+    mounts: [
+      { hostPath: import.meta.dir, containerPath: '/workspace/group', readonly: false },
+      { hostPath: import.meta.path, containerPath: '/app/runner.js', readonly: true },
+    ],
+    network: { kind: 'default' as const },
+    limits: { cpus: 1.5, memoryMb: 768, pids: 64 },
+  }
+}
+
+test('a missing bind source fails before Docker can create an empty directory', async () => {
+  const { cli, driver } = setup()
+  cli.responses.push({ match: /.*/, result: {} })
+  try {
+    const result = await driver.run({
+      ...agentSpec(),
+      mounts: [
+        {
+          hostPath: `${import.meta.dir}/missing-${crypto.randomUUID()}`,
+          containerPath: '/app/runner.js',
+          readonly: true,
+        },
+      ],
+    })
+    expect(result.ok).toBe(false)
+    expect(cli.started).toHaveLength(0)
+  } finally {
+    await driver.stop()
+  }
+})
+
+function containerName(args: string[]) {
+  const name = args[args.indexOf('--name') + 1]
+  if (!name) throw new Error('agent has no container name')
+  return name
+}
+
+async function finishAgent(cli: FakeCli, waitIndex: number, code = 0) {
+  cli.responses.push({ match: /^rm /, result: {} })
+  ;(await call(cli, waitIndex)).proc.complete({ stdout: `${code}\n` })
+  await call(cli, waitIndex + 1)
+  await Bun.sleep(0)
+}
+
+test('agent runs its runner with exact mounts, labels, hardening and resource limits', async () => {
+  const { cli, driver } = setup()
+  cli.responses.push({ match: /^(create|start) /, result: {} })
+  const exits: [string, number][] = []
+  driver.onExit((id, code) => exits.push([id, code]))
+  expect(await driver.run(agentSpec())).toEqual({ ok: true })
+  const create = await call(cli, 0)
+  expect(create.args).not.toContain('--rm')
+  for (const value of [
+    '--init',
+    '--cap-drop=ALL',
+    'no-new-privileges',
+    'kurumi.install=test-install',
+    'kurumi.session=ses-one',
+    'kurumi.role=agent',
+    'kurumi.container=ctr-one',
+  ])
+    expect(create.args).toContain(value)
+  expect(create.args).toContain(`${import.meta.dir}:/workspace/group:rw`)
+  expect(create.args).toContain(`${import.meta.path}:/app/runner.js:ro`)
+  expect(create.args.filter((arg) => arg.includes(':/'))).toEqual([
+    `${import.meta.dir}:/workspace/group:rw`,
+    `${import.meta.path}:/app/runner.js:ro`,
+  ])
+  expect(
+    create.args.slice(create.args.indexOf('--cpus'), create.args.indexOf('--cpus') + 2),
+  ).toEqual(['--cpus', '1.5'])
+  expect(
+    create.args.slice(create.args.indexOf('--memory'), create.args.indexOf('--memory') + 2),
+  ).toEqual(['--memory', '768m'])
+  expect(
+    create.args.slice(create.args.indexOf('--pids-limit'), create.args.indexOf('--pids-limit') + 2),
+  ).toEqual(['--pids-limit', '64'])
+  expect(create.args.slice(-3)).toEqual([image, 'bun', '/app/runner.js'])
+  expect(cli.started[1]?.args).toEqual(['start', containerName(create.args)])
+  expect(cli.started[2]?.args).toEqual(['wait', containerName(create.args)])
+  await finishAgent(cli, 2, 17)
+  expect(exits).toEqual([['ctr-one', 17]])
+  await driver.stop()
+})
+
+test('concurrent and repeated runs for one session create one container', async () => {
+  const { cli, driver } = setup()
+  const first = driver.run(agentSpec())
+  const duplicate = driver.run({ ...agentSpec(), containerId: 'ctr-duplicate' })
+  ;(await call(cli, 0)).proc.complete()
+  ;(await call(cli, 1)).proc.complete()
+  expect(await first).toEqual({ ok: true })
+  expect(await duplicate).toEqual({ ok: true })
+  expect(await driver.run(agentSpec())).toEqual({ ok: true })
+  expect(cli.started.filter(({ args }) => args[0] === 'create')).toHaveLength(1)
+  await finishAgent(cli, 2)
+  await driver.stop()
+})
+
+test('agent lockdown uses the contributed network and never attaches to stdout', async () => {
+  const { cli, driver } = setup()
+  cli.responses.push({ match: /^(create|start) /, result: {} })
+  expect(
+    await driver.run({
+      ...agentSpec(),
+      network: { kind: 'lockdown', dockerNetwork: 'private-net' },
+    }),
+  ).toEqual({ ok: true })
+  const args = (await call(cli, 0)).args
+  expect(args.slice(args.indexOf('--network'), args.indexOf('--network') + 2)).toEqual([
+    '--network',
+    'private-net',
+  ])
+  expect(cli.joined().join(' ')).not.toContain('--attach')
+  await finishAgent(cli, 2)
+  await driver.stop()
+})
+
+test('kill lets a pending create settle before removing its late container', async () => {
+  const { cli, driver } = setup()
+  const run = driver.run(agentSpec())
+  const create = await call(cli, 0)
+  let settled = false
+  const kill = driver.kill('ctr-one', 0).then(() => {
+    settled = true
+  })
+  expect(create.proc.killed).toBe(false)
+  expect(settled).toBe(false)
+  expect(cli.started).toHaveLength(1)
+  create.proc.complete()
+  ;(await call(cli, 1)).proc.complete()
+  await kill
+  expect((await run).ok).toBe(false)
+  expect(cli.started.map(({ args }) => args[0])).toEqual(['create', 'rm'])
+  await driver.stop()
+})
+
+test('uncertain agent cleanup prevents replacement until exact absence is confirmed', async () => {
+  const { cli, driver } = setup()
+  const first = driver.run(agentSpec())
+  const create = await call(cli, 0)
+  const name = containerName(create.args)
+  create.proc.complete({ code: 1, stderr: 'daemon disconnected never-print-this-token' })
+  ;(await call(cli, 1)).proc.complete({ code: 1, stderr: 'daemon disconnected' })
+  ;(await call(cli, 2)).proc.complete({ code: 1 })
+  const failed = await first
+  expect(failed.ok).toBe(false)
+  expect(JSON.stringify(failed)).not.toContain('never-print-this-token')
+  const retry = driver.run({ ...agentSpec(), containerId: 'ctr-two' })
+  const remove = await call(cli, 3)
+  expect(remove.args).toEqual(['rm', '--force', name])
+  remove.proc.complete({ code: 1, stderr: `No such container: ${name}` })
+  ;(await call(cli, 4)).proc.complete()
+  ;(await call(cli, 5)).proc.complete()
+  expect(await retry).toEqual({ ok: true })
+  await finishAgent(cli, 6)
+  await driver.stop()
+})
+
+test('list scopes to this install and agent role and returns logical ids with honest state', async () => {
+  const { cli, driver } = setup()
+  cli.responses.push({
+    match: /^ps /,
+    result: { stdout: 'ctr-one|running\nctr-two|exited\nctr-three|created\n' },
+  })
+  expect(await driver.list()).toEqual([
+    { containerId: 'ctr-one', running: true },
+    { containerId: 'ctr-two', running: false },
+    { containerId: 'ctr-three', running: false },
+  ])
+  const args = (await call(cli, 0)).args
+  expect(args).toContain('label=kurumi.install=test-install')
+  expect(args).toContain('label=kurumi.role=agent')
+  expect(args).toContain('-a')
+  await driver.stop()
+})
+
+test('stop drains the wait process, removes containers and rejects subsequent starts', async () => {
+  const { cli, driver } = setup()
+  cli.responses.push({ match: /^(create|start) /, result: {} })
+  expect(await driver.run(agentSpec())).toEqual({ ok: true })
+  const wait = await call(cli, 2)
+  const stopping = driver.stop()
+  expect(wait.proc.killed).toBe(true)
+  wait.proc.complete({ code: null })
+  ;(await call(cli, 3)).proc.complete()
+  await stopping
+  const count = cli.started.length
+  expect((await driver.run(agentSpec())).ok).toBe(false)
+  expect(cli.started).toHaveLength(count)
+  await driver.stop()
+})
+
+test('concurrent retries share a single replacement after retained cleanup', async () => {
+  const { cli, driver } = setup()
+  const failed = driver.run(agentSpec())
+  ;(await call(cli, 0)).proc.complete({ code: 1 })
+  ;(await call(cli, 1)).proc.complete({ code: 1 })
+  ;(await call(cli, 2)).proc.complete({ code: 1 })
+  expect((await failed).ok).toBe(false)
+  const first = driver.run({ ...agentSpec(), containerId: 'ctr-retry' })
+  const second = driver.run({ ...agentSpec(), containerId: 'ctr-other-retry' })
+  ;(await call(cli, 3)).proc.complete({ code: 1, stderr: 'No such container: old' })
+  ;(await call(cli, 4)).proc.complete()
+  ;(await call(cli, 5)).proc.complete()
+  expect(await first).toEqual({ ok: true })
+  expect(await second).toEqual({ ok: true })
+  expect(cli.started.filter(({ args }) => args[0] === 'create')).toHaveLength(2)
+  await finishAgent(cli, 6)
+  await driver.stop()
+})
+
+test('stop drains an active probe and agent together', async () => {
+  const { cli, driver } = setup()
+  cli.responses.push(
+    { match: /^create /, result: {} },
+    { match: /^start kurumi-agent-/, result: {} },
+  )
+  expect(await driver.run(agentSpec())).toEqual({ ok: true })
+  const probe = observe(driver.probe(url))
+  const attach = await call(cli, 4)
+  const stopping = driver.stop()
+  expect((await call(cli, 2)).proc.killed).toBe(true)
+  expect(attach.proc.killed).toBe(true)
+  ;(await call(cli, 2)).proc.complete({ code: null })
+  attach.proc.complete({ code: null })
+  ;(await call(cli, 5)).proc.complete()
+  ;(await call(cli, 6)).proc.complete()
+  await stopping
+  expect((await probe).kind).toBe('failure')
+})
+
+test('agent exit is reported immediately while removal waits for exact absence', async () => {
+  const { cli, driver } = setup()
+  cli.responses.push({ match: /^(create|start) /, result: {} })
+  const exits: number[] = []
+  driver.onExit((_id, code) => exits.push(code))
+  expect(await driver.run(agentSpec())).toEqual({ ok: true })
+  const name = containerName((await call(cli, 0)).args)
+  ;(await call(cli, 2)).proc.complete({ stdout: '137\n' })
+  ;(await call(cli, 3)).proc.complete({
+    code: 1,
+    stderr: `Error response from daemon: removal of container ${name} is already in progress`,
+  })
+  ;(await call(cli, 4)).proc.complete({ stdout: `${name}\n` })
+  expect(exits).toEqual([137])
+  ;(await call(cli, 5)).proc.complete()
+  await Bun.sleep(0)
+  expect(exits).toEqual([137])
+  await driver.stop()
+})
+
+test('a failed wait removes the unsupervised container and emits once to active listeners', async () => {
+  const { cli, driver } = setup()
+  cli.responses.push({ match: /^(create|start) /, result: {} })
+  const exits: number[] = []
+  const unsubscribe = driver.onExit(() => {
+    throw new Error('unsubscribed listener ran')
+  })
+  unsubscribe()
+  driver.onExit(() => {
+    throw new Error('subscriber failed')
+  })
+  driver.onExit((_id, code) => exits.push(code))
+  expect(await driver.run(agentSpec())).toEqual({ ok: true })
+  ;(await call(cli, 2)).proc.fail(new Error('daemon disconnected'))
+  ;(await call(cli, 3)).proc.complete()
+  await Bun.sleep(0)
+  expect(exits).toEqual([-1])
+  await driver.stop()
+})
+
+test('kill cancels a replacement while the previous incarnation is still being removed', async () => {
+  const { cli, driver } = setup()
+  const failed = driver.run(agentSpec())
+  ;(await call(cli, 0)).proc.complete({ code: 1 })
+  ;(await call(cli, 1)).proc.complete({ code: 1 })
+  ;(await call(cli, 2)).proc.complete({ code: 1 })
+  expect((await failed).ok).toBe(false)
+  const retry = driver.run({ ...agentSpec(), containerId: 'ctr-retry' })
+  const oldRemoval = await call(cli, 3)
+  const kill = driver.kill('ctr-retry', 0)
+  oldRemoval.proc.complete({ code: 1, stderr: 'No such container: old' })
+  await kill
+  expect((await retry).ok).toBe(false)
+  expect(cli.started.filter(({ args }) => args[0] === 'create')).toHaveLength(1)
+  await driver.stop()
+})
+
+test('stop retries cleanup of a probe whose earlier cleanup was unconfirmed', async () => {
+  const { cli, driver } = setup()
+  const probe = observe(driver.probe(url))
+  const create = await call(cli, 0)
+  create.proc.complete({ code: 1 })
+  ;(await call(cli, 1)).proc.complete({ code: 1 })
+  ;(await call(cli, 2)).proc.complete({ code: 1 })
+  expect((await probe).kind).toBe('failure')
+  const stopping = driver.stop()
+  ;(await call(cli, 3)).proc.complete({
+    code: 1,
+    stderr: `No such container: ${containerName(create.args)}`,
+  })
+  await stopping
+})
+
+test('kill lets a replacement create settle after its predecessor cleanup finishes', async () => {
+  const { cli, driver } = setup()
+  const failed = driver.run(agentSpec())
+  ;(await call(cli, 0)).proc.complete({ code: 1 })
+  ;(await call(cli, 1)).proc.complete({ code: 1 })
+  ;(await call(cli, 2)).proc.complete({ code: 1 })
+  await failed
+  const retry = driver.run({ ...agentSpec(), containerId: 'ctr-retry' })
+  ;(await call(cli, 3)).proc.complete({ code: 1, stderr: 'No such container: old' })
+  const create = await call(cli, 4)
+  const killing = driver.kill('ctr-retry', 0)
+  const killed = create.proc.killed
+  create.proc.complete()
+  ;(await call(cli, 5)).proc.complete({ code: 1, stderr: 'No such container: new' })
+  await killing
+  expect((await retry).ok).toBe(false)
+  await driver.stop()
+  expect(killed).toBe(false)
+})
+
+test('kill rejects when a replacement create reaches its cleanup deadline', async () => {
+  const cli = new FakeCli()
+  const driver = createDockerDriver({ install: 'test', image, cli, timeoutMs: 30 })
+  const failed = driver.run(agentSpec())
+  ;(await call(cli, 0)).proc.complete({ code: 1 })
+  ;(await call(cli, 1)).proc.complete({ code: 1 })
+  ;(await call(cli, 2)).proc.complete({ code: 1 })
+  expect((await failed).ok).toBe(false)
+  const retry = driver.run({ ...agentSpec(), containerId: 'ctr-retry' })
+  ;(await call(cli, 3)).proc.complete({ code: 1, stderr: 'No such container: old' })
+  const create = await call(cli, 4)
+  const killing = driver.kill('ctr-retry', 0).then(
+    () => 'removed',
+    (error: unknown) => String(error),
+  )
+  const outcome = await Promise.race([killing, Bun.sleep(250).then(() => 'still waiting')])
+  create.proc.complete({ code: null })
+  expect((await retry).ok).toBe(false)
+  expect(await driver.stop().catch((cause: unknown) => String(cause))).toContain('cleanup')
+  expect(outcome).toContain('cleanup')
+})
+
+test.each(['agent', 'probe'] as const)(
+  'stop removes a late daemon create for %s even when killing its CLI would finish first',
+  async (role) => {
+    const cli = new FakeCli()
+    const containers = new Set<string>()
+    const created = Promise.withResolvers<void>()
+    const daemon: Cli = {
+      start(args) {
+        const proc = cli.start(args)
+        if (args[0] === 'create') {
+          const name = containerName([...args])
+          setTimeout(() => {
+            containers.add(name)
+            proc.complete({ stdout: name })
+            created.resolve()
+          }, 50)
+          return {
+            result: proc.result,
+            kill() {
+              proc.kill()
+              proc.complete({ code: null })
+            },
+          }
+        }
+        if (args[0] === 'rm') {
+          const name = args.at(-1) ?? ''
+          proc.complete(
+            containers.delete(name)
+              ? { stdout: name }
+              : { code: 1, stderr: `No such container: ${name}` },
+          )
+        }
+        return proc
+      },
+    }
+    const driver = createDockerDriver({ install: 'test-install', image, cli: daemon })
+    const pending = role === 'agent' ? driver.run(agentSpec()) : observe(driver.probe(url))
+    await call(cli, 0)
+    await driver.stop()
+    await pending
+    await created.promise
+    expect([...containers]).toEqual([])
+    expect(cli.started.some(({ args }) => args[0] === 'start')).toBe(false)
+  },
+)
+
+test.each(['agent', 'probe'] as const)(
+  'stop reports unconfirmed cleanup within its bound when %s create never settles',
+  async (role) => {
+    const cli = new FakeCli()
+    const driver = createDockerDriver({ install: 'test', image, cli, timeoutMs: 30 })
+    const pending = role === 'agent' ? driver.run(agentSpec()) : observe(driver.probe(url))
+    const create = await call(cli, 0)
+    const stopped = driver.stop().then(
+      () => 'success',
+      (error: unknown) => String(error),
+    )
+    const result = await Promise.race([stopped, Bun.sleep(250).then(() => 'still waiting')])
+    expect(result).toContain('cleanup')
+    expect(create.proc.killed).toBe(true)
+    expect(cli.started.some(({ args }) => args[0] === 'start')).toBe(false)
+    create.proc.complete({ code: null })
+    await pending
+  },
+)
+
+function signalledDaemon(code: number | null) {
+  const cli = new FakeCli()
+  const containers = new Set<string>()
+  const created = Promise.withResolvers<void>()
+  const daemon: Cli = {
+    start(args) {
+      const proc = cli.start(args)
+      if (args[0] === 'create') {
+        const name = containerName([...args])
+        proc.complete({ code })
+        setTimeout(() => {
+          containers.add(name)
+          created.resolve()
+        }, 30)
+      }
+      if (args[0] === 'rm') {
+        const name = args.at(-1) ?? ''
+        proc.complete(
+          containers.delete(name)
+            ? { stdout: name }
+            : { code: 1, stderr: `No such container: ${name}` },
+        )
+      }
+      if (args[0] === 'ps') proc.complete({ stdout: '' })
+      return proc
+    },
+  }
+  return { cli, containers, created: created.promise, daemon }
+}
+
+test.each(
+  (['agent', 'probe'] as const).flatMap((role) =>
+    (
+      [
+        { exit: 'exit 143', code: 143 },
+        { exit: 'exit 130', code: 130 },
+        { exit: 'code null', code: null },
+      ] as const
+    ).map(({ exit, code }) => ({ role, exit, code })),
+  ),
+)(
+  'stop leaves no $role container or rejects when its create CLI ends by $exit from an outside signal',
+  async ({ role, code }) => {
+    const { cli, containers, created, daemon } = signalledDaemon(code)
+    const driver = createDockerDriver({ install: 'test-install', image, cli: daemon })
+    const pending = role === 'agent' ? driver.run(agentSpec()) : observe(driver.probe(url))
+    await call(cli, 0)
+    await pending
+    const stopped = await driver.stop().then(
+      () => 'ok',
+      (error: unknown) => String(error),
+    )
+    await created
+    expect(stopped === 'ok' ? `left: ${[...containers].join(' ')}` : stopped).toMatch(
+      /^left: $|unconfirmed/,
+    )
+  },
+)
+
+test('kill rejects after an agent create CLI ends by an outside signal', async () => {
+  const { created, daemon } = signalledDaemon(143)
+  const driver = createDockerDriver({ install: 'test-install', image, cli: daemon })
+  expect((await driver.run(agentSpec())).ok).toBe(false)
+  const killed = await driver.kill('ctr-one', 0).then(
+    () => 'ok',
+    (error: unknown) => String(error),
+  )
+  await created
+  expect(killed).toContain('unconfirmed')
+  await driver.stop().catch(() => {})
+})
+
+test('docker CLI children run in their own process group', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kurumi-docker-pgid-'))
+  const record = join(dir, 'pgid')
+  writeFileSync(join(dir, 'docker'), `#!/bin/sh\nps -o pgid= -p $$ > '${record}'\n`, {
+    mode: 0o755,
+  })
+  const path = process.env.PATH
+  process.env.PATH = `${dir}:${path}`
+  try {
+    const driver = createDockerDriver({ install: 'test-install', image })
+    expect(await driver.list()).toEqual([])
+    await driver.stop()
+    const own = (await Bun.$`ps -o pgid= -p ${process.pid}`.text()).trim()
+    expect(readFileSync(record, 'utf8').trim()).not.toBe(own)
+  } finally {
+    process.env.PATH = path
+    rmSync(dir, { recursive: true, force: true })
   }
 })

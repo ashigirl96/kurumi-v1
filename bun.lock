@@ -44,6 +44,22 @@
         "zod": "catalog:",
       },
     },
+    "apps/runner": {
+      "name": "@kurumi/runner",
+      "dependencies": {
+        "@kurumi/session": "workspace:*",
+        "@orpc/client": "catalog:",
+        "@orpc/contract": "catalog:",
+      },
+      "devDependencies": {
+        "@kurumi/agent": "workspace:*",
+        "@kurumi/chat": "workspace:*",
+        "@kurumi/gateway": "workspace:*",
+        "@kurumi/rpc": "workspace:*",
+        "@orpc/server": "catalog:",
+        "drizzle-orm": "catalog:",
+      },
+    },
     "packages/access": {
       "name": "@kurumi/access",
       "dependencies": {
@@ -213,6 +229,8 @@
     "@kurumi/host": ["@kurumi/host@workspace:apps/host"],
 
     "@kurumi/rpc": ["@kurumi/rpc@workspace:packages/rpc"],
+
+    "@kurumi/runner": ["@kurumi/runner@workspace:apps/runner"],
 
     "@kurumi/session": ["@kurumi/session@workspace:packages/session"],
 
