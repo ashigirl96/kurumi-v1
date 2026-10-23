@@ -20,9 +20,13 @@ function homeForTest(): string {
   return home
 }
 
-function spawnHost(home: string, preload?: string): Bun.Subprocess<'ignore', 'pipe', 'pipe'> {
+function spawnHost(
+  home: string,
+  preload?: string,
+  env: Record<string, string> = {},
+): Bun.Subprocess<'ignore', 'pipe', 'pipe'> {
   const child = Bun.spawn([process.execPath, ...(preload ? ['--preload', preload] : []), main], {
-    env: { ...process.env, KURUMI_HOME: home },
+    env: { ...process.env, KURUMI_HOME: home, ...env },
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -102,6 +106,24 @@ test.each(['SIGTERM', 'SIGINT'] as const)(
   },
   5000,
 )
+
+test('a repeated SIGINT during shutdown still lets the host stop cleanly', async () => {
+  const home = homeForTest()
+  const created = join(home, 'create-started')
+  writeFileSync(
+    join(home, 'docker'),
+    `#!/bin/sh\nif [ "$1" = create ]; then : > '${created}'; sleep 1; fi\n`,
+    { mode: 0o755 },
+  )
+  const host = spawnHost(home, undefined, { PATH: `${home}:${process.env.PATH}` })
+  await waitForHost(home, host)
+  while (!existsSync(created)) await Bun.sleep(10)
+  host.kill('SIGINT')
+  await Bun.sleep(100)
+  host.kill('SIGINT')
+  expect(await host.exited).toBe(0)
+  expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
+}, 5000)
 
 test('concurrent host starts name the lock owner before its pid write completes', async () => {
   for (let attempt = 0; attempt < 5; attempt++) {

@@ -1035,7 +1035,7 @@ test('kill rejects after an agent create CLI ends by an outside signal', async (
   await driver.stop().catch(() => {})
 })
 
-test('docker CLI children run outside the host process group so a group signal cannot end them', async () => {
+test('docker CLI children run in their own process group', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'kurumi-docker-pgid-'))
   const record = join(dir, 'pgid')
   writeFileSync(join(dir, 'docker'), `#!/bin/sh\nps -o pgid= -p $$ > '${record}'\n`, {
