@@ -5,6 +5,10 @@
   "dependencies": {
     "@kurumi/account": "workspace:*",
     "@kurumi/agent": "workspace:*",
-    "drizzle-orm": "catalog:"
+    "@kurumi/rpc": "workspace:*",
+    "@orpc/contract": "catalog:",
+    "@orpc/server": "catalog:",
+    "drizzle-orm": "catalog:",
+    "zod": "catalog:"
   }
 }
