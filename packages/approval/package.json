@@ -1,0 +1,24 @@
+{
+  "name": "@kurumi/approval",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./contract": "./src/contract.ts",
+    "./schema": "./src/schema.ts",
+    "./server": "./src/server.ts"
+  },
+  "scripts": {
+    "generate": "drizzle-kit generate"
+  },
+  "dependencies": {
+    "@kurumi/access": "workspace:*",
+    "@kurumi/rpc": "workspace:*",
+    "@orpc/server": "catalog:",
+    "drizzle-orm": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@kurumi/agent": "workspace:*",
+    "drizzle-kit": "catalog:"
+  }
+}

@@ -101,6 +101,20 @@
         "drizzle-kit": "catalog:",
       },
     },
+    "packages/approval": {
+      "name": "@kurumi/approval",
+      "dependencies": {
+        "@kurumi/access": "workspace:*",
+        "@kurumi/rpc": "workspace:*",
+        "@orpc/server": "catalog:",
+        "drizzle-orm": "catalog:",
+        "zod": "catalog:",
+      },
+      "devDependencies": {
+        "@kurumi/agent": "workspace:*",
+        "drizzle-kit": "catalog:",
+      },
+    },
     "packages/chat": {
       "name": "@kurumi/chat",
       "dependencies": {
@@ -261,6 +275,8 @@
     "@kurumi/account": ["@kurumi/account@workspace:packages/account"],
 
     "@kurumi/agent": ["@kurumi/agent@workspace:packages/agent"],
+
+    "@kurumi/approval": ["@kurumi/approval@workspace:packages/approval"],
 
     "@kurumi/chat": ["@kurumi/chat@workspace:packages/chat"],
 

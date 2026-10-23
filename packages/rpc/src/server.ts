@@ -1,4 +1,14 @@
-import { ORPCError, os, type AnyProcedure } from '@orpc/server'
+import type { AnyContractRouter } from '@orpc/contract'
+import {
+  call as callProcedure,
+  getRouter,
+  isProcedure,
+  ORPCError,
+  os,
+  unlazy,
+  type AnyProcedure,
+  type Router,
+} from '@orpc/server'
 import type { BunSQLiteDatabase } from 'drizzle-orm/bun-sqlite'
 
 import type { AgentCaller, Caller, Meta } from './contract.ts'
@@ -122,6 +132,20 @@ export const guarded = base.middleware(async ({ context, path, procedure, next }
 
 export function guardRouter<TContext extends KurumiContext>() {
   return os.$context<TContext>().$meta<Meta>({}).use(guarded)
+}
+
+/** Calls the procedure at `path` through every middleware the router put in front of it. */
+export async function callByPath<TContext extends KurumiContext>(
+  router: Router<AnyContractRouter, TContext>,
+  path: readonly string[],
+  input: unknown,
+  context: TContext,
+): Promise<unknown> {
+  const { default: target } = await unlazy(getRouter(router, path))
+  if (!isProcedure(target)) {
+    throw new ORPCError('NOT_FOUND', { message: `no procedure at ${path.join('.')}` })
+  }
+  return callProcedure(target, input, { context, path })
 }
 
 export function targetGroup(caller: Caller, requested: string | undefined): string {
