@@ -127,7 +127,7 @@ export async function startHost(config: HostConfig) {
       if (!(error instanceof VaultError)) throw error
       const dbPath = join(config.home, 'kurumi.db')
       throw new Error(
-        `${join(config.home, 'vault.key')} cannot open the gateway CA in ${dbPath} (${error.message}). ${dbPath} also holds accounts, so kurumi does not replace the CA under this key. If this vault.key did not seal those accounts, put back the one that did from your backup and start the host again. If it did, only the CA is unreadable: with the host stopped, run sqlite3 '${dbPath.replaceAll("'", `'\\''`)}' 'DELETE FROM gateway_ca;' and start the host, and kurumi creates a new CA.`,
+        `${join(config.home, 'vault.key')} cannot open the gateway CA in ${dbPath}: ${error.message}. If this vault.key did not seal the accounts, put back the one that did from your backup and start the host again. If it did, only the CA is unreadable: with the host stopped, run sqlite3 '${dbPath.replaceAll("'", `'\\''`)}' 'DELETE FROM gateway_ca;' and start the host, and kurumi creates a new CA.`,
         { cause: error },
       )
     })

@@ -230,14 +230,6 @@ test('a killed host leaves a lock and socket that a new host can recover', async
   expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
 }, 5000)
 
-async function startedAndStoppedHome(home = homeForTest()): Promise<string> {
-  const first = spawnHost(home)
-  await waitForHost(home, first)
-  first.kill('SIGTERM')
-  expect(await first.exited).toBe(0)
-  return home
-}
-
 async function startAndStop(home: string): Promise<string> {
   const host = spawnHost(home)
   await waitForHost(home, host)
@@ -267,7 +259,8 @@ function storeAccount(home: string, material: Uint8Array): void {
 }
 
 test('with no accounts stored, a host whose vault.key was deleted starts with a new key and a new gateway CA', async () => {
-  const home = await startedAndStoppedHome()
+  const home = homeForTest()
+  await startAndStop(home)
   const before = storedCa(home)
   rmSync(join(home, 'vault.key'))
 
@@ -278,7 +271,8 @@ test('with no accounts stored, a host whose vault.key was deleted starts with a 
 }, 5000)
 
 test('after the start-over SQL deletes every account, a host without vault.key starts with a new gateway CA', async () => {
-  const home = await startedAndStoppedHome()
+  const home = homeForTest()
+  await startAndStop(home)
   const before = storedCa(home)
   storeAccount(home, Buffer.of(0))
   rmSync(join(home, 'vault.key'))
@@ -298,7 +292,8 @@ test('after the start-over SQL deletes every account, a host without vault.key s
 }, 5000)
 
 test('with accounts stored, a wrong vault.key stops the host, names the backup, and keeps the gateway CA', async () => {
-  const home = await startedAndStoppedHome()
+  const home = homeForTest()
+  await startAndStop(home)
   const before = storedCa(home)
   storeAccount(home, Buffer.of(0))
   writeFileSync(join(home, 'vault.key'), randomBytes(32), { mode: 0o600 })
@@ -313,9 +308,9 @@ test('with accounts stored, a wrong vault.key stops the host, names the backup, 
 }, 5000)
 
 test('with accounts stored, a gateway CA the vault.key cannot open stops the host, and the printed command replaces it', async () => {
-  const quoted = mkdtempSync(join(tmpdir(), "kurumi host's "))
-  homes.push(quoted)
-  const home = await startedAndStoppedHome(quoted)
+  const home = mkdtempSync(join(tmpdir(), "kurumi host's "))
+  homes.push(home)
+  await startAndStop(home)
   const key = readFileSync(join(home, 'vault.key'))
   storeAccount(home, seal(key, 'acc-a', 'sk-ant-test'))
   const sqlite = new Database(join(home, 'kurumi.db'))
@@ -331,7 +326,7 @@ test('with accounts stored, a gateway CA the vault.key cannot open stops the hos
   const stderr = await new Response(refused.stderr).text()
   const db = join(home, 'kurumi.db')
   expect(stderr).toContain(
-    `${join(home, 'vault.key')} cannot open the gateway CA in ${db} (sealed material for gateway_ca failed authentication). ${db} also holds accounts, so kurumi does not replace the CA under this key. If this vault.key did not seal those accounts, put back the one that did from your backup and start the host again. If it did, only the CA is unreadable: with the host stopped, run sqlite3 '${db.replaceAll("'", `'\\''`)}' 'DELETE FROM gateway_ca;' and start the host, and kurumi creates a new CA.`,
+    `${join(home, 'vault.key')} cannot open the gateway CA in ${db}: sealed material for gateway_ca failed authentication, and accounts are stored, so the CA is not replaced under this key. If this vault.key did not seal the accounts, put back the one that did from your backup and start the host again. If it did, only the CA is unreadable: with the host stopped, run sqlite3 '${db.replaceAll("'", `'\\''`)}' 'DELETE FROM gateway_ca;' and start the host, and kurumi creates a new CA.`,
   )
   expect(storedCa(home)).toBe(before)
   const printed = / run (sqlite3 .+;') and start/.exec(stderr)?.[1]

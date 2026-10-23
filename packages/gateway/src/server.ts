@@ -67,18 +67,23 @@ export async function loadCertificateAuthority(deps: {
   }
   const row = deps.db.select().from(gatewayCa).get()
   if (!row) return certificateAuthority(await sealNewCa(), clock)
-  const keyPem = openCaKey(deps.vaultKey, row.sealedKey)
-  if (keyPem instanceof VaultError) {
-    if (deps.accountsStored) throw keyPem
+  const opened = openCaKey(deps.vaultKey, row.sealedKey)
+  if (opened instanceof VaultError) {
+    if (deps.accountsStored) {
+      throw new VaultError(
+        `${opened.message}, and accounts are stored, so the CA is not replaced under this key`,
+        { cause: opened },
+      )
+    }
     const replaced = await sealNewCa()
     deps.log({
       kind: 'gateway.ca.replaced',
-      reason: `the vault key cannot open the stored CA (${keyPem.message}) and no accounts are stored`,
+      reason: `the vault key cannot open the stored CA (${opened.message}) and no accounts are stored`,
       notAfter: certificateNotAfter(replaced.certPem).toISOString(),
     })
     return certificateAuthority(replaced, clock)
   }
-  const stored = { certPem: row.certPem, keyPem }
+  const stored = { certPem: row.certPem, keyPem: opened }
   const previousNotAfter = certificateNotAfter(stored.certPem)
   if (previousNotAfter.getTime() - now() > CA_RENEWAL_WINDOW_MS) {
     return certificateAuthority(stored, clock)

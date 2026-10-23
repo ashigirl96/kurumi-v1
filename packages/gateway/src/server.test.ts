@@ -99,6 +99,10 @@ test('the stored key is sealed and, with accounts stored, does not open without 
     log: ignore,
   }).catch((error: unknown) => error)
   expect(failure).toBeInstanceOf(VaultError)
+  expect(failure).toHaveProperty(
+    'message',
+    'sealed material for gateway_ca failed authentication, and accounts are stored, so the CA is not replaced under this key',
+  )
 })
 
 test('with no accounts stored, a CA the vault key cannot open is replaced and the reason is logged', async () => {
