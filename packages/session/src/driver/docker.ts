@@ -55,8 +55,7 @@ class CleanupError extends Error {
 
 const nativeCli: Cli = {
   start(args) {
-    // Own process group: a Ctrl-C or service-manager signal to the host's group would end a create
-    // the daemon still finishes, leaving the driver no answer about that container.
+    // A signal to the host's process group must not end a create the daemon would still finish.
     const child = spawn('docker', [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
