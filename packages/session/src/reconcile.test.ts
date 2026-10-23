@@ -86,7 +86,7 @@ test('rows this host supervises are left to the driver unless they are stale', (
 })
 
 test('an owned running container is stale once its last sign of life is older than the limit', () => {
-  const stale = { kind: 'reap', row: 'ctr-a', reason: 'stale' }
+  const stale = { kind: 'reap', row: 'ctr-a', reason: 'stale' } as const
   expect(plan([row({ owned: true, lastSeenAt: now - staleAfterMs })], [listed()])).toEqual([])
   expect(plan([row({ owned: true, lastSeenAt: now - staleAfterMs - 1 })], [listed()])).toEqual([
     stale,
