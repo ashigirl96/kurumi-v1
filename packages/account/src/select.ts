@@ -1,9 +1,25 @@
-import type { CredentialSlot, SelectorShape, ServiceId, VendorId } from './catalog.ts'
+import {
+  catalog,
+  type CredentialSlot,
+  type SelectorShape,
+  type ServiceId,
+  type VendorId,
+} from './catalog.ts'
 
 export type AccountHandle = `${VendorId}/${string}` & { readonly __brand: 'AccountHandle' }
 
 export function accountHandle(vendor: VendorId, label: string): AccountHandle {
   return `${vendor}/${label}` as AccountHandle
+}
+
+const isVendorId = (value: string): value is VendorId => Object.hasOwn(catalog, value)
+
+export function parseAccountHandle(handle: string): { vendor: VendorId; label: string } | null {
+  const slash = handle.indexOf('/')
+  if (slash === -1) return null
+  const vendor = handle.slice(0, slash)
+  const label = handle.slice(slash + 1)
+  return isVendorId(vendor) && label !== '' ? { vendor, label } : null
 }
 
 export type GrantedCandidate = {

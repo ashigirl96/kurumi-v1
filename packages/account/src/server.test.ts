@@ -3,19 +3,23 @@ import { randomBytes } from 'node:crypto'
 
 import { sql } from 'drizzle-orm'
 
-import { accountGrant, defaultAccount } from './schema.ts'
+import { account, accountGrant, defaultAccount } from './schema.ts'
 import {
   accountHandle,
   createAccountLedger,
   selectAccount,
   type AccountLedger,
+  type AddKeyInput,
   type Selector,
   type ServiceId,
 } from './server.ts'
 import { inMemoryDb, insertAccount, insertAgentGroup } from './testing.ts'
+import { open } from './vault.ts'
 
 const handleA = accountHandle('google', 'a@work.example')
 const handleB = accountHandle('google', 'b@work.example')
+
+const vaultKey = randomBytes(32)
 
 let db: ReturnType<typeof inMemoryDb>
 let ledger: AccountLedger
@@ -45,7 +49,7 @@ const defaultRows = () => db.select().from(defaultAccount).all()
 
 beforeEach(() => {
   db = inMemoryDb()
-  ledger = createAccountLedger({ db, vaultKey: randomBytes(32) })
+  ledger = createAccountLedger({ db, vaultKey })
   for (const group of ['g1', 'g2', 'g3']) insertAgentGroup(db, group)
   insertAccount(db, {
     id: 'acc-a',
@@ -64,7 +68,7 @@ beforeEach(() => {
 })
 
 function seedGroups() {
-  for (const account of ['acc-a', 'acc-b', 'acc-c']) grant('g1', account, 'gmail')
+  for (const accountId of ['acc-a', 'acc-b', 'acc-c']) grant('g1', accountId, 'gmail')
   setDefault('g1', 'acc-a', 'gmail')
   grant('g2', 'acc-b', 'gmail')
   grant('g2', 'acc-a', 'google-calendar')
@@ -199,7 +203,207 @@ describe('granting', () => {
   })
 })
 
+const secret = 'sk-ant-oat01-secret'
+
+const addKey = (input: Partial<AddKeyInput> = {}) =>
+  db.transaction((tx) =>
+    ledger.addKey(tx, {
+      vendor: 'anthropic',
+      label: 'main',
+      value: secret,
+      autoGrant: false,
+      addedBy: 'host',
+      ...input,
+    }),
+  )
+
+const accountRow = (label: string) =>
+  db
+    .select()
+    .from(account)
+    .all()
+    .find((row) => row.label === label)
+
+describe('key accounts', () => {
+  test('add-key stores the key sealed under the account id', () => {
+    expect(addKey()).toEqual({ ok: true, handle: accountHandle('anthropic', 'main') })
+
+    const row = accountRow('main')
+    expect(row).toMatchObject({
+      vendor: 'anthropic',
+      kind: 'key',
+      subject: null,
+      authMode: 'api-key',
+      services: ['anthropic-api'],
+      status: 'active',
+      autoGrant: false,
+    })
+    expect(row?.id).toMatch(/^acc-/)
+    expect(row?.material.includes(Buffer.from(secret))).toBe(false)
+    expect(JSON.parse(open(vaultKey, row?.id ?? '', row?.material ?? Buffer.alloc(0)))).toEqual({
+      kind: 'key',
+      key: secret,
+    })
+  })
+
+  test('the auth mode named is stored, and a vendor without modes stores none', () => {
+    addKey({ authMode: 'oauth-token' })
+    addKey({ vendor: 'github', label: 'gh' })
+
+    expect(accountRow('main')?.authMode).toBe('oauth-token')
+    expect(accountRow('gh')?.authMode).toBeNull()
+  })
+
+  test('an auth mode the vendor lacks is refused and adds no row', () => {
+    expect(addKey({ vendor: 'github', label: 'gh', authMode: 'api-key' })).toEqual({
+      ok: false,
+      refusal: 'auth_mode_not_supported',
+    })
+    expect(accountRow('gh')).toBeUndefined()
+  })
+
+  test('a duplicate label is refused and the first key stays the only row', () => {
+    addKey()
+    const first = accountRow('main')
+    expect(first).toBeDefined()
+
+    expect(addKey({ value: 'sk-ant-other', authMode: 'oauth-token' })).toEqual({
+      ok: false,
+      refusal: 'label_taken',
+    })
+    expect(
+      db
+        .select()
+        .from(account)
+        .all()
+        .filter((row) => row.vendor === 'anthropic'),
+    ).toEqual(first ? [first] : [])
+  })
+
+  test('the same label under another vendor is a different account', () => {
+    addKey()
+
+    expect(addKey({ vendor: 'github' })).toMatchObject({ ok: true, handle: 'github/main' })
+  })
+
+  test('an auto-grant key is granted to every existing group for every service it covers', () => {
+    addKey({ autoGrant: true, addedBy: 'human:u1' })
+
+    const { id } = accountRow('main') ?? {}
+    expect(
+      grantRows()
+        .filter((row) => row.accountId === id)
+        .map(({ agentGroupId, service, grantedBy }) => ({ agentGroupId, service, grantedBy }))
+        .toSorted((a, b) => a.agentGroupId.localeCompare(b.agentGroupId)),
+    ).toEqual(
+      ['g1', 'g2', 'g3'].map((agentGroupId) => ({
+        agentGroupId,
+        service: 'anthropic-api',
+        grantedBy: 'human:u1',
+      })),
+    )
+  })
+
+  test('a key without auto-grant is granted to no group', () => {
+    addKey()
+
+    expect(grantRows()).toEqual([])
+  })
+
+  test('grantAutoGrants gives a group every auto-grant account once, however often it runs', () => {
+    addKey({ autoGrant: true })
+    addKey({ vendor: 'github', label: 'gh' })
+    insertAgentGroup(db, 'g4')
+
+    for (let run = 0; run < 2; run++) db.transaction((tx) => ledger.grantAutoGrants(tx, 'g4'))
+
+    expect(
+      grantRows()
+        .filter((row) => row.agentGroupId === 'g4')
+        .map(({ service, grantedBy }) => ({ service, grantedBy })),
+    ).toEqual([{ service: 'anthropic-api', grantedBy: 'auto-grant' }])
+  })
+
+  test('list shows every account by handle, without material, ordered by handle', () => {
+    addKey({ authMode: 'oauth-token', autoGrant: true })
+
+    const views = ledger.list()
+
+    expect(views.map(({ handle }): string => handle)).toEqual([
+      'anthropic/main',
+      'google/a@work.example',
+      'google/b@work.example',
+      'google/c@work.example',
+      'notion/team',
+    ])
+    expect(views[0]).toEqual({
+      handle: accountHandle('anthropic', 'main'),
+      kind: 'key',
+      authMode: 'oauth-token',
+      services: ['anthropic-api'],
+      autoGrant: true,
+    })
+  })
+
+  test('removing an account removes its grants and defaults and leaves the others', () => {
+    seedGroups()
+
+    expect(db.transaction((tx) => ledger.remove(tx, 'google/a@work.example'))).toEqual({
+      ok: true,
+    })
+
+    expect(accountRow('a@work.example')).toBeUndefined()
+    expect(grantRows().filter((row) => row.accountId === 'acc-a')).toEqual([])
+    expect(
+      defaultRows().map(({ agentGroupId, accountId }) => ({ agentGroupId, accountId })),
+    ).toEqual([{ agentGroupId: 'g2', accountId: 'acc-b' }])
+    expect(grantRows()).toHaveLength(3)
+  })
+
+  test.each([
+    ['google/nobody@work.example', 'account_not_found'],
+    ['unknown/main', 'invalid_handle'],
+    ['google', 'invalid_handle'],
+    ['google/', 'invalid_handle'],
+  ] as const)('removing %p is refused as %s', (handle, refusal) => {
+    expect(db.transaction((tx) => ledger.remove(tx, handle))).toEqual({ ok: false, refusal })
+    expect(db.select().from(account).all()).toHaveLength(4)
+  })
+
+  test('a label holding a slash is found by its handle', () => {
+    addKey({ label: 'team/main' })
+
+    expect(db.transaction((tx) => ledger.accountIdOf(tx, 'anthropic/team/main'))).toEqual({
+      ok: true,
+      accountId: accountRow('team/main')?.id ?? '',
+    })
+  })
+
+  test('clearing a default keeps the grant it rested on', () => {
+    seedGroups()
+
+    db.transaction((tx) => ledger.clearDefault(tx, { agentGroupId: 'g1', service: 'gmail' }))
+
+    expect(defaultRows().map(({ agentGroupId }) => agentGroupId)).toEqual(['g2'])
+    expect(ledger.candidates('g1', 'gmail')).toHaveLength(3)
+  })
+})
+
 describe('what the database refuses without the ledger', () => {
+  test.each([null, 'password'])(
+    'an anthropic account with auth mode %p fails the CHECK',
+    (mode) => {
+      expect(() =>
+        db.$client
+          .query(
+            `INSERT INTO account (id, vendor, label, kind, auth_mode, services, material, status, created_at)
+           VALUES ('acc-x', 'anthropic', 'x', 'key', ?, '["anthropic-api"]', x'', 'active', 0)`,
+          )
+          .run(mode),
+      ).toThrow(/CHECK constraint failed: account_auth_mode_of_vendor/)
+    },
+  )
+
   test('a service of another vendor fails the CHECK', () => {
     expect(() => insertGrant('google', 'acc-a', 'notion')).toThrow(
       /CHECK constraint failed: account_grant_service_of_vendor/,
