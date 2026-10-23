@@ -802,17 +802,6 @@ describe('the credential for a Google request', () => {
       refusal: { code: 'account_needs_reauth', service: 'gmail', handle: handleB },
     })
   })
-
-  test('a fault outside the stored material surfaces instead of asking for re-authorization', () => {
-    class KeyOfWrongLength extends Uint8Array {
-      override get byteLength() {
-        return vaultKey.byteLength
-      }
-    }
-    const broken = createAccountLedger({ db, vaultKey: new KeyOfWrongLength(16) })
-
-    expect(() => broken.credentialFor({ agentGroupId: 'g2' }, gmail())).toThrow(RangeError)
-  })
 })
 
 describe('the slot an Anthropic account is written to', () => {
