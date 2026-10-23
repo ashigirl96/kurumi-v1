@@ -314,7 +314,7 @@ test('state and heartbeat remain session scoped and reject revoked incarnations'
   expect(() => ledger.channel.heartbeat(who, { currentTool: null, toolTimeoutMs: null })).toThrow()
 })
 
-test('cancelled pulls release promptly and stop drains parked requests before database closure', async () => {
+test('cancelled pulls release promptly and stop ends parked pulls with a retryable refusal while the incarnation stays', async () => {
   const first = await ledger.routeInbound(event('work'))
   const who = principal()
   await ledger.channel.pull(who, { waitMs: 0 })
@@ -325,11 +325,14 @@ test('cancelled pulls release promptly and stop drains parked requests before da
   controller.abort()
   await cancelledCheck
   const parked = ledger.channel.pull(who, { waitMs: 25000 })
-  const parkedCheck = rejects(parked, { code: 'UNAUTHORIZED' })
+  const parkedCheck = rejects(parked, { code: 'SERVICE_UNAVAILABLE' })
   await ledger.stop()
   await parkedCheck
-  expect(db.select().from(container).all()).toEqual([])
-  expect(ledger.authenticate(driver.runs[0]?.env.KURUMI_TOKEN ?? '')).toBeNull()
+  await rejects(ledger.channel.pull(who, { waitMs: 0 }), { code: 'SERVICE_UNAVAILABLE' })
+  expect(db.select().from(container).all()).toMatchObject([
+    { id: who.containerId, status: 'running' },
+  ])
+  expect(driver.runs).toHaveLength(1)
   await ledger.stop()
 })
 
@@ -400,7 +403,7 @@ test('Docker exit revokes channel authority before removal completes', async () 
   expect(db.select().from(container).all()).toEqual([])
 })
 
-test('concurrent host shutdown retains the stopping row when Docker cannot confirm removal', async () => {
+test('host shutdown keeps a running container and its row even when Docker cannot answer', async () => {
   await ledger.stop()
   const cli = new FakeCli()
   cli.responses.push(
@@ -415,37 +418,33 @@ test('concurrent host shutdown retains the stopping row when Docker cannot confi
     runtime: { ...configured, driver: docker },
   })
   await active.routeInbound(event('work'))
-  const row = db.select().from(container).get()
-  expect(row?.status).toBe('running')
-  const stopping = Promise.allSettled([active.stop(), docker.stop()])
+  expect(db.select().from(container).get()?.status).toBe('running')
+  const stopping = Promise.allSettled([active.stop(), docker.detach()])
   for (const entry of cli.started) if (entry.args[0] === 'wait') entry.proc.complete({ code: null })
   const outcomes = await stopping
-  expect(
-    db
-      .select()
-      .from(container)
-      .all()
-      .map((entry) => entry.status),
-  ).toEqual(['stopping'])
-  expect(outcomes.map((outcome) => outcome.status)).toEqual(['rejected', 'rejected'])
+  expect(outcomes.map((outcome) => outcome.status)).toEqual(['fulfilled', 'fulfilled'])
+  expect(cli.joined().filter((call) => /^(rm|stop) /.test(call))).toEqual([])
+  expect(db.select().from(container).get()?.status).toBe('running')
 })
 
-test('late startup success cannot restore a revoked token and stop joins its completion', async () => {
+test('stop waits for a startup in flight and keeps the incarnation it started', async () => {
   const startup = Promise.withResolvers<void>()
   driver.beforeRun = () => startup.promise
   const inbound = ledger.routeInbound(event('queued'))
-  const who = principal()
-  const kill = driver.kill.bind(driver)
-  driver.kill = async (id, grace) => {
-    startup.resolve()
-    await kill(id, grace)
-  }
   const stopping = ledger.stop()
-  expect(ledger.authenticate(driver.runs[0]?.env.KURUMI_TOKEN ?? '')).toBeNull()
+  let stopped = false
+  stopping.then(
+    () => {
+      stopped = true
+    },
+    () => {},
+  )
+  await Bun.sleep(20)
+  expect(stopped).toBe(false)
+  startup.resolve()
   await stopping
   expect((await inbound).seq).toBe(1)
-  expect(db.select().from(container).all()).toEqual([])
-  await rejects(ledger.channel.pull(who, { waitMs: 0 }), { code: 'UNAUTHORIZED' })
+  expect(db.select().from(container).all()).toMatchObject([{ status: 'running' }])
 })
 
 test('post rejects content conflicts and completion of a batch is atomic', async () => {
@@ -482,6 +481,7 @@ function fakeDaemon() {
   const containers = new Map<string, DaemonContainer>()
   const streams = new Set<(line: string) => void>()
   const held = new Map<string, (() => void)[]>()
+  const failing = new Set<string>()
   let late: number | null | undefined
   const emit = (action: string, name: string) => {
     for (const stream of streams) stream(`${action} ${name}`)
@@ -584,8 +584,11 @@ function fakeDaemon() {
   const daemon: Cli = {
     start(args, options) {
       const proc = cli.start(args)
-      const queue = held.get(args[0] ?? '')
-      if (queue) queue.push(() => act(args, proc, options?.onLine))
+      const [command = ''] = args
+      const queue = held.get(command)
+      if (failing.has(command))
+        proc.complete({ code: 1, stderr: 'Cannot connect to the Docker daemon' })
+      else if (queue) queue.push(() => act(args, proc, options?.onLine))
       else act(args, proc, options?.onLine)
       return {
         result: proc.result,
@@ -613,6 +616,12 @@ function fakeDaemon() {
     },
     lateCreate(code: number | null) {
       late = code
+    },
+    fail(command: string) {
+      failing.add(command)
+    },
+    recover(command: string) {
+      failing.delete(command)
     },
     commands: (command: string) => cli.started.filter(({ args }) => args[0] === command),
   }
@@ -844,4 +853,264 @@ test('a subscription that reaches the end of its window continues at once from w
     await dockerDriver.stop()
   }
   expect(changes).toEqual([{ kind: 'subscribed', attempt: 0 }])
+})
+
+function supervisedHost(
+  docker: ReturnType<typeof fakeDaemon>,
+  limits: { staleAfterMs?: number; intervalMs?: number } = {},
+) {
+  const dockerDriver = createDockerDriver({
+    install: 'restart',
+    image: 'agent-test',
+    cli: docker.daemon,
+  })
+  const sessions = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: {
+      ...configured,
+      driver: dockerDriver,
+      supervision: { inventory: dockerDriver, staleAfterMs: 60_000, intervalMs: 60_000, ...limits },
+    },
+    runtimeLog: (entry) => logs.push(entry),
+  })
+  ledger = sessions
+  return {
+    dockerDriver,
+    sessions,
+    stop: () => Promise.all([sessions.stop(), dockerDriver.detach()]),
+  }
+}
+
+function tokens(docker: ReturnType<typeof fakeDaemon>): string[] {
+  return docker.commands('create').map(
+    ({ args }) =>
+      flagValues(args, '--env')
+        .find((entry) => entry.startsWith('KURUMI_TOKEN='))
+        ?.slice('KURUMI_TOKEN='.length) ?? '',
+  )
+}
+
+async function servedOnce(host: ReturnType<typeof supervisedHost>, token: string) {
+  const who = host.sessions.authenticate(token)
+  if (!who) throw new Error('the container token was refused')
+  const { messages } = await host.sessions.channel.pull(who, { waitMs: 0 })
+  const ids = messages.map((message) => message.id)
+  if (ids.length) await host.sessions.channel.complete(who, { ids })
+  return { who, messages }
+}
+
+function decisions(since: number) {
+  return logs
+    .slice(since)
+    .flatMap((entry) =>
+      entry.kind === 'session.container.adopted' ||
+      entry.kind === 'session.container.reaped' ||
+      entry.kind === 'session.container.stopped' ||
+      entry.kind === 'session.adoption.done' ||
+      entry.kind === 'session.events.lost' ||
+      entry.kind === 'session.events.subscribed'
+        ? [entry]
+        : [],
+    )
+}
+
+test('a restarted host adopts its running container from the labels, keeps the token and creates nothing', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const first = supervisedHost(docker)
+  await first.sessions.start()
+  await first.sessions.routeInbound(event('before restart'))
+  const [token = ''] = tokens(docker)
+  const { who: before } = await servedOnce(first, token)
+  await first.stop()
+  const restartedAt = logs.length
+  const restarted = supervisedHost(docker)
+  try {
+    await restarted.sessions.start()
+    const next = await restarted.sessions.routeInbound(event('after restart'))
+    const { who: after, messages } = await servedOnce(restarted, token)
+    expect(after.containerId).toBe(before.containerId)
+    expect(messages.map((message) => message.id)).toEqual([next.inboundId])
+    expect(docker.commands('create')).toHaveLength(1)
+    const name = restarted.dockerDriver.nameOf(before.containerId)
+    expect(docker.commands('wait').map(({ args, proc }) => [args[1], proc.killed])).toEqual([
+      [name, true],
+      [name, false],
+    ])
+    expect(decisions(restartedAt)).toMatchObject([
+      {
+        kind: 'session.container.adopted',
+        sessionId: before.sessionId,
+        containerId: before.containerId,
+        name,
+        reason: 'running container matches its row',
+      },
+      { kind: 'session.adoption.done', listed: true, adopted: 1, reaped: 0, stopped: 0 },
+      { kind: 'session.events.subscribed', attempt: 0 },
+    ])
+  } finally {
+    await restarted.stop()
+  }
+})
+
+test('a restarted host reaps the row of a container removed while it was down and answers from a new one', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const first = supervisedHost(docker)
+  await first.sessions.start()
+  await first.sessions.routeInbound(event('before restart'))
+  const [token = ''] = tokens(docker)
+  const { who } = await servedOnce(first, token)
+  await first.stop()
+  docker.remove(first.dockerDriver.nameOf(who.containerId))
+  const restartedAt = logs.length
+  const restarted = supervisedHost(docker)
+  try {
+    await restarted.sessions.start()
+    expect(restarted.sessions.authenticate(token)).toBeNull()
+    expect(decisions(restartedAt)).toMatchObject([
+      {
+        kind: 'session.container.reaped',
+        containerId: who.containerId,
+        reason: 'container missing',
+      },
+      { kind: 'session.adoption.done', listed: true, adopted: 0, reaped: 1, stopped: 0 },
+      { kind: 'session.events.subscribed', attempt: 0 },
+    ])
+    const next = await restarted.sessions.routeInbound(event('after restart'))
+    await until(() => docker.commands('create').length === 2)
+    const fresh = tokens(docker)[1] ?? ''
+    await until(() => restarted.sessions.authenticate(fresh) !== null)
+    expect((await servedOnce(restarted, fresh)).messages.map((message) => message.id)).toEqual([
+      next.inboundId,
+    ])
+  } finally {
+    await restarted.stop()
+  }
+})
+
+test('a restarted host stops containers without a live row and never touches another install', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  docker.add('kurumi-agent-ghost', {
+    'kurumi.install': 'restart',
+    'kurumi.role': 'agent',
+    'kurumi.session': 'ses-ghost',
+    'kurumi.container': 'ctr-ghost',
+  })
+  docker.add(
+    'kurumi-probe-left',
+    { 'kurumi.install': 'restart', 'kurumi.role': 'probe' },
+    'created',
+  )
+  docker.add('hand-made', { 'kurumi.install': 'restart' })
+  docker.add('kurumi-agent-other', {
+    'kurumi.install': 'other',
+    'kurumi.role': 'agent',
+    'kurumi.session': 'ses-ghost',
+    'kurumi.container': 'ctr-ghost',
+  })
+  const host = supervisedHost(docker)
+  try {
+    await host.sessions.start()
+    await until(() => docker.containers.size === 1)
+    expect([...docker.containers.keys()]).toEqual(['kurumi-agent-other'])
+    expect(decisions(0)).toMatchObject([
+      { kind: 'session.container.stopped', name: 'kurumi-agent-ghost', reason: 'no live row' },
+      { kind: 'session.container.stopped', name: 'kurumi-probe-left', reason: 'leftover probe' },
+      { kind: 'session.container.stopped', name: 'hand-made', reason: 'unknown role' },
+      { kind: 'session.adoption.done', listed: true, adopted: 0, reaped: 0, stopped: 3 },
+      { kind: 'session.events.subscribed', attempt: 0 },
+    ])
+    expect(docker.cli.joined().join('\n')).not.toMatch(/kurumi-agent-other|kurumi\.install=other/)
+  } finally {
+    await host.stop()
+  }
+})
+
+test('a container silent past the stale limit is reaped and the next line starts a new one', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const host = supervisedHost(docker, { staleAfterMs: 30_000, intervalMs: 10 })
+  let now = Date.now()
+  const advance = (ms: number) => {
+    now += ms
+    setSystemTime(new Date(now))
+  }
+  try {
+    await host.sessions.start()
+    await host.sessions.routeInbound(event('work'))
+    const [token = ''] = tokens(docker)
+    await servedOnce(host, token)
+    advance(20_000)
+    await servedOnce(host, token)
+    advance(25_000)
+    await Bun.sleep(50)
+    expect(host.sessions.authenticate(token)).not.toBeNull()
+    advance(6_000)
+    await until(() => host.sessions.authenticate(token) === null)
+    expect(decisions(0)).toContainEqual(
+      expect.objectContaining({ kind: 'session.container.reaped', reason: 'stale' }),
+    )
+    await host.sessions.routeInbound(event('after stale'))
+    await until(() => docker.commands('create').length === 2)
+  } finally {
+    setSystemTime()
+    await host.stop()
+  }
+})
+
+test('a lost events subscription resubscribes and its gap pass stops a container that appeared meanwhile', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const host = supervisedHost(docker)
+  try {
+    await host.sessions.start()
+    docker.commands('events')[0]?.proc.complete({ code: 143 })
+    await Bun.sleep(0)
+    docker.add('kurumi-agent-late', {
+      'kurumi.install': 'restart',
+      'kurumi.role': 'agent',
+      'kurumi.session': 'ses-late',
+      'kurumi.container': 'ctr-late',
+    })
+    await until(() => docker.containers.size === 0)
+    expect(decisions(0).slice(2)).toMatchObject([
+      { kind: 'session.events.lost', code: 143, retryMs: 1000 },
+      { kind: 'session.events.subscribed', attempt: 1 },
+      { kind: 'session.container.stopped', name: 'kurumi-agent-late', reason: 'no live row' },
+    ])
+  } finally {
+    await host.stop()
+  }
+})
+
+test('a row from an earlier host cannot authenticate until a listing adopts its container', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const first = supervisedHost(docker)
+  await first.sessions.start()
+  await first.sessions.routeInbound(event('before restart'))
+  const [token = ''] = tokens(docker)
+  await servedOnce(first, token)
+  await first.stop()
+  docker.fail('ps')
+  const restartedAt = logs.length
+  const restarted = supervisedHost(docker, { intervalMs: 10 })
+  try {
+    await restarted.sessions.start()
+    expect(decisions(restartedAt)[0]).toMatchObject({
+      kind: 'session.adoption.done',
+      listed: false,
+      adopted: 0,
+    })
+    expect(restarted.sessions.authenticate(token)).toBeNull()
+    docker.recover('ps')
+    await until(() => restarted.sessions.authenticate(token) !== null)
+    expect(docker.commands('create')).toHaveLength(1)
+  } finally {
+    await restarted.stop()
+  }
 })

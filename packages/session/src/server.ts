@@ -25,11 +25,18 @@ import {
   type StateKeyInput,
   type StatePutInput,
 } from './contract.ts'
-import type { ContainerDriver, ContainerSpec } from './driver/docker.ts'
+import type {
+  ContainerDriver,
+  ContainerInventory,
+  ContainerSpec,
+  InventoryChange,
+  ListedContainer,
+} from './driver/docker.ts'
+import { planReconciliation, type ContainerRow, type Reconciliation } from './reconcile.ts'
 import { container, inboundMessage, outboundMessage, session, sessionState } from './schema.ts'
 
 export { createDockerDriver } from './driver/docker.ts'
-export type { ContainerDriver, ContainerSpec } from './driver/docker.ts'
+export type { ContainerDriver, ContainerInventory, ContainerSpec } from './driver/docker.ts'
 export { migrations } from '../migrations/index.ts'
 export type { AgentPrincipal, SessionId } from './contract.ts'
 
@@ -53,6 +60,7 @@ export type SessionRuntime = {
     admission(): Admission
     contribution(input: { agentGroupId: string; sessionToken: string }): ContainerEgress
   }
+  supervision?: { inventory: ContainerInventory; staleAfterMs: number; intervalMs: number }
 }
 export type InboundLog = {
   kind: 'session.inbound.received' | 'session.inbound.committed'
@@ -75,6 +83,25 @@ export type RuntimeLog =
       monotonicMs: number
     }
   | { kind: 'session.cleanup.failed'; sessionId: string; containerId: string; monotonicMs: number }
+  | {
+      kind: 'session.container.adopted' | 'session.container.reaped' | 'session.container.stopped'
+      sessionId: string | null
+      containerId: string | null
+      name: string | null
+      reason: string
+      monotonicMs: number
+    }
+  | {
+      kind: 'session.adoption.done'
+      listed: boolean
+      adopted: number
+      reaped: number
+      stopped: number
+      monotonicMs: number
+    }
+  | { kind: 'session.reconcile.failed'; reason: string; monotonicMs: number }
+  | { kind: 'session.events.subscribed'; attempt: number; monotonicMs: number }
+  | { kind: 'session.events.lost'; code: number | null; retryMs: number; monotonicMs: number }
 type OutboundInput = { id: string; sessionId: string; text: string; inReplyTo?: string }
 export type SessionLedger = {
   start(): Promise<void>
@@ -126,7 +153,13 @@ export function createSessionLedger({
   const pulls = new Set<Promise<{ messages: Inbound[] }>>()
   const waiters = new Map<string, Set<() => void>>()
   const retries = new Map<string, { attempt: number; due: number }>()
+  const owned = new Set<string>()
+  const supervision = runtime?.supervision
   let timer: ReturnType<typeof setInterval> | undefined
+  let sweeper: ReturnType<typeof setInterval> | undefined
+  let unwatch: (() => void) | undefined
+  let passing: Promise<unknown> | undefined
+  let passAgain = false
   let enabled = false
   let stopped = false
   let stopping: Promise<void> | undefined
@@ -135,7 +168,8 @@ export function createSessionLedger({
     for (const notify of waiters.get(id) ?? []) notify()
   }
 
-  function authorize(tx: Tx, principal: AgentPrincipal) {
+  function authorize(tx: Tx, principal: AgentPrincipal, { arrival = true } = {}) {
+    if (stopped) throw new ORPCError('SERVICE_UNAVAILABLE', { message: 'host is stopping' })
     const row = tx
       .select({ id: container.id })
       .from(container)
@@ -150,11 +184,17 @@ export function createSessionLedger({
         ),
       )
       .get()
-    if (stopped || !row)
+    if (!row)
       throw new ORPCError('UNAUTHORIZED', { message: 'container incarnation is no longer active' })
+    if (arrival)
+      tx.update(container)
+        .set({ lastSeenAt: new Date() })
+        .where(eq(container.id, principal.containerId))
+        .run()
   }
 
   function retire(id: string) {
+    owned.delete(id)
     const retired = transaction(db, (tx) => {
       const row = tx.select().from(container).where(eq(container.id, id)).get()
       if (!row || row.status === 'stopping') return null
@@ -185,6 +225,7 @@ export function createSessionLedger({
       })
       wake(retired.sessionId)
     }
+    return retired
   }
 
   function cleanup(id: string): Promise<void> {
@@ -203,10 +244,23 @@ export function createSessionLedger({
     return task
   }
 
-  const unsubscribe = runtime?.driver.onExit((id) => {
-    if (stopped) return
-    retire(id)
+  function reap(id: string, reason: string, name: string | null) {
+    const retired = retire(id)
+    if (retired)
+      runtimeLog?.({
+        kind: 'session.container.reaped',
+        sessionId: retired.sessionId,
+        containerId: id,
+        name,
+        reason,
+        monotonicMs: performance.now(),
+      })
     void cleanup(id).catch(() => {})
+  }
+
+  const unsubscribe = runtime?.driver.onExit((id, code) => {
+    if (stopped) return
+    reap(id, `exited with code ${code}`, supervision?.inventory.nameOf(id) ?? null)
   })
 
   async function reconcileSession(id: string) {
@@ -259,6 +313,7 @@ export function createSessionLedger({
         })
         .run()
     })
+    owned.add(containerId)
     try {
       const egress = runtime.egress.contribution({ agentGroupId: agent.id, sessionToken: token })
       const result = await runtime.driver.run({
@@ -273,7 +328,7 @@ export function createSessionLedger({
         network: egress.network,
         limits: { cpus: 1, memoryMb: 1024, pids: 256 },
       })
-      if (result.ok && !stopped) {
+      if (result.ok) {
         transaction(db, (tx) => {
           tx.update(container)
             .set({ status: 'running' })
@@ -307,6 +362,155 @@ export function createSessionLedger({
     }
   }
 
+  function containerRows(): ContainerRow[] {
+    return db
+      .select({
+        id: container.id,
+        sessionId: container.sessionId,
+        status: container.status,
+        sessionStatus: session.status,
+        startedAt: container.startedAt,
+        lastSeenAt: container.lastSeenAt,
+        toolDeadlineAt: container.toolDeadlineAt,
+      })
+      .from(container)
+      .innerJoin(session, eq(session.id, container.sessionId))
+      .all()
+      .map((row) => ({
+        id: row.id,
+        sessionId: row.sessionId,
+        status: row.status,
+        sessionActive: row.sessionStatus === 'active',
+        owned: owned.has(row.id),
+        startedAt: row.startedAt.getTime(),
+        lastSeenAt: row.lastSeenAt?.getTime() ?? null,
+        toolDeadlineAt: row.toolDeadlineAt?.getTime() ?? null,
+      }))
+  }
+
+  function apply(inventory: ContainerInventory, decision: Reconciliation): Reconciliation['kind'] {
+    const logged = (
+      kind: 'session.container.adopted' | 'session.container.stopped',
+      found: ListedContainer,
+    ) =>
+      runtimeLog?.({
+        kind,
+        sessionId: found.sessionId || null,
+        containerId: found.containerId || null,
+        name: found.name,
+        reason: decision.reason,
+        monotonicMs: performance.now(),
+      })
+    switch (decision.kind) {
+      case 'adopt': {
+        const { row, container: found } = decision
+        const adopted = inventory.adopt(found)
+        if (!adopted.ok) {
+          reap(row.id, `adoption failed: ${adopted.reason}`, found.name)
+          return 'reap'
+        }
+        owned.add(row.id)
+        transaction(db, (tx) => {
+          tx.update(container)
+            .set({ status: 'running', lastSeenAt: new Date() })
+            .where(
+              and(eq(container.id, row.id), inArray(container.status, ['starting', 'running'])),
+            )
+            .run()
+        })
+        logged('session.container.adopted', found)
+        return 'adopt'
+      }
+      case 'reap':
+        reap(
+          decision.row.id,
+          decision.reason,
+          decision.container?.name ?? inventory.nameOf(decision.row.id),
+        )
+        return 'reap'
+      case 'stop':
+        logged('session.container.stopped', decision.container)
+        inventory.remove(decision.container.name).catch((cause: unknown) => {
+          runtimeLog?.({
+            kind: 'session.reconcile.failed',
+            reason: `remove ${decision.container.name}: ${String(cause)}`,
+            monotonicMs: performance.now(),
+          })
+        })
+        return 'stop'
+      default: {
+        const unknown: never = decision
+        return unknown
+      }
+    }
+  }
+
+  async function supervise(inventory: ContainerInventory, staleAfterMs: number) {
+    let containers: ListedContainer[] | null = null
+    try {
+      containers = await inventory.sweep()
+    } catch (cause) {
+      runtimeLog?.({
+        kind: 'session.reconcile.failed',
+        reason: String(cause),
+        monotonicMs: performance.now(),
+      })
+    }
+    const counts = { adopt: 0, reap: 0, stop: 0 }
+    if (stopped) return { listed: containers !== null, ...counts }
+    for (const decision of planReconciliation({
+      rows: containerRows(),
+      containers,
+      now: Date.now(),
+      staleAfterMs,
+    }))
+      counts[apply(inventory, decision)]++
+    return { listed: containers !== null, ...counts }
+  }
+
+  function observe(change: InventoryChange) {
+    if (stopped) return
+    const monotonicMs = performance.now()
+    switch (change.kind) {
+      case 'event':
+        requestPass()
+        return
+      case 'lost':
+        runtimeLog?.({
+          kind: 'session.events.lost',
+          code: change.code,
+          retryMs: change.retryMs,
+          monotonicMs,
+        })
+        return
+      case 'subscribed':
+        runtimeLog?.({ kind: 'session.events.subscribed', attempt: change.attempt, monotonicMs })
+        if (change.attempt > 0) requestPass()
+        return
+      default: {
+        const unknown: never = change
+        return unknown
+      }
+    }
+  }
+
+  function requestPass() {
+    if (!supervision || stopped) return
+    if (passing) {
+      passAgain = true
+      return
+    }
+    passing = supervise(supervision.inventory, supervision.staleAfterMs)
+      .catch(() => {})
+      .finally(() => {
+        passing = undefined
+        if (passAgain) {
+          passAgain = false
+          requestPass()
+        }
+      })
+  }
+
   async function pull(
     principal: AgentPrincipal,
     input: PullInput,
@@ -314,7 +518,7 @@ export function createSessionLedger({
   ): Promise<{ messages: Inbound[] }> {
     const { waitMs } = parse(pullInput, input)
     const deadline = performance.now() + waitMs
-    while (true) {
+    for (let arrival = true; ; arrival = false) {
       const notification = Promise.withResolvers<void>()
       const notify = () => notification.resolve()
       const listeners = waiters.get(principal.sessionId) ?? new Set<() => void>()
@@ -324,7 +528,7 @@ export function createSessionLedger({
       let timeout: ReturnType<typeof setTimeout> | undefined
       try {
         const messages = transaction(db, (tx) => {
-          authorize(tx, principal)
+          authorize(tx, principal, { arrival })
           signal?.throwIfAborted()
           const row = tx
             .select()
@@ -474,6 +678,26 @@ export function createSessionLedger({
       if (stopped) throw new Error('session ledger stopped')
       if (enabled) return
       enabled = true
+      if (supervision) {
+        const { inventory, staleAfterMs, intervalMs } = supervision
+        const startup = supervise(inventory, staleAfterMs)
+        passing = startup
+        const counts = await startup.finally(() => {
+          passing = undefined
+        })
+        runtimeLog?.({
+          kind: 'session.adoption.done',
+          listed: counts.listed,
+          adopted: counts.adopt,
+          reaped: counts.reap,
+          stopped: counts.stop,
+          monotonicMs: performance.now(),
+        })
+        if (stopped) return
+        unwatch = inventory.watch(observe)
+        sweeper = setInterval(requestPass, intervalMs)
+        sweeper.unref()
+      }
       timer = setInterval(tick, 100)
       timer.unref()
       tick()
@@ -481,33 +705,18 @@ export function createSessionLedger({
     stop() {
       if (stopping) return stopping
       stopped = true
-      if (timer !== undefined) clearInterval(timer)
+      clearInterval(timer)
+      clearInterval(sweeper)
+      unwatch?.()
       unsubscribe?.()
       for (const id of waiters.keys()) wake(id)
-      for (const row of db.select().from(container).all()) retire(row.id)
-      stopping = (async () => {
-        await Promise.allSettled(
-          db
-            .select()
-            .from(container)
-            .all()
-            .map((row) => cleanup(row.id)),
-        )
-        await Promise.allSettled([...spawning.values(), ...deliveries.values(), ...pulls])
-        const remaining = await Promise.allSettled(
-          db
-            .select()
-            .from(container)
-            .all()
-            .map((row) => cleanup(row.id)),
-        )
-        const failures = remaining.filter((result) => result.status === 'rejected')
-        if (failures.length)
-          throw new AggregateError(
-            failures.map((result) => result.reason),
-            'session cleanup failed',
-          )
-      })()
+      stopping = Promise.allSettled([
+        passing,
+        ...spawning.values(),
+        ...cleanups.values(),
+        ...deliveries.values(),
+        ...pulls,
+      ]).then(() => {})
       return stopping
     },
     async routeInbound(event) {
@@ -585,7 +794,6 @@ export function createSessionLedger({
       return accepted.receipt
     },
     authenticate(token) {
-      if (stopped) return null
       const row = db
         .select({
           containerId: container.id,
@@ -602,7 +810,7 @@ export function createSessionLedger({
           ),
         )
         .get()
-      return row
+      return row && owned.has(row.containerId)
         ? { ...row, sessionId: sessionId.parse(row.sessionId), __brand: 'AgentPrincipal' }
         : null
     },
@@ -662,7 +870,6 @@ export function createSessionLedger({
           const now = new Date()
           tx.update(container)
             .set({
-              lastSeenAt: now,
               currentTool: heartbeat.currentTool,
               toolDeadlineAt:
                 heartbeat.toolTimeoutMs === null

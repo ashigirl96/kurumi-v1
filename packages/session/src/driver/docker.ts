@@ -898,7 +898,9 @@ export function createDockerDriver(options: {
               create.endedAt <= listedAt
             )
               create.state = 'settled'
-          return listed.filter((container) => container.name !== owned?.name)
+          return listed.filter(
+            ({ name }) => name !== owned?.name && residue.get(name)?.removal === undefined,
+          )
         })(),
       )
     },
