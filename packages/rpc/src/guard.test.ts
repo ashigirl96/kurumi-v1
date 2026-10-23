@@ -224,7 +224,7 @@ test('TypeScript rejects Promise returns through inline, imported, block, functi
     expect({ code: await result.exited, output, errors }).toMatchObject({ code: 1 })
     expect(errors).toBe('')
     const diagnostics = [...output.matchAll(/([^/\n]+\.ts)\(\d+,\d+\): error TS(\d+):/g)]
-    expect(diagnostics.map((match) => match[1]).toSorted()).toEqual(
+    expect(diagnostics.map((match) => match[1] ?? '').toSorted()).toEqual(
       Object.keys(rejected).toSorted(),
     )
     expect(diagnostics.every((match) => match[2] === '2345' || match[2] === '2322')).toBe(true)
