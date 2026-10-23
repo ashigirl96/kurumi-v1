@@ -6,6 +6,20 @@ import { authModeIds, keyVendorIds, serviceIds } from './catalog.ts'
 export const ServiceIdSchema = z.enum(serviceIds)
 export const HandleSchema = z.string().min(1).describe('handle')
 
+export const KEY_MAX_LENGTH = 4096
+
+/** A key ends up in an HTTP header or query string, which carry only visible ASCII safely. */
+const KeyValueSchema = z
+  .string()
+  .min(1, 'value is empty')
+  .max(KEY_MAX_LENGTH, `value is longer than ${KEY_MAX_LENGTH} characters`)
+  .refine((value) => !/\s/.test(value), { message: 'value contains whitespace', abort: true })
+  .refine((value) => !/\p{Cc}/u.test(value), {
+    message: 'value contains a control character',
+    abort: true,
+  })
+  .refine((value) => /^[\x21-\x7e]*$/.test(value), 'value contains a non-ASCII character')
+
 const GrantTarget = z.object({ service: ServiceIdSchema, agentGroupId: z.string().min(1) })
 
 export const AddKeyOutputSchema = z.object({ handle: z.string() })
@@ -28,7 +42,7 @@ export const contract = {
           label: z.string().min(1),
           auth: z.enum(authModeIds).optional(),
           autoGrant: z.boolean().default(false),
-          value: z.string().min(1).meta({ stdin: true }),
+          value: KeyValueSchema.meta({ stdin: true }),
         }),
       ]),
     )

@@ -10,6 +10,7 @@ import { guardRouter, type KurumiContext } from '@kurumi/rpc/server'
 import { createRouterClient, ORPCError } from '@orpc/server'
 import { sql } from 'drizzle-orm'
 
+import { KEY_MAX_LENGTH } from './contract.ts'
 import { account, accountGrant, defaultAccount } from './schema.ts'
 import {
   accountHandle,
@@ -220,7 +221,6 @@ const addKey = (input: Partial<AddKeyInput> = {}) =>
       label: 'main',
       value: secret,
       autoGrant: false,
-      addedBy: 'host',
       ...input,
     }),
   )
@@ -295,7 +295,7 @@ describe('key accounts', () => {
   })
 
   test('an auto-grant key is granted to every existing group for every service it covers', () => {
-    addKey({ autoGrant: true, addedBy: 'human:u1' })
+    addKey({ autoGrant: true })
 
     const { id } = accountRow('main') ?? {}
     expect(
@@ -307,7 +307,7 @@ describe('key accounts', () => {
       ['g1', 'g2', 'g3'].map((agentGroupId) => ({
         agentGroupId,
         service: 'anthropic-api',
-        grantedBy: 'human:u1',
+        grantedBy: 'auto-grant',
       })),
     )
   })
@@ -458,7 +458,7 @@ const failure = async (call: Promise<unknown>) => {
 }
 
 describe('the account router', () => {
-  test('add-key returns the handle and records who added it', async () => {
+  test('add-key returns the handle and records its grants as auto-grant', async () => {
     expect(
       await client({ kind: 'human', userId: 'u1' }).addKey([
         'anthropic',
@@ -466,9 +466,9 @@ describe('the account router', () => {
       ]),
     ).toEqual({ handle: 'anthropic/main' })
     expect(grantRows().map(({ grantedBy }) => grantedBy)).toEqual([
-      'human:u1',
-      'human:u1',
-      'human:u1',
+      'auto-grant',
+      'auto-grant',
+      'auto-grant',
     ])
     expect(await client().list()).toContainEqual({
       handle: 'anthropic/main',
@@ -491,6 +491,47 @@ describe('the account router', () => {
     expect(
       await failure(client().addKey(['github', { label: 'gh', value: secret, auth: 'api-key' }])),
     ).toEqual({ code: 'BAD_REQUEST', message: 'github has no auth mode api-key; it takes none' })
+  })
+
+  test.each([
+    ['whitespace', 'sk-ant one', 'value contains whitespace'],
+    ['a trailing newline', 'sk-ant-one\n', 'value contains whitespace'],
+    ['an embedded newline', 'sk-ant\none', 'value contains whitespace'],
+    ['a NUL', 'sk-ant\0one', 'value contains a control character'],
+    ['a replacement character', 'sk-ant-�', 'value contains a non-ASCII character'],
+    [
+      'too many characters',
+      'k'.repeat(KEY_MAX_LENGTH + 1),
+      `value is longer than ${KEY_MAX_LENGTH} characters`,
+    ],
+  ])(
+    'a key with %s is a BAD_REQUEST that names the problem, never the key, and adds no row',
+    async (_, value, problem) => {
+      let caught: unknown
+      try {
+        await client().addKey(['anthropic', { label: 'main', value }])
+      } catch (error) {
+        caught = error
+      }
+
+      expect(caught).toBeInstanceOf(ORPCError)
+      const error = caught instanceof ORPCError ? caught : undefined
+      expect(error?.code).toBe('BAD_REQUEST')
+      expect(JSON.stringify(error?.data)).toContain(problem)
+      expect(JSON.stringify({ message: error?.message, data: error?.data })).not.toContain(value)
+      expect(accountRow('main')).toBeUndefined()
+    },
+  )
+
+  test(`a key of exactly ${KEY_MAX_LENGTH} printable characters is stored`, async () => {
+    const value = 'k'.repeat(KEY_MAX_LENGTH)
+
+    await client().addKey(['anthropic', { label: 'main', value }])
+
+    const row = accountRow('main')
+    expect(JSON.parse(open(vaultKey, row?.id ?? '', row?.material ?? Buffer.alloc(0))).key).toBe(
+      value,
+    )
   })
 
   test('grant, set and clear a default, revoke and remove, each by handle', async () => {

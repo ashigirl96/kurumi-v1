@@ -52,7 +52,6 @@ export type AddKeyInput = {
   authMode?: AuthMode
   value: string
   autoGrant: boolean
-  addedBy: string
 }
 
 export type AddKeyRefusal = 'label_taken' | 'auth_mode_not_supported'
@@ -87,6 +86,8 @@ export type AccountLedger = {
   clearDefault(tx: Tx, input: { agentGroupId: string; service: ServiceId }): void
   candidates(agentGroupId: string, service: ServiceId): GrantedCandidate[]
 }
+
+const AUTO_GRANT = 'auto-grant'
 
 function accountIdOf(tx: Tx, handle: string): AccountLookup {
   const parsed = parseAccountHandle(handle)
@@ -159,7 +160,7 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
     .prepare()
 
   return {
-    addKey(tx, { vendor, label, authMode, value, autoGrant, addedBy }) {
+    addKey(tx, { vendor, label, authMode, value, autoGrant }) {
       const modes = authModesOf(vendor)
       if (authMode !== undefined && !modes.includes(authMode)) {
         return { ok: false, refusal: 'auth_mode_not_supported' }
@@ -191,7 +192,7 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
       if (autoGrant) {
         for (const group of tx.select({ id: agentGroup.id }).from(agentGroup).all()) {
           for (const service of services) {
-            grant(tx, { agentGroupId: group.id, accountId: id, service, grantedBy: addedBy })
+            grant(tx, { agentGroupId: group.id, accountId: id, service, grantedBy: AUTO_GRANT })
           }
         }
       }
@@ -233,7 +234,7 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
         .all()
       for (const { id, services } of autoGranted) {
         for (const service of services) {
-          grant(tx, { agentGroupId, accountId: id, service, grantedBy: 'auto-grant' })
+          grant(tx, { agentGroupId, accountId: id, service, grantedBy: AUTO_GRANT })
         }
       }
     },
@@ -354,16 +355,8 @@ const os = implement(contract).$context<KurumiContext & { accountLedger: Account
 
 export const router = os.router({
   addKey: os.addKey.handler(({ context, input: [vendor, { label, auth, autoGrant, value }] }) => {
-    const addedBy = actorOf(context.caller)
     const result = transaction(context.db, (tx) =>
-      context.accountLedger.addKey(tx, {
-        vendor,
-        label,
-        authMode: auth,
-        value,
-        autoGrant,
-        addedBy,
-      }),
+      context.accountLedger.addKey(tx, { vendor, label, authMode: auth, value, autoGrant }),
     )
     if (!result.ok)
       throw refusalError(result.refusal, { handle: `${vendor}/${label}`, authMode: auth })
