@@ -117,7 +117,10 @@ test('a repeated SIGINT during shutdown still lets the host stop cleanly', async
   )
   const host = spawnHost(home, undefined, { PATH: `${home}:${process.env.PATH}` })
   await waitForHost(home, host)
-  while (!existsSync(created)) await Bun.sleep(10)
+  for (let attempt = 0; !existsSync(created); attempt++) {
+    if (attempt === 200 || host.exitCode !== null) throw new Error('fake docker create never ran')
+    await Bun.sleep(10)
+  }
   host.kill('SIGINT')
   await Bun.sleep(100)
   host.kill('SIGINT')
