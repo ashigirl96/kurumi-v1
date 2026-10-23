@@ -47,7 +47,7 @@ type Creation = {
   endedAt: number | undefined
   cancel(): void
 }
-type Address = { reference: string; filter: string }
+type Address = { by: 'name' | 'id'; value: string }
 type AgentContainer = {
   sessionId: string
   containerId: string
@@ -182,7 +182,7 @@ function parseListing(line: string): ListedContainer | null {
   const [dockerId = '', names = '', state = '', role, sessionId, containerId, revision] = fields
   // With --no-trunc, .Names also lists the "<linker>/<alias>" names of legacy links.
   const [name, ...others] = names.split(',').filter((entry) => !entry.includes('/'))
-  if (!/^[0-9a-f]{64}$/.test(dockerId) || name === undefined || others.length > 0) return null
+  if (!/^[0-9a-f]{64}$/.test(dockerId) || !name || others.length > 0) return null
   return {
     dockerId,
     name,
@@ -394,7 +394,7 @@ export function createDockerDriver(options: {
 
   function record(
     identity: Pick<AgentContainer, 'sessionId' | 'containerId' | 'name' | 'ownership' | 'phase'>,
-    address: Address = { reference: identity.name, filter: `name=^/${identity.name}$` },
+    address: Address = { by: 'name', value: identity.name },
   ): AgentOperation {
     return {
       ...identity,
@@ -465,7 +465,7 @@ export function createDockerDriver(options: {
         let removed = false
         let removing = false
         try {
-          const exit = await agentCommand(['rm', '--force', agent.address.reference], agent)
+          const exit = await agentCommand(['rm', '--force', agent.address.value], agent)
           removing =
             exit.code !== 0 &&
             /^(?:Error response from daemon: )?removal (?:of container [^\r\n]+ is )?already in progress\s*$/.test(
@@ -473,8 +473,7 @@ export function createDockerDriver(options: {
             )
           removed =
             (exit.code === 0 &&
-              (agent.ownership !== 'uncertain' ||
-                exit.stdout.trim() === agent.address.reference)) ||
+              (agent.ownership !== 'uncertain' || exit.stdout.trim() === agent.address.value)) ||
             (exit.code !== 0 &&
               /^(?:Error response from daemon: )?No such container(?:: [^\r\n]+)?\s*$/.test(
                 exit.stderr,
@@ -484,9 +483,11 @@ export function createDockerDriver(options: {
         }
         if (!removed) {
           const deadline = performance.now() + timeoutMs
+          const { by, value } = agent.address
+          const filter = by === 'id' ? `id=${value}` : `name=^/${value}$`
           while (true) {
             const exit = await agentCommand(
-              ['ps', '-a', '--filter', agent.address.filter, '--format', '{{.Names}}'],
+              ['ps', '-a', '--filter', filter, '--format', '{{.Names}}'],
               agent,
             )
             const names = requireSuccess(exit, 'confirm removal')
@@ -498,7 +499,7 @@ export function createDockerDriver(options: {
         }
         agent.ownership = 'absent'
         if (agents.get(agent.sessionId) === agent) agents.delete(agent.sessionId)
-        residue.delete(agent.address.reference)
+        if (agent.address.by === 'id') residue.delete(agent.address.value)
       })
       .catch((cause: unknown) => {
         agent.phase = 'failed'
@@ -714,7 +715,7 @@ export function createDockerDriver(options: {
     const listed = residue.get(dockerId) ?? {
       ...record(
         { sessionId: '', containerId, name, ownership: 'confirmed', phase: 'stopping' },
-        { reference: dockerId, filter: `id=${dockerId}` },
+        { by: 'id', value: dockerId },
       ),
       cancelled: true,
     }
