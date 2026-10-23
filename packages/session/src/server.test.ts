@@ -13,7 +13,9 @@ import {
   migrations as chatMigrations,
   type InboundEvent,
 } from '@kurumi/chat/server'
-import { transaction, type Db } from '@kurumi/rpc/server'
+import { startAgentPort } from '@kurumi/gateway/server'
+import { guardRouter, transaction, type Db, type KurumiContext } from '@kurumi/rpc/server'
+import { RPCHandler } from '@orpc/server/node'
 import { eq } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
@@ -22,6 +24,7 @@ import { container, inboundMessage, outboundMessage, session } from './schema.ts
 import {
   createSessionLedger,
   migrations,
+  router,
   type InboundLog,
   type SessionLedger,
   type SessionRuntime,
@@ -61,7 +64,8 @@ beforeEach(() => {
   })
 })
 
-afterEach(() => {
+afterEach(async () => {
+  await ledger?.stop()
   chat?.stop()
   sqlite?.close()
   rmSync(home, { recursive: true, force: true })
@@ -97,6 +101,137 @@ function runtime(driver = createFakeDriver()): SessionRuntime {
     },
   }
 }
+
+async function channelServer() {
+  const driver = createFakeDriver()
+  ledger = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: runtime(driver),
+  })
+  type Context = KurumiContext & {
+    sessionLedger: SessionLedger
+    agentPrincipal: ReturnType<SessionLedger['authenticate']>
+    requestSignal: AbortSignal
+  }
+  const handler = new RPCHandler(guardRouter<Context>().router({ session: router }))
+  const port = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: (token) => ledger.authenticate(token),
+    intercepts: () => false,
+    forward: { inject: ({ path, headers }) => ({ path, headers }) },
+    async rpc(request, response, principal, signal) {
+      const result = await handler.handle(request, response, {
+        prefix: '/rpc',
+        context: {
+          db,
+          sessionLedger: ledger,
+          caller: { kind: 'agent', ...principal },
+          agentPrincipal: principal,
+          requestSignal: signal,
+          grant: null,
+          guard: () => ({ kind: 'allow' }),
+        },
+      })
+      if (!result.matched) response.writeHead(404).end()
+    },
+  })
+  return {
+    driver,
+    stop: () => port.stop(),
+    pull: (token: string, input: unknown = { waitMs: 0 }) =>
+      fetch(`http://127.0.0.1:${port.port}/rpc/session/channel/pull`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ json: input }),
+      }),
+  }
+}
+
+test('a parked pull returns within 50 ms of inbound arrival', async () => {
+  const driver = createFakeDriver()
+  ledger = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: runtime(driver),
+  })
+  const first = await ledger.routeInbound(event('first'))
+  const principal = ledger.authenticate(driver.runs[0]?.env.KURUMI_TOKEN ?? '')
+  if (!principal) throw new Error('missing live container')
+  await ledger.channel.pull(principal, { waitMs: 0 })
+  await ledger.channel.complete(principal, { ids: [first.inboundId] })
+  let returned = false
+  const parked = ledger.channel.pull(principal, { waitMs: 500 }).then((result) => {
+    returned = true
+    return { result, returnedAt: performance.now() }
+  })
+  await Bun.sleep(10)
+  expect(returned).toBe(false)
+  const incoming = event('wake up')
+  const accepted = await ledger.routeInbound(incoming)
+  const { result, returnedAt } = await parked
+  expect(result.messages.map((message) => message.id)).toEqual([accepted.inboundId])
+  expect(returnedAt - incoming.receivedAt).toBeLessThanOrEqual(50)
+})
+
+test('a reaped container token receives HTTP 401 on pull', async () => {
+  const host = await channelServer()
+  try {
+    await ledger.routeInbound(event('first'))
+    const spec = host.driver.runs[0]
+    const token = spec?.env.KURUMI_TOKEN
+    if (!spec || !token) throw new Error('missing live container')
+    const before = await host.pull(token)
+    expect(before.status).toBe(200)
+    await before.body?.cancel()
+    await host.driver.kill(spec.containerId, 0)
+    const deadline = performance.now() + 1000
+    while (db.select().from(container).where(eq(container.id, spec.containerId)).get()) {
+      if (performance.now() > deadline) throw new Error('container was not reaped')
+      await Bun.sleep(1)
+    }
+    const after = await host.pull(token)
+    expect(after.status).toBe(401)
+    await after.body?.cancel()
+  } finally {
+    await host.stop()
+  }
+})
+
+test('another session token cannot pull its pending rows over HTTP', async () => {
+  const host = await channelServer()
+  try {
+    const first = await ledger.routeInbound(event('work message'))
+    const workToken = host.driver.runs[0]?.env.KURUMI_TOKEN
+    const principal = ledger.authenticate(workToken ?? '')
+    if (!workToken || !principal) throw new Error('missing work container')
+    await ledger.channel.pull(principal, { waitMs: 0 })
+    await ledger.channel.complete(principal, { ids: [first.inboundId] })
+    const other = agents.create({ name: 'home' }).id
+    const second = await ledger.routeInbound(event('home message', other))
+    const homeToken = host.driver.runs[1]?.env.KURUMI_TOKEN
+    if (!homeToken) throw new Error('missing home container')
+    expect(homeToken).not.toBe(workToken)
+    const crossSession = await host.pull(workToken, { waitMs: 0, sessionId: second.sessionId })
+    expect(crossSession.status).toBe(400)
+    await crossSession.body?.cancel()
+    const workPull = await host.pull(workToken)
+    expect(workPull.status).toBe(200)
+    expect(await workPull.json()).toEqual({ json: { messages: [] } })
+    expect(
+      db.select().from(inboundMessage).where(eq(inboundMessage.id, second.inboundId)).get(),
+    ).toMatchObject({ status: 'pending', claimedBy: null })
+    const homePull = await host.pull(homeToken)
+    expect(homePull.status).toBe(200)
+    expect(await homePull.json()).toMatchObject({
+      json: { messages: [{ id: second.inboundId, content: 'home message' }] },
+    })
+  } finally {
+    await host.stop()
+  }
+})
 
 test('shared sessions persist exact pending messages and resume sequence after reopening SQLite', async () => {
   const text = `  日本語 🐈\t\r\0${'x'.repeat(100_000)}  `
