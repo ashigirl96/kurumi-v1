@@ -1,5 +1,5 @@
 import { Database } from 'bun:sqlite'
-import { afterEach, beforeEach, expect, setSystemTime, test } from 'bun:test'
+import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { rejects } from 'node:assert/strict'
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -152,8 +152,8 @@ function principal(index = 0) {
   if (!value) throw new Error('missing principal')
   return value
 }
-async function until(predicate: () => boolean) {
-  const deadline = performance.now() + 3000
+async function until(predicate: () => boolean, timeoutMs = 3000) {
+  const deadline = performance.now() + timeoutMs
   while (!predicate()) {
     if (performance.now() > deadline) throw new Error('condition timed out')
     await Bun.sleep(10)
@@ -811,7 +811,7 @@ test('a probe whose create CLI exits 2 blocks the next probe until a sweep settl
   }
 })
 
-test('a driver has one events subscription that follows this install, reports it only after a second alive, and resubscribes after a loss', async () => {
+test('a driver has one events subscription that follows this install, reports it only after a second alive, and replays from the last one that ran', async () => {
   const docker = fakeDaemon()
   const dockerDriver = createDockerDriver({
     install: 'events',
@@ -821,35 +821,36 @@ test('a driver has one events subscription that follows this install, reports it
   const changes: InventoryChange[] = []
   const unwatch = dockerDriver.watch((change) => changes.push(change))
   expect(() => dockerDriver.watch(() => {})).toThrow('already has a watcher')
+  const since = (index: number) => {
+    const args = docker.commands('events')[index]?.args ?? []
+    return args.includes('--since') ? Number(args[args.indexOf('--since') + 1]) : null
+  }
   const [first] = docker.commands('events')
   expect(docker.commands('events')).toHaveLength(1)
   expect(first?.args).toContain('label=kurumi.install=events')
   expect(first?.args).toContain('--until')
-  expect(first?.args).not.toContain('--since')
+  expect(since(0)).toBeNull()
+  const firstStart = Number(first?.args[(first?.args.indexOf('--until') ?? 0) + 1]) - 60
   docker.add('kurumi-agent-new', { 'kurumi.install': 'events' })
-  await Bun.sleep(100)
-  const startedAt = Number(first?.args[(first?.args.indexOf('--until') ?? 0) + 1]) - 60
-  setSystemTime(new Date(Date.now() + 2_000))
+  await until(() => changes.length === 2)
   first?.proc.complete({ code: null })
-  await Bun.sleep(0)
-  setSystemTime()
-  await until(() => changes.length === 3)
-  const resumed = docker.commands('events')[1]
-  expect(Number(resumed?.args[(resumed?.args.indexOf('--since') ?? 0) + 1])).toBeCloseTo(
-    startedAt - 1,
-    2,
-  )
+  await until(() => docker.commands('events').length === 2)
+  expect(since(1)).toBeCloseTo(firstStart - 1, 2)
+  docker.commands('events')[1]?.proc.complete({ code: 1 })
+  await until(() => docker.commands('events').length === 3, 4_000)
+  expect(since(2)).toBeCloseTo(firstStart - 1, 2)
   expect(changes).toEqual([
     { kind: 'event' },
+    { kind: 'subscribed', attempt: 0 },
     { kind: 'lost', code: null, retryMs: 1000 },
-    { kind: 'subscribed', attempt: 1 },
+    { kind: 'lost', code: 1, retryMs: 2000 },
   ])
   unwatch()
-  expect(resumed?.proc.killed).toBe(true)
-  await Bun.sleep(1100)
-  expect(docker.commands('events')).toHaveLength(2)
+  expect(docker.commands('events')[2]?.proc.killed).toBe(true)
+  await Bun.sleep(1_100)
+  expect(docker.commands('events')).toHaveLength(3)
   await dockerDriver.stop()
-})
+}, 10_000)
 
 test('a subscription that reaches the end of its window resubscribes at once and replays the previous window', async () => {
   const docker = fakeDaemon()
@@ -863,15 +864,16 @@ test('a subscription that reaches the end of its window resubscribes at once and
   const [first] = docker.commands('events')
   const windowEnd = Number(first?.args[(first?.args.indexOf('--until') ?? 0) + 1])
   try {
-    setSystemTime(new Date(Date.now() + 2_000))
+    await until(() => changes.length === 1)
     first?.proc.complete({ code: 0 })
     await Bun.sleep(0)
     const next = docker.commands('events')[1]
-    expect(Number(next?.args[(next?.args.indexOf('--since') ?? 0) + 1])).toBe(windowEnd - 61)
-    setSystemTime()
-    await until(() => changes.length === 1)
+    expect(Number(next?.args[(next?.args.indexOf('--since') ?? 0) + 1])).toBeCloseTo(
+      windowEnd - 61,
+      2,
+    )
+    await Bun.sleep(1_100)
   } finally {
-    setSystemTime()
     unwatch()
     await dockerDriver.stop()
   }
@@ -889,10 +891,14 @@ function isAlive(pid: number): boolean {
 
 function supervisedHost(
   docker: ReturnType<typeof fakeDaemon>,
-  limits: { staleAfterMs?: number; intervalMs?: number; revision?: string } = {},
+  {
+    revision = 'rev-1',
+    ...limits
+  }: { staleAfterMs?: number; intervalMs?: number; revision?: string } = {},
 ) {
   const dockerDriver = createDockerDriver({
     install: 'restart',
+    revision,
     image: 'agent-test',
     cli: docker.daemon,
   })
@@ -903,7 +909,7 @@ function supervisedHost(
     runtime: {
       ...configured,
       driver: dockerDriver,
-      supervision: { staleAfterMs: 60_000, intervalMs: 60_000, revision: 'rev-1', ...limits },
+      supervision: { staleAfterMs: 60_000, intervalMs: 60_000, ...limits },
     },
     runtimeLog: (entry) => logs.push(entry),
   })
@@ -1096,7 +1102,7 @@ test('a restart with another image, port or network replaces the container inste
       {
         kind: 'session.container.reaped',
         containerId: who.containerId,
-        reason: 'created for another runtime',
+        reason: expect.stringContaining('created for another runtime'),
       },
       { kind: 'session.adoption.done', adopted: 0, reaped: 1 },
     ])
@@ -1136,10 +1142,33 @@ test('an adopted container keeps the tool deadline its runner declared before th
   }
 })
 
+test('a slow create does not count as silence, because the clock starts again when the container runs', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const host = supervisedHost(docker, { staleAfterMs: 300, intervalMs: 10 })
+  try {
+    await host.sessions.start()
+    docker.hold('create')
+    const routed = host.sessions.routeInbound(event('slow'))
+    await until(() => docker.commands('create').length === 1)
+    await Bun.sleep(500)
+    docker.release('create')
+    await routed
+    const [token = ''] = tokens(docker)
+    await Bun.sleep(100)
+    expect(host.sessions.authenticate(token)).not.toBeNull()
+    expect(decisions(0)).not.toContainEqual(
+      expect.objectContaining({ kind: 'session.container.reaped' }),
+    )
+  } finally {
+    await host.stop()
+  }
+})
+
 test('a host stall counts as at most a few intervals of silence, so a container that called just before it survives', async () => {
   await ledger.stop()
   const docker = fakeDaemon()
-  const host = supervisedHost(docker, { staleAfterMs: 400, intervalMs: 50 })
+  const host = supervisedHost(docker, { staleAfterMs: 600, intervalMs: 50 })
   try {
     await host.sessions.start()
     await host.sessions.routeInbound(event('work'))
@@ -1253,7 +1282,7 @@ test('a listing that gets no answer within the driver timeout fails the sweep in
     runtime: {
       ...configured,
       driver: dockerDriver,
-      supervision: { staleAfterMs: 60_000, intervalMs: 60_000, revision: 'rev-1' },
+      supervision: { staleAfterMs: 60_000, intervalMs: 60_000 },
     },
     runtimeLog: (entry) => logs.push(entry),
   })

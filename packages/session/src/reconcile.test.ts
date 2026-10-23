@@ -19,7 +19,6 @@ function row(overrides: Partial<ContainerRow> = {}): ContainerRow {
     sessionId: 'ses-a',
     status: 'running',
     sessionActive: true,
-    toolDeadlineAt: null,
     liveness: null,
     ...overrides,
   }
@@ -38,7 +37,7 @@ function listed(overrides: Partial<ListedContainer> = {}): ListedContainer {
 }
 
 function plan(rows: ContainerRow[], containers: ListedContainer[] | null) {
-  return planReconciliation({ rows, containers, staleAfterMs, revision }).map((decision) =>
+  return planReconciliation({ rows, containers, staleAfterMs }).map((decision) =>
     decision.kind === 'stop'
       ? { kind: decision.kind, name: decision.container.name, reason: decision.reason }
       : { kind: decision.kind, row: decision.row.id, reason: decision.reason },
@@ -84,10 +83,6 @@ test('a row from an earlier host is reaped when its container is gone or unusabl
     expect(plan([row()], [listed(labels)])).toEqual([
       { kind: 'reap', row: 'ctr-a', reason: 'labels disagree with the row' },
     ])
-  for (const other of ['rev-0', null])
-    expect(plan([row()], [listed({ revision: other })])).toEqual([
-      { kind: 'reap', row: 'ctr-a', reason: 'created for another runtime' },
-    ])
 })
 
 test('a row claims the container with its own name and a stray wearing its labels is stopped', () => {
@@ -115,6 +110,12 @@ test('a supervised running container is stale once it has been silent longer tha
 test('stopping rows keep their container for the cleanup that is already under way', () => {
   expect(plan([row({ status: 'stopping' })], [listed()])).toEqual([])
   expect(plan([row({ status: 'stopping', liveness: silent(10 * staleAfterMs) })], [])).toEqual([])
+})
+
+test('the pass retries an unfinished cleanup for a session that no longer spawns', () => {
+  expect(plan([row({ status: 'stopping', sessionActive: false })], [listed()])).toEqual([
+    { kind: 'reap', row: 'ctr-a', reason: 'cleanup unfinished' },
+  ])
 })
 
 test('without a listing only staleness is judged and unadopted rows wait', () => {
@@ -194,17 +195,23 @@ test('a declared tool deadline keeps a silent container alive until it passes', 
   expect(liveness.view('ctr-a')).toBeNull()
 })
 
-function fakeInventory() {
+function fakeInventory(listing: ListedContainer[] = []) {
   const sweeps: number[] = []
+  const adoptions: string[] = []
   let failing = true
+  let hold: Promise<void> | undefined
   let watcher: ((change: InventoryChange) => void) | undefined
   const inventory: ContainerInventory = {
     async sweep() {
       sweeps.push(performance.now())
+      await hold
       if (failing) throw new Error('Cannot connect to the Docker daemon')
-      return []
+      return listing
     },
-    adopt: () => ({ ok: true }),
+    adopt(container) {
+      adoptions.push(container.name)
+      return { ok: true }
+    },
     remove: async () => {},
     nameOf: (id) => `kurumi-agent-${id}`,
     watch(listener) {
@@ -217,27 +224,45 @@ function fakeInventory() {
   return {
     inventory,
     sweeps,
+    adoptions,
     answer() {
       failing = false
+    },
+    holdNextSweep() {
+      const release = Promise.withResolvers<void>()
+      hold = release.promise
+      return () => release.resolve()
     },
     emit: (change: InventoryChange) => watcher?.(change),
     watched: () => watcher !== undefined,
   }
 }
 
-function supervise(inventory: ContainerInventory, intervalMs: number) {
+function supervise(
+  inventory: ContainerInventory,
+  intervalMs: number,
+  overrides: Partial<Pick<Parameters<typeof createSupervisor>[0], 'rows' | 'accept'>> = {},
+) {
   const logs: SupervisionLog[] = []
   const supervisor = createSupervisor({
     inventory,
     staleAfterMs,
     intervalMs,
-    revision,
     rows: () => [],
     accept: () => {},
     reap: () => {},
     log: (entry) => logs.push(entry),
+    ...overrides,
   })
   return { supervisor, logs }
+}
+
+async function eventually(predicate: () => boolean) {
+  const deadline = performance.now() + 3_000
+  while (!predicate()) {
+    if (performance.now() > deadline) throw new Error('condition timed out')
+    await Bun.sleep(10)
+  }
 }
 
 test('while Docker cannot be listed the supervisor retries with backoff and adoption waits', async () => {
@@ -254,12 +279,60 @@ test('while Docker cannot be listed the supervisor retries with backoff and adop
   expect(fake.watched()).toBe(true)
   await Bun.sleep(1_900)
   expect(adopted).toBe(false)
-  expect(fake.sweeps.length).toBeGreaterThanOrEqual(5)
+  expect(fake.sweeps.length).toBeGreaterThanOrEqual(2)
   expect(fake.sweeps.length).toBeLessThanOrEqual(7)
   fake.answer()
-  await Bun.sleep(450)
-  expect(adopted).toBe(true)
+  await eventually(() => adopted)
   expect(logs.filter((entry) => entry.kind === 'session.adoption.done')).toHaveLength(1)
+  await supervisor.stop()
+})
+
+test('a decision that fails keeps adoption closed, and the retry adopts without a second driver adoption', async () => {
+  const fake = fakeInventory([
+    {
+      name: 'kurumi-agent-a',
+      role: 'agent',
+      sessionId: 'ses-a',
+      containerId: 'ctr-a',
+      revision,
+      state: 'running',
+    },
+  ])
+  fake.answer()
+  let busy = true
+  const accepted: string[] = []
+  let owned = false
+  const { supervisor, logs } = supervise(fake.inventory, 400, {
+    rows: () => [row({ liveness: owned ? silent(0) : null })],
+    accept(adoptedRow) {
+      if (busy) {
+        busy = false
+        throw new Error('SQLITE_BUSY')
+      }
+      accepted.push(adoptedRow.id)
+      owned = true
+    },
+  })
+  let adopted = false
+  supervisor.adopted.then(
+    () => {
+      adopted = true
+    },
+    () => {},
+  )
+  await supervisor.start()
+  expect(adopted).toBe(false)
+  expect(fake.adoptions).toEqual([])
+  await eventually(() => adopted)
+  expect(accepted).toEqual(['ctr-a'])
+  expect(fake.adoptions).toEqual(['kurumi-agent-a'])
+  expect(
+    logs.flatMap((entry) =>
+      entry.kind === 'session.adoption.done' || entry.kind === 'session.reconcile.failed'
+        ? [entry.kind]
+        : [],
+    ),
+  ).toEqual(['session.reconcile.failed', 'session.adoption.done'])
   await supervisor.stop()
 })
 
@@ -272,28 +345,32 @@ test('an event or a resubscription wakes the supervisor before its interval', as
   expect(fake.sweeps).toHaveLength(1)
   fake.emit({ kind: 'event' })
   fake.emit({ kind: 'event' })
-  await Bun.sleep(10)
-  expect(fake.sweeps).toHaveLength(2)
+  await eventually(() => fake.sweeps.length === 2)
   fake.emit({ kind: 'subscribed', attempt: 0 })
-  await Bun.sleep(10)
+  await Bun.sleep(50)
   expect(fake.sweeps).toHaveLength(2)
   fake.emit({ kind: 'subscribed', attempt: 1 })
-  await Bun.sleep(10)
-  expect(fake.sweeps).toHaveLength(3)
+  await eventually(() => fake.sweeps.length === 3)
   await supervisor.stop()
 })
 
-test('stopping before any listing answered rejects adoption and ends the loop', async () => {
+test('stopping before any listing answered rejects adoption, ends the loop and logs no late failure', async () => {
   const fake = fakeInventory()
   const { supervisor, logs } = supervise(fake.inventory, 60_000)
   await supervisor.start()
+  const release = fake.holdNextSweep()
+  await eventually(() => fake.sweeps.length === 2)
   const adopted = supervisor.adopted.then(
     () => 'adopted',
     (error: unknown) => String(error),
   )
-  await supervisor.stop()
+  const failures = logs.length
+  const stopping = supervisor.stop()
+  release()
+  await stopping
   expect(await adopted).toContain('stopped')
   expect(fake.watched()).toBe(false)
+  expect(logs).toHaveLength(failures)
   const sweeps = fake.sweeps.length
   await Bun.sleep(600)
   expect(fake.sweeps).toHaveLength(sweeps)

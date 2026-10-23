@@ -11,7 +11,6 @@ export type ContainerSpec = {
   mounts: { hostPath: string; containerPath: string; readonly: boolean }[]
   network: { kind: 'default' } | { kind: 'lockdown'; dockerNetwork: string }
   limits: { cpus: number; memoryMb: number; pids: number }
-  revision?: string
 }
 export type ContainerDriver = {
   run(spec: ContainerSpec): Promise<{ ok: true } | { ok: false; reason: string }>
@@ -189,6 +188,7 @@ await Bun.write(Bun.stdout, Buffer.concat(chunks));
 
 export function createDockerDriver(options: {
   install: string
+  revision?: string
   image: string
   network?: string
   timeoutMs?: number
@@ -200,6 +200,7 @@ export function createDockerDriver(options: {
     detach(): Promise<void>
   } {
   const cli = options.cli ?? nativeCli
+  const revision = options.revision ?? null
   const timeoutMs = options.timeoutMs ?? 10_000
   const error = (message: string, cause?: unknown) =>
     new Error(`Docker (${options.image}): ${message}`, { cause })
@@ -528,7 +529,7 @@ export function createDockerDriver(options: {
           'kurumi.role=agent',
           '--label',
           `kurumi.container=${spec.containerId}`,
-          ...(spec.revision === undefined ? [] : ['--label', `kurumi.revision=${spec.revision}`]),
+          ...(revision === null ? [] : ['--label', `kurumi.revision=${revision}`]),
           '--init',
           '--cap-drop=ALL',
           '--security-opt',
@@ -683,6 +684,7 @@ export function createDockerDriver(options: {
     resubscribe = undefined
     if (shutdown.signal.aborted || !watcher) return
     const startedAt = Date.now()
+    const began = performance.now()
     let proc: CliProcess
     try {
       proc = cli.start(
@@ -708,7 +710,7 @@ export function createDockerDriver(options: {
         },
       )
     } catch {
-      lost(null, startedAt)
+      lost(null, began)
       return
     }
     subscription = proc
@@ -729,18 +731,18 @@ export function createDockerDriver(options: {
         if (subscription !== proc) return
         subscription = undefined
         if (shutdown.signal.aborted || !watcher) return
-        const ran = Date.now() - startedAt >= 1_000
+        const ran = performance.now() - began >= 1_000
         if (ran) since = startedAt - 1_000
         if (code === 0 && ran) {
           losses = 0
           subscribe()
-        } else lost(code, startedAt)
+        } else lost(code, began)
       })
       .catch(() => {})
   }
 
-  function lost(code: number | null, startedAt: number): void {
-    losses = Date.now() - startedAt >= 10_000 ? 1 : losses + 1
+  function lost(code: number | null, began: number): void {
+    losses = performance.now() - began >= 10_000 ? 1 : losses + 1
     const retryMs = Math.min(30_000, 1_000 * 2 ** Math.min(losses - 1, 5))
     watcher?.({ kind: 'lost', code, retryMs })
     resubscribe = setTimeout(subscribe, retryMs)
@@ -750,8 +752,8 @@ export function createDockerDriver(options: {
   function endWatch(): void {
     clearTimeout(resubscribe)
     resubscribe = undefined
+    if (subscription) void track(subscription.result).catch(() => {})
     subscription?.kill()
-    subscription = undefined
     announced = false
     losses = 0
   }
@@ -759,7 +761,6 @@ export function createDockerDriver(options: {
   function close({ keepRunning }: { keepRunning: boolean }): Promise<void> {
     if (stopping) return stopping
     shutdown.abort()
-    const events = subscription
     endWatch()
     for (const proc of commands) proc.kill()
     if (keepRunning)
@@ -777,7 +778,6 @@ export function createDockerDriver(options: {
       ...watches,
       ...work,
       ...[...commands].map((proc) => proc.result),
-      events?.result,
     ]).then(async () => {
       await cleanup()
       if ([...agents.values()].some((agent) => !detached.has(agent)) || residue.size > 0 || owned)
@@ -911,10 +911,13 @@ export function createDockerDriver(options: {
         })(),
       )
     },
-    adopt({ name, sessionId, containerId }) {
+    adopt(container) {
+      const { name, sessionId, containerId } = container
       if (shutdown.signal.aborted) return { ok: false, reason: error('driver stopped').message }
       if (sessionId === null || containerId === null || name !== agentName(containerId))
         return { ok: false, reason: error('container name does not match its labels').message }
+      if (container.revision !== revision)
+        return { ok: false, reason: error('container was created for another runtime').message }
       if (agents.has(sessionId))
         return { ok: false, reason: error('session already has a container').message }
       const agent = {

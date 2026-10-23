@@ -62,7 +62,7 @@ export type SessionRuntime = {
   | { driver: ContainerDriver; supervision?: undefined }
   | {
       driver: ContainerDriver & ContainerInventory
-      supervision: { staleAfterMs: number; intervalMs: number; revision: string }
+      supervision: { staleAfterMs: number; intervalMs: number }
     }
 )
 export type InboundLog = {
@@ -315,7 +315,6 @@ export function createSessionLedger({
         ],
         network: egress.network,
         limits: { cpus: 1, memoryMb: 1024, pids: 256 },
-        revision: runtime.supervision?.revision,
       })
       if (result.ok) {
         liveness.touch(containerId)
@@ -359,7 +358,6 @@ export function createSessionLedger({
         sessionId: container.sessionId,
         status: container.status,
         sessionStatus: session.status,
-        toolDeadlineAt: container.toolDeadlineAt,
       })
       .from(container)
       .innerJoin(session, eq(session.id, container.sessionId))
@@ -370,7 +368,6 @@ export function createSessionLedger({
         sessionId: row.sessionId,
         status: row.status,
         sessionActive: row.sessionStatus === 'active',
-        toolDeadlineAt: row.toolDeadlineAt?.getTime() ?? null,
         liveness: liveness.view(row.id),
       }))
   }
@@ -381,16 +378,21 @@ export function createSessionLedger({
       ...supervision,
       rows: () => containerRows((id) => supervision.inventory.nameOf(id)),
       accept(row) {
-        const toolMs = (row.toolDeadlineAt ?? 0) - Date.now()
-        liveness.begin(row.id, toolMs > 0 ? toolMs : null)
-        transaction(db, (tx) => {
+        const deadline = transaction(db, (tx) => {
           tx.update(container)
             .set({ status: 'running' })
             .where(
               and(eq(container.id, row.id), inArray(container.status, ['starting', 'running'])),
             )
             .run()
+          return tx
+            .select({ at: container.toolDeadlineAt })
+            .from(container)
+            .where(eq(container.id, row.id))
+            .get()?.at
         })
+        const toolMs = (deadline?.getTime() ?? 0) - Date.now()
+        liveness.begin(row.id, toolMs > 0 ? toolMs : null)
       },
       reap,
       log: (entry) => runtimeLog?.(entry),

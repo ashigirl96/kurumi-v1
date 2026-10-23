@@ -7,7 +7,6 @@ export type ContainerRow = {
   sessionId: string
   status: 'starting' | 'running' | 'stopping'
   sessionActive: boolean
-  toolDeadlineAt: number | null
   liveness: LivenessView | null
 }
 
@@ -35,8 +34,6 @@ export type SupervisionLog =
   | { kind: 'session.reconcile.failed'; reason: string; monotonicMs: number }
   | { kind: 'session.events.subscribed'; attempt: number; monotonicMs: number }
   | { kind: 'session.events.lost'; code: number | null; retryMs: number; monotonicMs: number }
-
-export type Liveness = ReturnType<typeof createLiveness>
 
 // Silence is measured in time the host was running: one gap between observations counts for at
 // most maxStepMs, so a suspended or stalled host never makes its containers look silent.
@@ -90,14 +87,13 @@ export function createLiveness({
   }
 }
 
-function unadoptable(row: ContainerRow, container: ListedContainer, revision: string) {
+function unadoptable(row: ContainerRow, container: ListedContainer) {
   if (
     container.role !== 'agent' ||
     container.containerId !== row.id ||
     container.sessionId !== row.sessionId
   )
     return 'labels disagree with the row'
-  if (container.revision !== revision) return 'created for another runtime'
   if (!row.sessionActive) return 'session closed'
   if (container.state !== 'running') return 'container not running'
   return null
@@ -122,12 +118,10 @@ export function planReconciliation({
   rows,
   containers,
   staleAfterMs,
-  revision,
 }: {
   rows: readonly ContainerRow[]
   containers: readonly ListedContainer[] | null
   staleAfterMs: number
-  revision: string
 }): Reconciliation[] {
   const byName = new Map(containers?.map((container) => [container.name, container]))
   const claimed = new Set<string>()
@@ -135,7 +129,10 @@ export function planReconciliation({
   for (const row of rows) {
     const container = byName.get(row.name)
     if (container) claimed.add(container.name)
-    if (row.status === 'stopping') continue
+    if (row.status === 'stopping') {
+      if (!row.sessionActive) decisions.push({ kind: 'reap', row, reason: 'cleanup unfinished' })
+      continue
+    }
     if (row.liveness) {
       const { silentMs, toolPending } = row.liveness
       if (row.status === 'running' && !toolPending && silentMs > staleAfterMs)
@@ -143,7 +140,7 @@ export function planReconciliation({
       continue
     }
     if (!containers) continue
-    const reason = container ? unadoptable(row, container, revision) : 'container missing'
+    const reason = container ? unadoptable(row, container) : 'container missing'
     if (reason !== null) decisions.push({ kind: 'reap', row, reason })
     else if (container)
       decisions.push({ kind: 'adopt', row, container, reason: 'running container matches its row' })
@@ -158,7 +155,6 @@ export function createSupervisor(deps: {
   inventory: ContainerInventory
   staleAfterMs: number
   intervalMs: number
-  revision: string
   rows(): ContainerRow[]
   accept(row: ContainerRow): void
   reap(rowId: string, reason: string, name: string): void
@@ -202,12 +198,12 @@ export function createSupervisor(deps: {
     switch (decision.kind) {
       case 'adopt': {
         const { row, container } = decision
+        deps.accept(row)
         const result = inventory.adopt(container)
         if (!result.ok) {
           deps.reap(row.id, `adoption failed: ${result.reason}`, row.name)
           return 'reap'
         }
-        deps.accept(row)
         deps.log({
           kind: 'session.container.adopted',
           sessionId: row.sessionId,
@@ -246,7 +242,7 @@ export function createSupervisor(deps: {
 
   async function run() {
     let listed = false
-    let backoffMs = 250
+    let backoffMs = Math.min(250, intervalMs)
     for (;;) {
       if (stopped) break
       let containers: ListedContainer[] | null = null
@@ -257,18 +253,26 @@ export function createSupervisor(deps: {
       }
       if (stopped) break
       const counts = { adopt: 0, reap: 0, stop: 0 }
+      let applied = true
+      let decisions: Reconciliation[] = []
       try {
-        for (const decision of planReconciliation({
+        decisions = planReconciliation({
           rows: deps.rows(),
           containers,
           staleAfterMs: deps.staleAfterMs,
-          revision: deps.revision,
-        }))
-          counts[apply(decision)]++
+        })
       } catch (cause) {
+        applied = false
         failed(String(cause))
       }
-      if (containers && !listed) {
+      for (const decision of decisions)
+        try {
+          counts[apply(decision)]++
+        } catch (cause) {
+          applied = false
+          failed(String(cause))
+        }
+      if (containers && applied && !listed) {
         listed = true
         deps.log({
           kind: 'session.adoption.done',
@@ -283,7 +287,6 @@ export function createSupervisor(deps: {
       await pause(listed ? intervalMs : backoffMs)
       if (!listed) backoffMs = Math.min(backoffMs * 2, intervalMs)
     }
-    firstPass.resolve()
   }
 
   function observe(change: InventoryChange) {
@@ -316,6 +319,9 @@ export function createSupervisor(deps: {
     adopted: adopted.promise,
     async start() {
       loop ??= run()
+        .catch((cause: unknown) => failed(String(cause)))
+        .catch(() => {})
+        .finally(() => firstPass.resolve())
       await firstPass.promise
       if (!stopped) unwatch = inventory.watch(observe)
     },
