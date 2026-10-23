@@ -21,6 +21,7 @@ import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import {
   gatewayContribution,
   loadCertificateAuthority,
+  proxyEnv,
   stageCaBundle,
   startAdmission,
   startAgentPort,
@@ -119,22 +120,20 @@ export async function startHost(config: HostConfig) {
     const ca = await loadCertificateAuthority({ db, vaultKey })
     const caBundle = stageCaBundle(config.home, ca.certPem)
     const runner = join(config.home, 'runner/runner.js')
-    const contribution = ({ sessionToken }: { sessionToken: string }): ContainerEgress => {
-      const gateway = gatewayContribution({ port: config.agentPort.port, caBundle, sessionToken })
-      return {
-        env: gateway.env,
-        mounts: [
-          { hostPath: runner, containerPath: '/app/runner.js', readonly: true },
-          ...gateway.mounts,
-        ],
-        network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
-      }
+    const gateway = gatewayContribution({ port: config.agentPort.port, caBundle })
+    const egress: ContainerEgress = {
+      env: gateway.env,
+      mounts: [
+        { hostPath: runner, containerPath: '/app/runner.js', readonly: true },
+        ...gateway.mounts,
+      ],
+      network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
     }
     const docker = createDockerDriver({
       install,
       revision: containerRevision({
         image: environment.KURUMI_AGENT_IMAGE,
-        contribution,
+        egress,
         runner: existsSync(runner) ? readFileSync(runner) : new Uint8Array(),
       }),
       image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
@@ -173,7 +172,10 @@ export async function startHost(config: HostConfig) {
               since: new Date(),
             }
           },
-          contribution,
+          contribution: ({ sessionToken }) => ({
+            ...egress,
+            env: { ...egress.env, ...proxyEnv({ port: config.agentPort.port, sessionToken }) },
+          }),
         },
         supervision: { staleAfterMs, intervalMs },
       },

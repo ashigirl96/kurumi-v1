@@ -376,14 +376,13 @@ function revisionFor(sha: string): string {
   return containerRevision({
     image: 'kurumi-agent:test',
     runner: new TextEncoder().encode('runner'),
-    contribution: ({ sessionToken }) => ({
+    egress: {
       ...gatewayContribution({
         port: 4100,
         caBundle: { path: `/home/ca/combined-${sha}.pem`, sha },
-        sessionToken,
       }),
       network: { kind: 'lockdown', dockerNetwork: 'bridge' },
-    }),
+    },
   })
 }
 

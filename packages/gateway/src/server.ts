@@ -73,16 +73,10 @@ export type GatewayContribution = {
 export function gatewayContribution(input: {
   port: number
   caBundle: CaBundle
-  sessionToken: string
 }): GatewayContribution {
-  const proxy = `http://s:${input.sessionToken}@${CONTAINER_HOST}:${input.port}`
   return {
     env: {
       KURUMI_URL: `http://${CONTAINER_HOST}:${input.port}`,
-      HTTPS_PROXY: proxy,
-      https_proxy: proxy,
-      HTTP_PROXY: proxy,
-      http_proxy: proxy,
       NO_PROXY: CONTAINER_HOST,
       no_proxy: CONTAINER_HOST,
       NODE_EXTRA_CA_CERTS: CONTAINER_CA_PATH,
@@ -90,4 +84,9 @@ export function gatewayContribution(input: {
     },
     mounts: [{ hostPath: input.caBundle.path, containerPath: CONTAINER_CA_PATH, readonly: true }],
   }
+}
+
+export function proxyEnv(input: { port: number; sessionToken: string }): Record<string, string> {
+  const proxy = `http://s:${input.sessionToken}@${CONTAINER_HOST}:${input.port}`
+  return { HTTPS_PROXY: proxy, https_proxy: proxy, HTTP_PROXY: proxy, http_proxy: proxy }
 }

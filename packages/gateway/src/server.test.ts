@@ -15,6 +15,7 @@ import {
   gatewayContribution,
   loadCertificateAuthority,
   migrations,
+  proxyEnv,
   stageCaBundle,
 } from './server.ts'
 
@@ -93,16 +94,11 @@ test('the CA bundle holds the public roots and the CA under a content-addressed 
   expect(other.path).not.toBe(bundle.path)
 })
 
-test('the contribution sends container egress through the Agent Port with the session token', () => {
+test('the contribution points the container at the Agent Port and its CA bundle', () => {
   const caBundle = { path: '/home/ca/combined-abc.pem', sha: 'abc' }
-  const proxy = 'http://s:token-1@host.docker.internal:4100'
-  expect(gatewayContribution({ port: 4100, caBundle, sessionToken: 'token-1' })).toEqual({
+  expect(gatewayContribution({ port: 4100, caBundle })).toEqual({
     env: {
       KURUMI_URL: 'http://host.docker.internal:4100',
-      HTTPS_PROXY: proxy,
-      https_proxy: proxy,
-      HTTP_PROXY: proxy,
-      http_proxy: proxy,
       NO_PROXY: 'host.docker.internal',
       no_proxy: 'host.docker.internal',
       NODE_EXTRA_CA_CERTS: '/etc/kurumi/ca.pem',
@@ -115,5 +111,15 @@ test('the contribution sends container egress through the Agent Port with the se
         readonly: true,
       },
     ],
+  })
+})
+
+test('the proxy env carries the session token as the proxy password', () => {
+  const proxy = 'http://s:token-1@host.docker.internal:4100'
+  expect(proxyEnv({ port: 4100, sessionToken: 'token-1' })).toEqual({
+    HTTPS_PROXY: proxy,
+    https_proxy: proxy,
+    HTTP_PROXY: proxy,
+    http_proxy: proxy,
   })
 })

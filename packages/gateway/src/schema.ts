@@ -1,7 +1,6 @@
 import { sql } from 'drizzle-orm'
 import { blob, check, integer, sqliteTable, text } from 'drizzle-orm/sqlite-core'
 
-/** The MITM CA. The key is sealed with the vault key, so it backs up and restores with kurumi.db and vault.key. */
 export const gatewayCa = sqliteTable(
   'gateway_ca',
   {
