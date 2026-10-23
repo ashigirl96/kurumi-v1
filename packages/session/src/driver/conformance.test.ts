@@ -1,5 +1,5 @@
 import { Database } from 'bun:sqlite'
-import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, expect, setSystemTime, test } from 'bun:test'
 import { rejects } from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -25,8 +25,14 @@ import {
   type RuntimeLog,
 } from '../server.ts'
 import { createFakeDriver } from '../testing.ts'
-import { createDockerDriver } from './docker.ts'
-import { FakeCli } from './fake-cli.ts'
+import {
+  createDockerDriver,
+  type Cli,
+  type CliResult,
+  type ContainerSpec,
+  type InventoryChange,
+} from './docker.ts'
+import { FakeCli, type FakeProcess } from './fake-cli.ts'
 
 let sqlite: Database
 let db: Db
@@ -463,4 +469,379 @@ test('post rejects content conflicts and completion of a batch is atomic', async
     code: 'CONFLICT',
   })
   expect(db.select().from(outboundMessage).get()).toMatchObject({ content: 'first', attempts: 1 })
+})
+
+function flagValues(args: readonly string[], flag: string): string[] {
+  return args.flatMap((arg, index) => (arg === flag ? [args[index + 1] ?? ''] : []))
+}
+
+type DaemonContainer = { labels: Map<string, string>; state: string; waits: Set<FakeProcess> }
+
+function fakeDaemon() {
+  const cli = new FakeCli()
+  const containers = new Map<string, DaemonContainer>()
+  const streams = new Set<(line: string) => void>()
+  const held = new Map<string, (() => void)[]>()
+  let late: number | null | undefined
+  const emit = (action: string, name: string) => {
+    for (const stream of streams) stream(`${action} ${name}`)
+  }
+  function add(name: string, labels: Record<string, string>, state = 'running') {
+    containers.set(name, { labels: new Map(Object.entries(labels)), state, waits: new Set() })
+    emit('create', name)
+  }
+  function exit(name: string, code: number) {
+    const entry = containers.get(name)
+    if (!entry) return
+    entry.state = 'exited'
+    for (const wait of entry.waits) wait.complete({ stdout: `${code}\n` })
+    entry.waits.clear()
+    emit('die', name)
+  }
+  function remove(name: string): boolean {
+    const entry = containers.get(name)
+    if (!entry) return false
+    if (entry.state === 'running') exit(name, 137)
+    containers.delete(name)
+    emit('destroy', name)
+    return true
+  }
+  function selected(args: readonly string[]) {
+    const filters = flagValues(args, '--filter')
+    return [...containers].filter(([name, entry]) =>
+      filters.every((filter) => {
+        if (filter.startsWith('name=')) return filter === `name=^/${name}$`
+        if (!filter.startsWith('label=')) return true
+        const [key = '', value = ''] = filter.slice('label='.length).split(/=(.*)/s)
+        return entry.labels.get(key) === value
+      }),
+    )
+  }
+  function act(args: readonly string[], proc: FakeProcess, onLine?: (line: string) => void) {
+    const [command] = args
+    const name = args.at(-1) ?? ''
+    const answer = (result: Partial<CliResult>) => proc.complete(result)
+    const missing = () =>
+      answer({ code: 1, stderr: `Error response from daemon: No such entry: ${name}` })
+    if (command === 'create') {
+      const created = flagValues(args, '--name')[0] ?? ''
+      const labels = Object.fromEntries(
+        flagValues(args, '--label').map((label) => label.split(/=(.*)/s).slice(0, 2)),
+      )
+      if (late !== undefined) {
+        const code = late
+        late = undefined
+        answer({ code })
+        setTimeout(() => add(created, labels, 'created'), 5)
+        return
+      }
+      add(created, labels, 'created')
+      answer({ stdout: `${created}\n` })
+    } else if (command === 'start') {
+      const entry = containers.get(name)
+      if (!entry) return missing()
+      entry.state = 'running'
+      if (args[1] === '--attach') {
+        remove(name)
+        return answer({ stdout: 'probe-body' })
+      }
+      answer({})
+    } else if (command === 'wait') {
+      const entry = containers.get(name)
+      if (!entry) return missing()
+      if (entry.state === 'running') entry.waits.add(proc)
+      else answer({ stdout: '0\n' })
+    } else if (command === 'stop') {
+      exit(name, 143)
+      answer({})
+    } else if (command === 'rm') {
+      if (remove(name)) answer({ stdout: `${name}\n` })
+      else missing()
+    } else if (command === 'ps') {
+      const format = flagValues(args, '--format')[0] ?? '{{.Names}}'
+      answer({
+        stdout: selected(args)
+          .map(([listed, entry]) =>
+            format
+              .replaceAll('{{.Names}}', listed)
+              .replaceAll('{{.State}}', entry.state)
+              .replace(
+                /\{\{\.Label "([^"]+)"\}\}/g,
+                (_match, key: string) => entry.labels.get(key) ?? '',
+              ),
+          )
+          .map((line) => `${line}\n`)
+          .join(''),
+      })
+    } else if (command === 'events' && onLine) {
+      streams.add(onLine)
+      void proc.result.then(
+        () => streams.delete(onLine),
+        () => streams.delete(onLine),
+      )
+    }
+  }
+  const daemon: Cli = {
+    start(args, options) {
+      const proc = cli.start(args)
+      const queue = held.get(args[0] ?? '')
+      if (queue) queue.push(() => act(args, proc, options?.onLine))
+      else act(args, proc, options?.onLine)
+      return {
+        result: proc.result,
+        kill() {
+          proc.kill()
+          proc.complete({ code: null })
+        },
+      }
+    },
+  }
+  return {
+    cli,
+    daemon,
+    containers,
+    add,
+    exit,
+    remove,
+    hold(command: string) {
+      held.set(command, [])
+    },
+    release(command: string) {
+      const queue = held.get(command) ?? []
+      held.delete(command)
+      for (const action of queue) action()
+    },
+    lateCreate(code: number | null) {
+      late = code
+    },
+    commands: (command: string) => cli.started.filter(({ args }) => args[0] === command),
+  }
+}
+
+function agentSpec(overrides: Partial<ContainerSpec> = {}): ContainerSpec {
+  return {
+    sessionId: 'ses-adopt',
+    containerId: 'ctr-adopt',
+    image: 'agent-test',
+    env: { KURUMI_TOKEN: 'secret' },
+    mounts: [{ hostPath: import.meta.path, containerPath: '/app/runner.js', readonly: true }],
+    network: { kind: 'default' },
+    limits: { cpus: 1, memoryMb: 1024, pids: 256 },
+    ...overrides,
+  }
+}
+
+test('a new driver adopts a running agent from its labels alone and a repeated run creates nothing', async () => {
+  const docker = fakeDaemon()
+  const previous = createDockerDriver({ install: 'adopt', image: 'agent-test', cli: docker.daemon })
+  expect(await previous.run(agentSpec())).toEqual({ ok: true })
+  await previous.detach()
+  const restarted = createDockerDriver({
+    install: 'adopt',
+    image: 'agent-test',
+    cli: docker.daemon,
+  })
+  const name = restarted.nameOf('ctr-adopt')
+  const exits: [string, number][] = []
+  restarted.onExit((id, code) => exits.push([id, code]))
+  try {
+    const listed = await restarted.sweep()
+    expect(listed).toEqual([
+      { name, role: 'agent', sessionId: 'ses-adopt', containerId: 'ctr-adopt', state: 'running' },
+    ])
+    const before = docker.cli.started.length
+    expect(listed.map((entry) => restarted.adopt(entry))).toEqual([{ ok: true }])
+    expect(await restarted.run(agentSpec())).toEqual({ ok: true })
+    expect(docker.cli.joined().slice(before)).toEqual([`wait ${name}`])
+    docker.exit(name, 7)
+    await until(() => exits.length === 1)
+    expect(exits).toEqual([['ctr-adopt', 7]])
+  } finally {
+    await restarted.stop()
+  }
+  expect(docker.containers.size).toBe(0)
+})
+
+test('adoption refuses a entry whose name does not follow from its labels', async () => {
+  const docker = fakeDaemon()
+  const dockerDriver = createDockerDriver({
+    install: 'adopt',
+    image: 'agent-test',
+    cli: docker.daemon,
+  })
+  const forged = {
+    name: 'kurumi-agent-forged',
+    role: 'agent',
+    sessionId: 'ses-adopt',
+    containerId: 'ctr-adopt',
+    state: 'running',
+  }
+  expect(dockerDriver.adopt(forged).ok).toBe(false)
+  expect(docker.commands('wait')).toHaveLength(0)
+  await dockerDriver.stop()
+})
+
+test('detach leaves running agents and removes only an agent that is still starting', async () => {
+  const docker = fakeDaemon()
+  const dockerDriver = createDockerDriver({
+    install: 'detach',
+    image: 'agent-test',
+    cli: docker.daemon,
+  })
+  const exits: string[] = []
+  dockerDriver.onExit((id) => exits.push(id))
+  expect(await dockerDriver.run(agentSpec())).toEqual({ ok: true })
+  docker.hold('create')
+  const starting = dockerDriver.run(agentSpec({ sessionId: 'ses-two', containerId: 'ctr-two' }))
+  await until(() => docker.commands('create').length === 2)
+  const detaching = dockerDriver.detach()
+  docker.release('create')
+  expect((await starting).ok).toBe(false)
+  await detaching
+  const kept = dockerDriver.nameOf('ctr-adopt')
+  expect([...docker.containers].map(([name, entry]) => [name, entry.state])).toEqual([
+    [kept, 'running'],
+  ])
+  expect(docker.commands('wait').map(({ proc }) => proc.killed)).toEqual([true])
+  expect(docker.commands('rm').map(({ args }) => args.at(-1))).toEqual([
+    dockerDriver.nameOf('ctr-two'),
+  ])
+  expect(exits).toEqual([])
+  expect((await dockerDriver.run(agentSpec({ sessionId: 'ses-three' }))).ok).toBe(false)
+})
+
+test('a sweep lists and removes only containers that carry this install label', async () => {
+  const docker = fakeDaemon()
+  docker.add('other-agent', {
+    'kurumi.install': 'other',
+    'kurumi.role': 'agent',
+    'kurumi.session': 'ses-adopt',
+    'kurumi.container': 'ctr-adopt',
+  })
+  docker.add('other-probe', { 'kurumi.install': 'other', 'kurumi.role': 'probe' })
+  docker.add('own-probe', { 'kurumi.install': 'mine', 'kurumi.role': 'probe' }, 'exited')
+  const dockerDriver = createDockerDriver({
+    install: 'mine',
+    image: 'agent-test',
+    cli: docker.daemon,
+  })
+  try {
+    expect(await dockerDriver.sweep()).toEqual([
+      { name: 'own-probe', role: 'probe', sessionId: '', containerId: '', state: 'exited' },
+    ])
+    await dockerDriver.remove('own-probe')
+    await dockerDriver.kill('ctr-adopt', 0)
+  } finally {
+    await dockerDriver.stop()
+  }
+  expect([...docker.containers.keys()]).toEqual(['other-agent', 'other-probe'])
+  expect(docker.cli.joined().join('\n')).not.toMatch(/other-|kurumi\.install=other/)
+})
+
+test.each([143, 2, null])(
+  'an agent create CLI that ends with %p stays unconfirmed until a later sweep lets cleanup remove its late entry',
+  async (code) => {
+    const docker = fakeDaemon()
+    const dockerDriver = createDockerDriver({
+      install: 'late',
+      image: 'agent-test',
+      cli: docker.daemon,
+    })
+    docker.lateCreate(code)
+    try {
+      expect((await dockerDriver.run(agentSpec())).ok).toBe(false)
+      await until(() => docker.containers.size === 1)
+      expect(await dockerDriver.kill('ctr-adopt', 0).then(() => 'removed', String)).toContain(
+        'unconfirmed',
+      )
+      expect(docker.containers.size).toBe(1)
+      await dockerDriver.sweep()
+      await dockerDriver.kill('ctr-adopt', 0)
+      expect(docker.containers.size).toBe(0)
+    } finally {
+      await dockerDriver.stop()
+    }
+  },
+)
+
+test('a probe whose create CLI exits 2 blocks the next probe until a sweep settles its name', async () => {
+  const docker = fakeDaemon()
+  const dockerDriver = createDockerDriver({
+    install: 'probe',
+    image: 'agent-test',
+    cli: docker.daemon,
+  })
+  const url = 'http://host.docker.internal:1/probe/nonce'
+  docker.lateCreate(2)
+  try {
+    expect(await dockerDriver.probe(url).then(() => 'opened', String)).toContain('unconfirmed')
+    await until(() => docker.containers.size === 1)
+    expect(await dockerDriver.probe(url).then(() => 'opened', String)).toContain('unconfirmed')
+    expect(docker.commands('create')).toHaveLength(1)
+    expect(await dockerDriver.sweep()).toEqual([])
+    expect(await dockerDriver.probe(url)).toBe('probe-body')
+    expect(docker.containers.size).toBe(0)
+  } finally {
+    await dockerDriver.stop()
+  }
+})
+
+test('one events subscription per driver follows this install and resubscribes after a loss', async () => {
+  const docker = fakeDaemon()
+  const dockerDriver = createDockerDriver({
+    install: 'events',
+    image: 'agent-test',
+    cli: docker.daemon,
+  })
+  const changes: InventoryChange[] = []
+  const unwatch = [
+    dockerDriver.watch((change) => changes.push(change)),
+    dockerDriver.watch(() => {}),
+  ]
+  const [first] = docker.commands('events')
+  expect(docker.commands('events')).toHaveLength(1)
+  expect(first?.args).toContain('label=kurumi.install=events')
+  expect(first?.args).toContain('--until')
+  expect(first?.args).not.toContain('--since')
+  docker.add('kurumi-agent-new', { 'kurumi.install': 'events' })
+  first?.proc.complete({ code: null })
+  await until(() => docker.commands('events').length === 2)
+  const resumed = docker.commands('events')[1]
+  expect(resumed?.args).toContain('--since')
+  expect(changes).toEqual([
+    { kind: 'subscribed', attempt: 0 },
+    { kind: 'event', action: 'create', name: 'kurumi-agent-new' },
+    { kind: 'lost', code: null, retryMs: 1000 },
+    { kind: 'subscribed', attempt: 1 },
+  ])
+  for (const stop of unwatch) stop()
+  expect(resumed?.proc.killed).toBe(true)
+  await Bun.sleep(1100)
+  expect(docker.commands('events')).toHaveLength(2)
+  await dockerDriver.stop()
+})
+
+test('a subscription that reaches the end of its window continues at once from where it ended', async () => {
+  const docker = fakeDaemon()
+  const dockerDriver = createDockerDriver({
+    install: 'events',
+    image: 'agent-test',
+    cli: docker.daemon,
+  })
+  const changes: InventoryChange[] = []
+  const unwatch = dockerDriver.watch((change) => changes.push(change))
+  const [first] = docker.commands('events')
+  const windowEnd = Number(first?.args[(first?.args.indexOf('--until') ?? 0) + 1])
+  try {
+    setSystemTime(new Date(windowEnd * 1000))
+    first?.proc.complete({ code: 0 })
+    await Bun.sleep(0)
+    const next = docker.commands('events')[1]
+    expect(Number(next?.args[(next?.args.indexOf('--since') ?? 0) + 1])).toBe(windowEnd - 1)
+  } finally {
+    setSystemTime()
+    unwatch()
+    await dockerDriver.stop()
+  }
+  expect(changes).toEqual([{ kind: 'subscribed', attempt: 0 }])
 })
