@@ -26,6 +26,7 @@ function row(overrides: Partial<ContainerRow> = {}): ContainerRow {
 
 function listed(overrides: Partial<ListedContainer> = {}): ListedContainer {
   return {
+    dockerId: 'a'.repeat(64),
     name: 'kurumi-agent-a',
     role: 'agent',
     sessionId: 'ses-a',
@@ -288,16 +289,7 @@ test('while Docker cannot be listed the supervisor retries with backoff and adop
 })
 
 test('a decision that fails keeps adoption closed, and the retry adopts without a second driver adoption', async () => {
-  const fake = fakeInventory([
-    {
-      name: 'kurumi-agent-a',
-      role: 'agent',
-      sessionId: 'ses-a',
-      containerId: 'ctr-a',
-      revision,
-      state: 'running',
-    },
-  ])
+  const fake = fakeInventory([listed()])
   fake.answer()
   let busy = true
   const accepted: string[] = []

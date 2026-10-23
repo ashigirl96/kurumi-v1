@@ -221,7 +221,7 @@ export function createSupervisor(deps: {
         return 'reap'
       case 'stop': {
         const { container, reason } = decision
-        inventory.remove(container.name).then(
+        inventory.remove(container).then(
           () =>
             deps.log({
               kind: 'session.container.stopped',

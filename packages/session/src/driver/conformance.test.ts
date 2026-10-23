@@ -691,6 +691,7 @@ test('a new driver adopts a running agent from its labels alone and a repeated r
     const listed = await restarted.sweep()
     expect(listed).toEqual([
       {
+        dockerId: docker.containers.get(name)?.id ?? '',
         name,
         role: 'agent',
         sessionId: 'ses-adopt',
@@ -720,6 +721,7 @@ test('adoption refuses a container whose name does not follow from its labels', 
     cli: docker.daemon,
   })
   const forged: ListedContainer = {
+    dockerId: 'f'.repeat(64),
     name: 'kurumi-agent-forged',
     role: 'agent',
     sessionId: 'ses-adopt',
@@ -801,8 +803,10 @@ test('a sweep lists and removes only containers that carry this install label', 
     cli: docker.daemon,
   })
   try {
-    expect(await dockerDriver.sweep()).toEqual([
+    const listed = await dockerDriver.sweep()
+    expect(listed).toEqual([
       {
+        dockerId: docker.containers.get('own-probe')?.id ?? '',
         name: 'own-probe',
         role: 'probe',
         sessionId: null,
@@ -811,7 +815,7 @@ test('a sweep lists and removes only containers that carry this install label', 
         state: 'exited',
       },
     ])
-    await dockerDriver.remove('own-probe')
+    for (const entry of listed) await dockerDriver.remove(entry)
     await dockerDriver.kill('ctr-adopt', 0)
   } finally {
     await dockerDriver.stop()
@@ -1502,6 +1506,7 @@ test('adopting a container ends the docker wait a dead host left for it and keep
     await until(() => pids(name).length === 1 && pids(unrelated).length === 1)
     expect(
       dockerDriver.adopt({
+        dockerId: 'a'.repeat(64),
         name,
         role: 'agent',
         sessionId: 'ses-adopt',
