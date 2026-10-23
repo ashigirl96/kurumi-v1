@@ -114,8 +114,14 @@
     "packages/gateway": {
       "name": "@kurumi/gateway",
       "dependencies": {
+        "@kurumi/account": "workspace:*",
+        "@kurumi/rpc": "workspace:*",
         "@peculiar/x509": "catalog:",
+        "drizzle-orm": "catalog:",
         "reflect-metadata": "catalog:",
+      },
+      "devDependencies": {
+        "drizzle-kit": "catalog:",
       },
     },
     "packages/rpc": {

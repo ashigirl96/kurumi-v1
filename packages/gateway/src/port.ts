@@ -7,9 +7,6 @@ import { createServer as createTlsServer } from 'node:tls'
 import { createCertificateAuthority, type CertificateAuthority, type Leaf } from './ca.ts'
 import { forward, forwardUpgrade, type ConnectTarget, type ForwardDeps } from './forward.ts'
 
-export { startAdmission } from './admission.ts'
-export type { ForwardDeps, Injection, InjectionInput, UpstreamDestination } from './forward.ts'
-
 type Tunnel<Principal> = {
   target: ConnectTarget
   authenticate(): Principal | null | Promise<Principal | null>
