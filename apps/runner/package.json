@@ -1,0 +1,18 @@
+{
+  "name": "@kurumi/runner",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@kurumi/session": "workspace:*",
+    "@orpc/client": "catalog:",
+    "@orpc/contract": "catalog:"
+  },
+  "devDependencies": {
+    "@kurumi/agent": "workspace:*",
+    "@kurumi/chat": "workspace:*",
+    "@kurumi/gateway": "workspace:*",
+    "@kurumi/rpc": "workspace:*",
+    "@orpc/server": "catalog:",
+    "drizzle-orm": "catalog:"
+  }
+}

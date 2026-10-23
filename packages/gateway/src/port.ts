@@ -7,6 +7,7 @@ import { createServer as createTlsServer } from 'node:tls'
 import { createCertificateAuthority, type CertificateAuthority, type Leaf } from './ca.ts'
 import { forward, forwardUpgrade, type ConnectTarget, type ForwardDeps } from './forward.ts'
 
+export { startAdmission } from './admission.ts'
 export type { ForwardDeps, Injection, InjectionInput, UpstreamDestination } from './forward.ts'
 
 type Tunnel<Principal> = {
@@ -78,6 +79,12 @@ export async function startAgentPort<Principal extends object>(deps: {
   ca?: CertificateAuthority
   onConnect?(target: ConnectTarget): void
   probeNonce?(): string | null
+  rpc?(
+    request: IncomingMessage,
+    response: ServerResponse,
+    principal: Principal,
+    signal: AbortSignal,
+  ): Promise<void>
 }): Promise<AgentPort> {
   const ca = deps.ca ?? (await createCertificateAuthority())
   const listeners = new Map<string, Promise<HostListener<Principal>>>()
@@ -252,13 +259,43 @@ export async function startAgentPort<Principal extends object>(deps: {
     pipeline(client, outbound, client, done)
   }
 
-  const outer = createServer((req, res) => {
+  async function handleOuter(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const nonce = deps.probeNonce?.()
     if (req.method === 'GET' && nonce && req.url === `/probe/${nonce}`) {
       res.writeHead(200, { 'content-type': 'text/plain' }).end(nonce)
       return
     }
-    res.writeHead(404).end()
+    if (!deps.rpc) {
+      res.writeHead(404).end()
+      return
+    }
+    let count = 0
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      if (req.rawHeaders[i]?.toLowerCase() === 'authorization') count++
+    }
+    const token = /^Bearer ([A-Za-z0-9_-]+)$/i.exec(req.headers.authorization ?? '')?.[1]
+    const principal = count === 1 && token ? await deps.authenticate(token) : null
+    if (principal === null) {
+      res.writeHead(401, { 'www-authenticate': 'Bearer' }).end()
+      return
+    }
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    res.once('close', abort)
+    if (res.destroyed || stopping) controller.abort()
+    try {
+      await deps.rpc(req, res, principal, controller.signal)
+    } finally {
+      res.removeListener('close', abort)
+    }
+  }
+
+  const outer = createServer((req, res) => {
+    handleOuter(req, res).catch(() => {
+      if (res.destroyed) return
+      if (res.headersSent) res.destroy()
+      else res.writeHead(500).end()
+    })
   })
   outer.on('connection', track)
   outer.on('clientError', (_error, socket) => socket.destroy())
