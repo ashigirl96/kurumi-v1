@@ -136,6 +136,16 @@ export async function startHost(config: HostConfig) {
         supervision: {
           staleAfterMs: environment.KURUMI_STALE_AFTER_MS,
           intervalMs: environment.KURUMI_RECONCILE_INTERVAL_MS,
+          revision: createHash('sha256')
+            .update(
+              JSON.stringify([
+                environment.KURUMI_AGENT_IMAGE,
+                config.agentPort.port,
+                environment.KURUMI_DOCKER_NETWORK,
+              ]),
+            )
+            .digest('hex')
+            .slice(0, 16),
         },
       },
     })
@@ -236,15 +246,19 @@ export async function startHost(config: HostConfig) {
 }
 
 if (import.meta.main) {
-  const starting = startHost(loadConfig(process.env))
+  const starting = Promise.resolve().then(() => startHost(loadConfig(process.env)))
   const shutdown = () => {
-    starting
-      .then((host) => host.stop())
-      .then(() => process.exit(0))
-      .catch((error: unknown) => {
-        process.stderr.write(`${String(error)}\n`)
-        process.exit(1)
-      })
+    starting.then(
+      (host) =>
+        host.stop().then(
+          () => process.exit(0),
+          (error: unknown) => {
+            process.stderr.write(`${String(error)}\n`)
+            process.exit(1)
+          },
+        ),
+      () => {},
+    )
   }
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)
