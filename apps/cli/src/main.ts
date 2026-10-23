@@ -3,6 +3,11 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 
+import {
+  AccountViewSchema,
+  AddKeyOutputSchema,
+  contract as accountContract,
+} from '@kurumi/account/contract'
 import { contract as agentContract } from '@kurumi/agent/contract'
 import { contract as chatContract, type TerminalEvent } from '@kurumi/chat/contract'
 import { hostContract, type Meta } from '@kurumi/rpc/contract'
@@ -43,7 +48,7 @@ export async function main(argv: string[]): Promise<number> {
     },
   })
   if (argv[0] === 'chat') return chat(argv.slice(1), link)
-  const router = forward({ agent: agentContract, ...hostContract }, link)
+  const router = forward({ agent: agentContract, account: accountContract, ...hostContract }, link)
   const cli = createCli({
     router,
     name: 'kurumi',
@@ -165,18 +170,24 @@ function forward(
       if (Object.keys(children).length > 0) router[key] = children
       continue
     }
-    const { inputSchema } = child['~orpc']
+    const { inputSchema, outputSchema } = child['~orpc']
     const meta: Meta = child['~orpc'].meta
     if (meta.cli !== true) continue
+    const stdin = stdinFieldOf(inputSchema)
+    const render = renderers[childPath.join('.')] ?? json
     router[key] = os
       .meta(meta)
-      .input(inputSchema ?? z.object({}))
+      .input(stdin?.cliSchema ?? inputSchema ?? z.object({}))
       .handler(async ({ input }) => {
+        const sent = stdin
+          ? withField(input, stdin.field, await readStdinValue(stdin.field, childPath))
+          : input
         try {
-          const output = await link.call(childPath, inputSchema ? input : undefined, {
+          const output = await link.call(childPath, inputSchema ? sent : undefined, {
             context: {},
           })
-          process.stdout.write(`${JSON.stringify(output, null, 2)}\n`)
+          const text = outputSchema === undefined ? '' : render(output)
+          if (text !== '') process.stdout.write(`${text}\n`)
         } catch (error) {
           if (error instanceof ORPCError) {
             throw new Error(`${error.code}: ${error.message}`, { cause: error })
@@ -186,6 +197,77 @@ function forward(
       })
   }
   return router
+}
+
+const json = (output: unknown) => JSON.stringify(output, null, 2)
+
+const renderers: Readonly<Record<string, (output: unknown) => string>> = {
+  'account.addKey': (output) => AddKeyOutputSchema.parse(output).handle,
+  'account.list': (output) =>
+    alignColumns(
+      z
+        .array(AccountViewSchema)
+        .parse(output)
+        .map((view) => [
+          view.handle,
+          view.authMode ?? view.kind,
+          view.services.join(','),
+          view.autoGrant ? 'auto-grant' : '',
+        ]),
+    ),
+}
+
+function alignColumns(rows: readonly string[][]): string {
+  const widths: number[] = []
+  for (const row of rows) {
+    row.forEach((cell, column) => {
+      widths[column] = Math.max(widths[column] ?? 0, cell.length)
+    })
+  }
+  return rows
+    .map((row) =>
+      row
+        .map((cell, column) => cell.padEnd(widths[column] ?? 0))
+        .join('  ')
+        .trimEnd(),
+    )
+    .join('\n')
+}
+
+function stdinFieldOf(schema: unknown): { field: string; cliSchema: z.ZodType } | null {
+  if (!(schema instanceof z.ZodTuple)) return null
+  const items: readonly z.core.$ZodType[] = schema.def.items
+  const last = items.at(-1)
+  if (!(last instanceof z.ZodObject)) return null
+  const shape: Readonly<Record<string, z.core.$ZodType>> = last.shape
+  const field = Object.entries(shape).find(
+    ([, value]) => z.globalRegistry.get(value)?.stdin === true,
+  )?.[0]
+  if (field === undefined) return null
+  const rest = Object.fromEntries(Object.entries(shape).filter(([key]) => key !== field))
+  const [first, ...others] = [...items.slice(0, -1), z.object(rest)]
+  return { field, cliSchema: z.tuple([first, ...others]) }
+}
+
+function withField(input: unknown, field: string, value: string): unknown[] {
+  const last: unknown = Array.isArray(input) ? input.at(-1) : undefined
+  if (!Array.isArray(input) || typeof last !== 'object' || last === null) {
+    throw new Error('expected a tuple input that ends in options')
+  }
+  return [...input.slice(0, -1), { ...last, [field]: value }]
+}
+
+async function readStdinValue(field: string, path: readonly string[]): Promise<string> {
+  const command = path.map((key) => key.replaceAll(/[A-Z]/g, (c) => `-${c.toLowerCase()}`))
+  if (process.stdin.isTTY) {
+    throw new Error(
+      `BAD_REQUEST: ${field} is read from stdin, so pipe it in, for example: pbpaste | kurumi ${command.join(' ')} ...`,
+    )
+  }
+  const text = await Bun.stdin.text()
+  const value = text.replace(/\r?\n$/, '')
+  if (value === '') throw new Error(`BAD_REQUEST: stdin was empty, so there is no ${field}`)
+  return value
 }
 
 function writeLine(stream: NodeJS.WriteStream, args: unknown[]): void {
