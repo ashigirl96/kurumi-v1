@@ -18,6 +18,14 @@ export type ContainerDriver = {
   onExit(listener: (containerId: string, code: number) => void): () => void
 }
 
+export type ListedContainer = {
+  name: string
+  role: string
+  sessionId: string
+  containerId: string
+  state: string
+}
+
 type RunResult = Awaited<ReturnType<ContainerDriver['run']>>
 type Creation = {
   result: Promise<CliResult>
