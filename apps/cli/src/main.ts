@@ -11,7 +11,7 @@ import {
 import { contract as agentContract } from '@kurumi/agent/contract'
 import { contract as chatContract, type TerminalEvent } from '@kurumi/chat/contract'
 import { hostContract, type Meta } from '@kurumi/rpc/contract'
-import { createORPCClient } from '@orpc/client'
+import { createORPCClient, type ClientLink } from '@orpc/client'
 import { RPCLink } from '@orpc/client/fetch'
 import {
   isContractProcedure,
@@ -48,7 +48,22 @@ export async function main(argv: string[]): Promise<number> {
     },
   })
   if (argv[0] === 'chat') return chat(argv.slice(1), link)
-  const router = forward({ agent: agentContract, account: accountContract, ...hostContract }, link)
+  return runCommand(argv, {
+    contract: { agent: agentContract, account: accountContract, ...hostContract },
+    link,
+    stdin: { isTTY: process.stdin.isTTY, chunks: process.stdin },
+  })
+}
+
+export type Stdin = { isTTY: boolean; chunks: AsyncIterable<Uint8Array> }
+
+type Link = ClientLink<Record<string, never>>
+
+export async function runCommand(
+  argv: string[],
+  { contract, link, stdin }: { contract: AnyContractRouter; link: Link; stdin: Stdin },
+): Promise<number> {
+  const router = forward(contract, link, stdin)
   const cli = createCli({
     router,
     name: 'kurumi',
@@ -159,28 +174,32 @@ async function chat(argv: string[], link: RPCLink<Record<string, never>>): Promi
 
 function forward(
   contract: AnyContractRouter,
-  link: RPCLink<Record<string, never>>,
+  link: Link,
+  stdin: Stdin,
   path: string[] = [],
 ): ForwardingRouter {
   const router: ForwardingRouter = {}
   for (const [key, child] of Object.entries(contract)) {
     const childPath = [...path, key]
     if (!isContractProcedure(child)) {
-      const children = forward(child, link, childPath)
+      const children = forward(child, link, stdin, childPath)
       if (Object.keys(children).length > 0) router[key] = children
       continue
     }
     const { inputSchema, outputSchema } = child['~orpc']
     const meta: Meta = child['~orpc'].meta
     if (meta.cli !== true) continue
-    const stdin = stdinFieldOf(inputSchema)
+    const command = childPath
+      .map((name) => name.replaceAll(/[A-Z]/g, (c) => `-${c.toLowerCase()}`))
+      .join(' ')
+    const piped = stdinFieldOf(command, inputSchema)
     const render = renderers[childPath.join('.')] ?? json
     router[key] = os
       .meta(meta)
-      .input(stdin?.cliSchema ?? inputSchema ?? z.object({}))
+      .input(piped?.cliSchema ?? inputSchema ?? z.object({}))
       .handler(async ({ input }) => {
-        const sent = stdin
-          ? withField(input, stdin.field, await readStdinValue(stdin.field, childPath))
+        const sent = piped
+          ? withField(input, piped.field, await readStdinValue(stdin, command, piped))
           : input
         try {
           const output = await link.call(childPath, inputSchema ? sent : undefined, {
@@ -234,19 +253,53 @@ function alignColumns(rows: readonly string[][]): string {
     .join('\n')
 }
 
-function stdinFieldOf(schema: unknown): { field: string; cliSchema: z.ZodType } | null {
-  if (!(schema instanceof z.ZodTuple)) return null
-  const items: readonly z.core.$ZodType[] = schema.def.items
-  const last = items.at(-1)
-  if (!(last instanceof z.ZodObject)) return null
-  const shape: Readonly<Record<string, z.core.$ZodType>> = last.shape
-  const field = Object.entries(shape).find(
-    ([, value]) => z.globalRegistry.get(value)?.stdin === true,
-  )?.[0]
-  if (field === undefined) return null
-  const rest = Object.fromEntries(Object.entries(shape).filter(([key]) => key !== field))
+type StdinField = {
+  field: string
+  schema: z.core.$ZodType
+  maxLength: number
+  cliSchema: z.ZodType
+}
+
+function stdinFieldOf(command: string, schema: unknown): StdinField | null {
+  if (!(schema instanceof z.ZodType)) return null
+  const [only, ...more] = stdinMarkers(
+    z.toJSONSchema(schema, { io: 'input', unrepresentable: 'any' }),
+  )
+  if (!only) return null
+  const refuse = (why: string) => new Error(`kurumi ${command} cannot read stdin: ${why}`)
+  const items: readonly z.core.$ZodType[] = schema instanceof z.ZodTuple ? schema.def.items : []
+  const options = items.at(-1)
+  const field = only.path
+    .join('/')
+    .match(new RegExp(`^prefixItems/${items.length - 1}/properties/([^/]+)(?:/anyOf/\\d+)*$`))?.[1]
+  if (more.length > 0 || field === undefined || !(options instanceof z.ZodObject)) {
+    throw refuse('only one field of the trailing options object may be marked stdin')
+  }
+  if (typeof only.maxLength !== 'number') throw refuse(`${field} needs a maximum length`)
+  const { [field]: fieldSchema, ...rest } = options.shape
+  if (fieldSchema === undefined) throw refuse(`${field} is not in the options object`)
   const [first, ...others] = [...items.slice(0, -1), z.object(rest)]
-  return { field, cliSchema: z.tuple([first, ...others]) }
+  return {
+    field,
+    schema: fieldSchema,
+    maxLength: only.maxLength,
+    cliSchema: z.tuple([first, ...others]),
+  }
+}
+
+function stdinMarkers(
+  node: unknown,
+  path: string[] = [],
+): { path: string[]; maxLength: unknown }[] {
+  if (typeof node !== 'object' || node === null) return []
+  const here =
+    'stdin' in node && node.stdin === true
+      ? [{ path, maxLength: 'maxLength' in node ? node.maxLength : undefined }]
+      : []
+  return [
+    ...here,
+    ...Object.entries(node).flatMap(([key, child]) => stdinMarkers(child, [...path, key])),
+  ]
 }
 
 function withField(input: unknown, field: string, value: string): unknown[] {
@@ -257,16 +310,43 @@ function withField(input: unknown, field: string, value: string): unknown[] {
   return [...input.slice(0, -1), { ...last, [field]: value }]
 }
 
-async function readStdinValue(field: string, path: readonly string[]): Promise<string> {
-  const command = path.map((key) => key.replaceAll(/[A-Z]/g, (c) => `-${c.toLowerCase()}`))
-  if (process.stdin.isTTY) {
+async function readStdinValue(
+  stdin: Stdin,
+  command: string,
+  { field, schema, maxLength }: StdinField,
+): Promise<string> {
+  if (stdin.isTTY) {
     throw new Error(
-      `BAD_REQUEST: ${field} is read from stdin, so pipe it in, for example: pbpaste | kurumi ${command.join(' ')} ...`,
+      `BAD_REQUEST: ${field} is read from stdin, so pipe it in, for example: pbpaste | kurumi ${command} ...`,
     )
   }
-  const text = await Bun.stdin.text()
+  // A UTF-16 unit takes at most 3 UTF-8 bytes, and the value may end in a CRLF.
+  const byteLimit = maxLength * 3 + 2
+  const chunks: Uint8Array[] = []
+  let bytes = 0
+  for await (const chunk of stdin.chunks) {
+    bytes += chunk.byteLength
+    if (bytes > byteLimit) {
+      throw new Error(
+        `BAD_REQUEST: stdin is longer than the ${maxLength} characters ${field} may hold`,
+      )
+    }
+    chunks.push(chunk)
+  }
+  let text: string
+  try {
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks))
+  } catch (error) {
+    throw new Error(`BAD_REQUEST: stdin is not valid UTF-8, so it holds no ${field}`, {
+      cause: error,
+    })
+  }
   const value = text.replace(/\r?\n$/, '')
   if (value === '') throw new Error(`BAD_REQUEST: stdin was empty, so there is no ${field}`)
+  const parsed = z.safeParse(schema, value)
+  if (!parsed.success) {
+    throw new Error(`BAD_REQUEST: ${parsed.error.issues.map(({ message }) => message).join('; ')}`)
+  }
   return value
 }
 
