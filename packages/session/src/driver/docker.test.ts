@@ -872,6 +872,28 @@ test('kill lets a replacement create settle after its predecessor cleanup finish
   expect(killed).toBe(false)
 })
 
+test('kill rejects when a replacement create reaches its cleanup deadline', async () => {
+  const cli = new FakeCli()
+  const driver = createDockerDriver({ install: 'test', image, cli, timeoutMs: 30 })
+  const failed = driver.run(agentSpec())
+  ;(await call(cli, 0)).proc.complete({ code: 1 })
+  ;(await call(cli, 1)).proc.complete({ code: 1 })
+  ;(await call(cli, 2)).proc.complete({ code: 1 })
+  expect((await failed).ok).toBe(false)
+  const retry = driver.run({ ...agentSpec(), containerId: 'ctr-retry' })
+  ;(await call(cli, 3)).proc.complete({ code: 1, stderr: 'No such container: old' })
+  const create = await call(cli, 4)
+  const killing = driver.kill('ctr-retry', 0).then(
+    () => 'removed',
+    (error: unknown) => String(error),
+  )
+  const outcome = await Promise.race([killing, Bun.sleep(250).then(() => 'still waiting')])
+  create.proc.complete({ code: null })
+  expect((await retry).ok).toBe(false)
+  await expect(driver.stop()).rejects.toThrow('cleanup')
+  expect(outcome).toContain('cleanup')
+})
+
 test.each(['agent', 'probe'] as const)(
   'stop removes a late daemon create for %s even when killing its CLI would finish first',
   async (role) => {
