@@ -171,7 +171,10 @@ export async function forward<Principal>(
   }
   if (prepared.kind === 'refused') {
     const { status, headers, body } = refusalResponse(prepared.refusal)
-    res.writeHead(status, headers).end(body)
+    const respond = () => res.writeHead(status, headers).end(body)
+    req.resume()
+    if (req.complete) respond()
+    else req.once('end', respond)
     return
   }
   const { options, account } = prepared

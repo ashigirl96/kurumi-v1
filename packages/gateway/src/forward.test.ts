@@ -335,6 +335,44 @@ test('a group with no account is refused with a JSON 404 and nothing goes upstre
   expect(upstream.requests).toEqual([])
 })
 
+async function postToUnconnectedGroup(body: Buffer) {
+  const { upstream, tunnel } = await setupCredentials()
+  const response = Promise.withResolvers<{ status?: number; body: string }>()
+  const client = request(
+    {
+      hostname: 'api.anthropic.com',
+      port: 443,
+      path: '/v1/messages',
+      method: 'POST',
+      agent: tunnel.agent,
+      headers: { 'content-length': String(body.length) },
+    },
+    (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (chunk: Buffer) => chunks.push(chunk))
+      res.on('error', response.reject)
+      res.on('end', () =>
+        response.resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() }),
+      )
+    },
+  )
+  client.on('error', response.reject)
+  client.end(body)
+  return { ...(await response.promise), upstreamRequests: upstream.requests }
+}
+
+test('a refused POST with a 16 MiB body still reads the JSON refusal', async () => {
+  const body = Buffer.alloc(16 * 1024 * 1024, 97)
+  // An early answer resets the connection only when it wins a race, about two attempts in three.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await postToUnconnectedGroup(body)
+
+    expect(response.status).toBe(404)
+    expect(JSON.parse(response.body)).toMatchObject({ error: 'account_not_connected' })
+    expect(response.upstreamRequests).toEqual([])
+  }
+})
+
 test('two accounts and no default are refused as ambiguous, listing both', async () => {
   const { upstream, tunnel, addKey } = await setupCredentials()
   addKey('main', secrets.main)

@@ -45,7 +45,7 @@ export function refusalResponse(refusal: GatewayRefusal): {
     headers: {
       'content-type': 'application/json',
       'content-length': String(Buffer.byteLength(body)),
-      // The request body is never read, so the connection cannot carry another request.
+      // The WebSocket path ends the socket after a refusal, and both paths share these headers.
       connection: 'close',
       // The Anthropic SDK retries a 409 unless told not to.
       'x-should-retry': 'false',
