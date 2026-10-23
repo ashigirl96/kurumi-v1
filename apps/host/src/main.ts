@@ -134,7 +134,6 @@ export async function startHost(config: HostConfig) {
           }),
         },
         supervision: {
-          inventory: docker,
           staleAfterMs: environment.KURUMI_STALE_AFTER_MS,
           intervalMs: environment.KURUMI_RECONCILE_INTERVAL_MS,
         },
@@ -177,10 +176,10 @@ export async function startHost(config: HostConfig) {
     })
     const rpc = createRpcFronts(router, contextFor)
     const agentHandler = new RPCHandler(router)
-    const adopted = sessionLedger.start()
+    const started = sessionLedger.start()
     admission = startAdmission({
       bind: async (probeNonce) => {
-        await adopted
+        await sessionLedger.adopted()
         return startAgentPort({
           bind: config.agentPort,
           probeNonce,
@@ -209,7 +208,6 @@ export async function startHost(config: HostConfig) {
         process.stdout.write(`${JSON.stringify({ kind: 'gateway.admission', message })}\n`)
       },
     })
-    await adopted
     const stale = lstatSync(socket, { throwIfNoEntry: false })
     if (stale && !stale.isSocket()) throw new Error(`${socket} exists and is not a socket`)
     rmSync(socket, { force: true })
@@ -220,6 +218,7 @@ export async function startHost(config: HostConfig) {
     } finally {
       process.umask(umask)
     }
+    await started
     process.stdout.write(
       `${JSON.stringify({ kind: 'host.runtime', install, agentPort: config.agentPort.port, image: environment.KURUMI_AGENT_IMAGE })}\n`,
     )
@@ -237,20 +236,23 @@ export async function startHost(config: HostConfig) {
 }
 
 if (import.meta.main) {
+  const starting = startHost(loadConfig(process.env))
+  const shutdown = () => {
+    starting
+      .then((host) => host.stop())
+      .then(() => process.exit(0))
+      .catch((error: unknown) => {
+        process.stderr.write(`${String(error)}\n`)
+        process.exit(1)
+      })
+  }
+  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', shutdown)
   try {
-    const host = await startHost(loadConfig(process.env))
-    const shutdown = () => {
-      host
-        .stop()
-        .then(() => process.exit(0))
-        .catch((error: unknown) => {
-          process.stderr.write(`${String(error)}\n`)
-          process.exit(1)
-        })
-    }
-    process.on('SIGTERM', shutdown)
-    process.on('SIGINT', shutdown)
+    await starting
   } catch (error) {
+    process.off('SIGTERM', shutdown)
+    process.off('SIGINT', shutdown)
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
   }
