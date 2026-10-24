@@ -974,3 +974,32 @@ test('a passthrough CONNECT to a non-public address is logged as refused', async
     },
   ])
 })
+
+test('an injected request names the service of the injection the ledger chose', () => {
+  const handle = accountHandle('anthropic', 'main')
+  const inject = credentialInject({
+    credentialFor: (_principal, egress) => ({
+      kind: 'inject',
+      injection: {
+        service: 'anthropic-api',
+        handle,
+        accountId: 'a1',
+        apply: () => ({ path: egress.path, headers: egress.headers }),
+        toJSON: () => {
+          throw new Error('an injection is never serialized')
+        },
+      },
+    }),
+  })
+  expect(
+    inject({
+      principal: { agentGroupId: 'g1' },
+      host: 'api.anthropic.com',
+      port: 443,
+      method: 'POST',
+      path: '/v1/messages',
+      headers: new Headers(),
+      rawHeaders: [],
+    }),
+  ).toMatchObject({ account: { handle, service: 'anthropic-api' } })
+})

@@ -10,7 +10,6 @@ import {
   type AccountHandle,
   type AccountLedger,
   type CredentialPrincipal,
-  type EgressRequest,
   type ServiceId,
 } from '@kurumi/account/server'
 
@@ -105,32 +104,19 @@ async function pinPublicUpstream(
   return { kind: 'pinned', lookup: pinnedLookup(addresses) }
 }
 
-function serviceFromMethodRefusal(
-  ledger: Pick<AccountLedger, 'credentialFor'>,
-  principal: CredentialPrincipal,
-  egress: EgressRequest,
-): ServiceId {
-  const probe = ledger.credentialFor(principal, { ...egress, method: 'TRACE' })
-  if (probe.kind === 'refuse' && probe.refusal.code === 'method_not_allowed') {
-    return probe.refusal.service
-  }
-  throw new Error(`credentialFor injected into ${egress.host} but names no service for it`)
-}
-
 export function credentialInject(
   ledger: Pick<AccountLedger, 'credentialFor'>,
 ): ForwardDeps<CredentialPrincipal>['inject'] {
   return ({ principal, host, port, method, path, headers, rawHeaders }) => {
     if (port !== 443) return { refusal: { code: 'port_not_allowed', host, port } }
-    const egress = { host, method, path, headers, rawHeaders }
-    const decision = ledger.credentialFor(principal, egress)
+    const decision = ledger.credentialFor(principal, { host, method, path, headers, rawHeaders })
     switch (decision.kind) {
       case 'inject':
         return {
           ...decision.injection.apply(),
           account: {
             handle: decision.injection.handle,
-            service: serviceFromMethodRefusal(ledger, principal, egress),
+            service: decision.injection.service,
           },
         }
       case 'refuse':
