@@ -105,8 +105,7 @@ async function pinPublicUpstream(
   return { kind: 'pinned', lookup: pinnedLookup(addresses) }
 }
 
-/** `Injection` names no service, and `credentialFor` names it in the refusal of a method it never credentials, before it selects an account. */
-function injectedService(
+function serviceFromMethodRefusal(
   ledger: Pick<AccountLedger, 'credentialFor'>,
   principal: CredentialPrincipal,
   egress: EgressRequest,
@@ -131,7 +130,7 @@ export function credentialInject(
           ...decision.injection.apply(),
           account: {
             handle: decision.injection.handle,
-            service: injectedService(ledger, principal, egress),
+            service: serviceFromMethodRefusal(ledger, principal, egress),
           },
         }
       case 'refuse':
@@ -218,8 +217,7 @@ function forwardedDecision({ account }: Forwarded): EgressDecision {
     : { decision: 'passed' }
 }
 
-/** The query is cut because a selector, or a key in a query slot, travels there. */
-function loggedPath(path: string): string {
+function pathWithoutQuery(path: string): string {
   const end = path.search(/[?#]/)
   return end === -1 ? path : path.slice(0, end)
 }
@@ -238,7 +236,7 @@ function egressRecorder<Principal>(
       at,
       host: context.target.host,
       method: req.method ?? 'GET',
-      path: loggedPath(req.url ?? '/'),
+      path: pathWithoutQuery(req.url ?? '/'),
       status,
       durationMs: Math.round(performance.now() - started),
     })
