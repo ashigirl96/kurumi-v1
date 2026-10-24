@@ -6,15 +6,30 @@ import { join } from 'node:path'
 const repo = join(import.meta.dir, '..')
 const sdk = '@anthropic-ai/claude-agent-sdk'
 
-test('the agent image installs the Agent SDK at the version the catalog pins', () => {
-  const manifest: { workspaces: { catalog: Record<string, string> } } = JSON.parse(
-    readFileSync(join(repo, 'package.json'), 'utf8'),
-  )
-  const dockerfile = readFileSync(join(repo, 'container/Dockerfile'), 'utf8')
+const read = (path: string) => readFileSync(join(repo, path), 'utf8')
 
-  expect(dockerfile.match(/^ARG CLAUDE_AGENT_SDK_VERSION=(\S+)$/m)?.[1]).toBe(
-    manifest.workspaces.catalog[sdk],
+test('the agent image installs the Agent SDK from its lockfile at the version the catalog pins', () => {
+  const manifest: { workspaces: { catalog: Record<string, string> } } = JSON.parse(
+    read('package.json'),
   )
+  const pinned = manifest.workspaces.catalog[sdk]
+  const image: { dependencies: Record<string, string> } = JSON.parse(read('container/package.json'))
+  const dockerfile = read('container/Dockerfile')
+
+  expect(image.dependencies[sdk]).toBe(pinned)
+  expect(Bun.JSONC.parse(read('container/bun.lock'))).toMatchObject({
+    packages: {
+      [sdk]: [`${sdk}@${pinned}`, '', expect.anything(), expect.stringMatching(/^sha512-/)],
+    },
+  })
+  expect(dockerfile).toMatch(/^COPY package\.json bun\.lock \.\/$/m)
+  expect(dockerfile).toMatch(/^RUN bun install --frozen-lockfile /m)
+})
+
+test('the agent image runs the runner as the unprivileged bun user, never root', () => {
+  const users = [...read('container/Dockerfile').matchAll(/^USER (\S+)$/gm)].map((line) => line[1])
+
+  expect(users.at(-1)).toBe('bun')
 })
 
 test('runner.js imports the Agent SDK from the image instead of bundling it', async () => {
