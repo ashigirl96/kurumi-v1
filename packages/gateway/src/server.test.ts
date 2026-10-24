@@ -1,5 +1,5 @@
 import { Database } from 'bun:sqlite'
-import { afterAll, expect, test } from 'bun:test'
+import { afterAll, afterEach, expect, jest, test } from 'bun:test'
 import { randomBytes, X509Certificate } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { connect } from 'node:net'
@@ -336,6 +336,9 @@ const egressLogs: EgressLog[] = []
 afterAll(() => {
   for (const log of egressLogs.splice(0)) log.stop()
 })
+afterEach(() => {
+  jest.useRealTimers()
+})
 
 function startEgressLog(
   db: ReturnType<typeof openDb>['db'],
@@ -359,6 +362,30 @@ test('recorded requests reach egress_log together after the flush interval, not 
   expect(countRows(sqlite)).toBe(0)
   await Bun.sleep(60)
   expect(countRows(sqlite)).toBe(4)
+})
+
+test('with no interval given, a recorded request reaches egress_log one second later', () => {
+  jest.useFakeTimers()
+  const { db, sqlite } = openDb()
+  const log = startEgressLog(db)
+  log.record(egressEvent())
+  jest.advanceTimersByTime(999)
+  expect(countRows(sqlite)).toBe(0)
+  jest.advanceTimersByTime(1)
+  expect(countRows(sqlite)).toBe(1)
+})
+
+test('steady traffic is written every second while it continues, not only after it stops', () => {
+  jest.useFakeTimers()
+  const { db, sqlite } = openDb()
+  const log = startEgressLog(db)
+  const counts: (number | undefined)[] = []
+  for (let tick = 1; tick <= 30; tick++) {
+    log.record(egressEvent())
+    jest.advanceTimersByTime(100)
+    if (tick % 10 === 0) counts.push(countRows(sqlite))
+  }
+  expect(counts).toEqual([10, 20, 30])
 })
 
 test('stopping the log writes what is still buffered, and later records are dropped', async () => {
