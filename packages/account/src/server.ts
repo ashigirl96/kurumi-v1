@@ -175,12 +175,12 @@ const credentialedMethods: readonly string[] = ['GET', 'HEAD', 'POST', 'PUT', 'P
 
 type ModeBeta = { header: string; token: string; mode: AuthMode }
 
-/** Anthropic answers an OAuth bearer only when the request lists this beta, and a container keeps the mode it started in. */
+/** Anthropic answers an OAuth bearer only when the request lists this beta. */
 const modeBetaOf: Partial<Record<ServiceId, ModeBeta>> = {
   'anthropic-api': { header: 'anthropic-beta', token: 'oauth-2025-04-20', mode: 'oauth-token' },
 }
 
-function listModeBeta(
+function setBetaForAccountMode(
   headers: Headers,
   { header, token, mode }: ModeBeta,
   authMode: AuthMode | null,
@@ -238,7 +238,7 @@ function injectionFor({
       const headers = new Headers(stripped.headers)
       const url = new URL(stripped.url)
       for (const header of slotHeaders) headers.delete(header)
-      if (modeBeta) listModeBeta(headers, modeBeta, row.authMode)
+      if (modeBeta) setBetaForAccountMode(headers, modeBeta, row.authMode)
       switch (slot.kind) {
         case 'bearer':
           headers.set('authorization', `Bearer ${secret}`)
