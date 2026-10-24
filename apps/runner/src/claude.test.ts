@@ -71,6 +71,8 @@ test('a lost transcript starts a fresh conversation instead of failing every tur
     sdk.forget()
     await host.send('still there')
     expect(await host.reply()).toBe('model heard: still there')
+    await host.send('and again')
+    expect(await host.reply()).toBe('model heard: still there | and again')
   } finally {
     controller.abort()
     await running
