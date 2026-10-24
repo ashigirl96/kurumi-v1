@@ -112,8 +112,18 @@ export async function startAgentPort<Principal extends object>(deps: {
   const resolve = deps.resolve ?? ((host: string) => lookup(host, { all: true }))
   const listeners = new Map<string, Promise<HostListener<Principal>>>()
   const sockets = new Map<Duplex, (() => void) | undefined>()
+  const inFlight = new Set<Promise<unknown>>()
   let stopping = false
   let stopped: Promise<void> | undefined
+
+  // stop() waits for every exchange so its egress row is recorded before the caller stops the log.
+  function hold(work: Promise<unknown>, closed?: Duplex | ServerResponse): void {
+    const done: Promise<unknown> = Promise.allSettled([
+      work,
+      closed && new Promise((settle) => closed.once('close', settle)),
+    ]).then(() => inFlight.delete(done))
+    inFlight.add(done)
+  }
 
   function track(socket: Duplex): void {
     sockets.set(socket, undefined)
@@ -166,15 +176,16 @@ export async function startAgentPort<Principal extends object>(deps: {
           return
         }
         const inner = createServer((req, res) => {
-          void handleRequest(tunnel, req, res).catch(() => {
+          const handled = handleRequest(tunnel, req, res).catch(() => {
             if (res.destroyed) return
             if (res.headersSent) res.destroy()
             else res.writeHead(500, { connection: 'close' }).end()
           })
+          hold(handled, res)
         })
         inner.on('upgrade', (req, client, head) => {
           client.pause()
-          void (async () => {
+          const upgraded = (async () => {
             const principal = await tunnel.authenticate()
             if (client.destroyed || tunnel.signal.aborted) return
             if (principal === null) {
@@ -191,6 +202,7 @@ export async function startAgentPort<Principal extends object>(deps: {
           })().catch(() => {
             if (!client.destroyed) rejectConnect(client, 502)
           })
+          hold(upgraded, client)
         })
         inner.on('clientError', (_error, client) => client.destroy())
         socket.once('close', () => inner.removeAllListeners())
@@ -352,10 +364,11 @@ export async function startAgentPort<Principal extends object>(deps: {
   outer.on('connection', track)
   outer.on('clientError', (_error, socket) => socket.destroy())
   outer.on('connect', (req, socket, head) => {
-    void handleConnect(req, socket, head).catch((error: unknown) => {
+    const connected = handleConnect(req, socket, head).catch((error: unknown) => {
       if (socket.destroyed) return
       rejectConnect(socket, 502, error instanceof CaExpiredError ? `${error.message}\n` : '')
     })
+    hold(connected)
   })
 
   function stop(): Promise<void> {
@@ -374,6 +387,7 @@ export async function startAgentPort<Principal extends object>(deps: {
       )
       listeners.clear()
       await outerClosed
+      await Promise.all(inFlight)
     })()
     return stopped
   }

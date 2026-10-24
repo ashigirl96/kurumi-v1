@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite'
 import { afterAll, expect, test } from 'bun:test'
 import { randomBytes, X509Certificate } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { rootCertificates } from 'node:tls'
@@ -19,11 +20,13 @@ import {
   migrations,
   proxyEnv,
   stageCaBundle,
+  startAgentPort,
   type EgressDecision,
   type EgressEvent,
   type EgressLog,
   type EgressPrincipal,
 } from './server.ts'
+import { openTestTunnel, sendTestRequest } from './testing.ts'
 
 const dirs: string[] = []
 afterAll(() => {
@@ -470,4 +473,143 @@ test('status reports admission, the Agent Port address, and the SHA-256 fingerpr
       caPem: ca.certPem,
     }),
   ).toMatchObject({ admission: 'bind_failed', detail: 'port in use' })
+})
+
+async function until(condition: () => boolean) {
+  for (let tries = 0; !condition(); tries++) {
+    if (tries > 200) throw new Error('condition never held')
+    await Bun.sleep(5)
+  }
+}
+
+const anthropic = { host: 'api.anthropic.com', port: 443 }
+
+type LoggedPortDeps = Parameters<typeof startAgentPort<EgressPrincipal>>[0]
+
+async function startLoggedPort(
+  forward: Partial<LoggedPortDeps['forward']> = {},
+  deps: Partial<LoggedPortDeps> = {},
+) {
+  const ca = await createCertificateAuthority()
+  const leaf = await ca.leafFor(anthropic.host)
+  let received = 0
+  const silent = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    idleTimeout: 0,
+    tls: { key: leaf.keyPem, cert: leaf.certPem },
+    fetch: () => {
+      received++
+      return new Promise<Response>(() => {})
+    },
+  })
+  const { db, sqlite } = openDb()
+  const log = startEgressLog(db, { flushMs: 60_000 })
+  const port = await startAgentPort<EgressPrincipal>({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: () => ({ agentGroupId: 'g1', sessionId: 's1' }),
+    intercepts: (host) => host === anthropic.host,
+    ca,
+    forward: {
+      upstream: { ...anthropic, address: '127.0.0.1', port: silent.port, caPem: ca.certPem },
+      inject: ({ path, headers }) => ({ path, headers }),
+      log: log.record,
+      ...forward,
+    },
+    ...deps,
+  })
+  const rowsAfterHostStop = async () => {
+    await port.stop()
+    log.stop()
+    await silent.stop(true)
+    return sqlite.query('SELECT method, path, decision, status FROM egress_log').all()
+  }
+  return { port, received: () => received, rowsAfterHostStop }
+}
+
+test('a request still waiting on upstream when the Agent Port stops is written by the log stop that follows', async () => {
+  const { port, received, rowsAfterHostStop } = await startLoggedPort()
+  const tunnel = await openTestTunnel({
+    proxyPort: port.port,
+    token: 't',
+    caPem: port.caPem,
+    target: anthropic,
+  })
+  sendTestRequest(tunnel, { path: '/v1/models' }).catch(ignore)
+  await until(() => received() === 1)
+
+  expect(await rowsAfterHostStop()).toEqual([
+    expect.objectContaining({ method: 'GET', path: '/v1/models', decision: 'passed' }),
+  ])
+  tunnel.close()
+})
+
+test('a WebSocket upgrade still waiting on upstream when the Agent Port stops is written by the log stop that follows', async () => {
+  const { port, received, rowsAfterHostStop } = await startLoggedPort()
+  const tunnel = await openTestTunnel({
+    proxyPort: port.port,
+    token: 't',
+    caPem: port.caPem,
+    target: anthropic,
+  })
+  tunnel.socket.write(
+    `GET /v1/stream HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\n\r\n`,
+  )
+  await until(() => received() === 1)
+
+  expect(await rowsAfterHostStop()).toEqual([
+    expect.objectContaining({ method: 'GET', path: '/v1/stream', decision: 'passed' }),
+  ])
+  tunnel.close()
+})
+
+test('a request whose injection is still deciding when the Agent Port stops is written by the log stop that follows', async () => {
+  let injecting = false
+  const { port, rowsAfterHostStop } = await startLoggedPort({
+    inject: async ({ path, headers }) => {
+      injecting = true
+      await Bun.sleep(50)
+      return { path, headers }
+    },
+  })
+  const tunnel = await openTestTunnel({
+    proxyPort: port.port,
+    token: 't',
+    caPem: port.caPem,
+    target: anthropic,
+  })
+  sendTestRequest(tunnel, { path: '/v1/models' }).catch(ignore)
+  await until(() => injecting)
+
+  expect(await rowsAfterHostStop()).toEqual([
+    expect.objectContaining({ path: '/v1/models', decision: 'passed', status: null }),
+  ])
+  tunnel.close()
+})
+
+test('a CONNECT still resolving when the Agent Port stops is written as refused by the log stop that follows', async () => {
+  let resolving = false
+  const { port, rowsAfterHostStop } = await startLoggedPort(
+    {},
+    {
+      resolve: async () => {
+        resolving = true
+        await Bun.sleep(50)
+        return [{ address: '127.0.0.2', family: 4 }]
+      },
+      hostAddresses: () => [],
+    },
+  )
+  const client = connect(port.port, '127.0.0.1')
+  client.on('error', ignore)
+  client.write(
+    'CONNECT private.test:443 HTTP/1.1\r\nHost: private.test:443\r\n' +
+      `Proxy-Authorization: Basic ${Buffer.from('s:t').toString('base64')}\r\n\r\n`,
+  )
+  await until(() => resolving)
+
+  expect(await rowsAfterHostStop()).toEqual([
+    expect.objectContaining({ method: 'CONNECT', path: 'private.test:443', decision: 'refused' }),
+  ])
+  client.destroy()
 })
