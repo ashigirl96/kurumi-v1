@@ -143,7 +143,7 @@ export function createEgressApproval(deps: {
   db: Db
   accounts: Pick<AccountLedger, 'accountIdOf'>
   approvals: GatewayApprovals
-  /** Returns a receipt and never throws. */
+  /** Queues `text` for the session once per key. */
   notify(notice: SessionNotice): unknown
   holdMs?: number
   now?: () => number

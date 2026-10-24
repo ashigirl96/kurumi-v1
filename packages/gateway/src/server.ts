@@ -47,7 +47,7 @@ export type {
 } from './forward.ts'
 export { startAgentPort, type AgentPort } from './port.ts'
 export { REFUSAL_STATUS, type GatewayRefusal, type HoldRefusal } from './refusal.ts'
-export { createRuleStore, type RuleStore } from './rules.ts'
+export type { RuleStore } from './rules.ts'
 export type { CertificateAuthority } from './ca.ts'
 
 const CA_ROW = 1
