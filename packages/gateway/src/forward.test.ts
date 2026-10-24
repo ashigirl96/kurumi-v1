@@ -1515,6 +1515,26 @@ describe('held requests', () => {
     expect(allowance(approvalId(0))).toMatchObject({ state: 'pending' })
   })
 
+  test('held requests on one keep-alive tunnel leave no listeners behind', async () => {
+    const { gate, tunnel, requested, approvalId } = await setupHeld()
+    const warnings: string[] = []
+    const warned = (warning: Error) => warnings.push(warning.message)
+    process.on('warning', warned)
+    stops.push(() => {
+      process.off('warning', warned)
+    })
+
+    for (let index = 0; index < 12; index++) {
+      const response = sendMessage(tunnel, prompt(`keep-alive ${index}`))
+      await until(() => requested.length === index + 1)
+      await gate.decided({ id: approvalId(index) }, 'approve')
+      expect((await response).status).toBe(200)
+    }
+    await Bun.sleep(20)
+
+    expect(warnings).toEqual([])
+  })
+
   test('a WebSocket upgrade an approve rule covers waits and is refused when denied', async () => {
     const { gate, tunnel, requested, approvalId } = await setupHeld()
     gate.rules.add({
