@@ -84,7 +84,7 @@ export function canonicalPath(raw: string): CanonicalPath {
     : { kind: 'canonical', path: decoded }
 }
 
-const normalizeHost = (host: string) => host.toLowerCase().replace(/\.$/, '')
+export const normalizeHost = (host: string) => host.toLowerCase().replace(/\.$/, '')
 
 function foldPath(path: string): string {
   const lower = path.toLowerCase()

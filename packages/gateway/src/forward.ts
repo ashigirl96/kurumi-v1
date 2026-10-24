@@ -247,7 +247,7 @@ function forwardedDecision({ account }: Forwarded): EgressDecision {
     : { decision: 'passed' }
 }
 
-function pathWithoutQuery(path: string): string {
+export function pathWithoutQuery(path: string): string {
   const end = path.search(/[?#]/)
   return end === -1 ? path : path.slice(0, end)
 }

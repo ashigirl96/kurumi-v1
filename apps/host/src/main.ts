@@ -265,7 +265,7 @@ export async function startHost(config: HostConfig) {
     const egressApproval = createEgressApproval({
       db,
       accounts: accountLedger,
-      approvals: { request: (tx, input) => approvalLedger.request(tx, input) },
+      approvals: approvalLedger,
       notify: (notice) => sessionLedger.notify(notice),
     })
     const ledgers = {

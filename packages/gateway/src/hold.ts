@@ -6,9 +6,9 @@ import { transaction, type Db, type Tx } from '@kurumi/rpc/server'
 import { and, asc, count, eq, gt } from 'drizzle-orm'
 
 import type { EgressPrincipal } from './egress-log.ts'
-import type { EgressGate, ScreenInput, Screened } from './forward.ts'
+import { pathWithoutQuery, type EgressGate, type ScreenInput, type Screened } from './forward.ts'
 import type { HoldRefusal } from './refusal.ts'
-import { createRuleStore, evaluate, type RuleId, type RuleStore } from './rules.ts'
+import { createRuleStore, evaluate, normalizeHost, type RuleId, type RuleStore } from './rules.ts'
 import { egressAllowance } from './schema.ts'
 
 export type GatewayApprovals = {
@@ -58,13 +58,6 @@ type HeldRequest = {
 }
 
 const sha256 = (data: string | Buffer) => createHash('sha256').update(data)
-
-const normalizeHost = (host: string) => host.toLowerCase().replace(/\.$/, '')
-
-function pathWithoutQuery(path: string): string {
-  const end = path.search(/[?#]/)
-  return end === -1 ? path : path.slice(0, end)
-}
 
 function readBody(
   body: Readable | null,
@@ -168,12 +161,7 @@ export function createEgressApproval(deps: {
       .select({ approvalId: egressAllowance.approvalId })
       .from(egressAllowance)
       .where(
-        and(
-          sameRequest,
-          eq(egressAllowance.accountHandle, account.handle),
-          eq(egressAllowance.state, 'granted'),
-          gt(egressAllowance.expiresAt, at),
-        ),
+        and(sameRequest, eq(egressAllowance.state, 'granted'), gt(egressAllowance.expiresAt, at)),
       )
       .orderBy(asc(egressAllowance.expiresAt))
       .get()
@@ -299,18 +287,8 @@ export function createEgressApproval(deps: {
       ).digest(),
     }
     const admission = transaction(deps.db, (tx) => admit(tx, held))
-    switch (admission.kind) {
-      case 'pass':
-        return { kind: 'forward', body }
-      case 'refuse':
-        return admission
-      case 'wait':
-        break
-      default: {
-        const unknown: never = admission
-        return unknown
-      }
-    }
+    if (admission.kind === 'pass') return { kind: 'forward', body }
+    if (admission.kind === 'refuse') return admission
     const { approvalId } = admission
     input.held()
     const end = await wait(approvalId, input.signal)
@@ -424,7 +402,7 @@ export function createEgressApproval(deps: {
             settle('denied')
             return
           }
-          if (allowanceOf(approval.id)?.state === 'denied') notify()
+          notify()
           return
         }
         default: {
