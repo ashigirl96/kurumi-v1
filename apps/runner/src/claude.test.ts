@@ -150,37 +150,42 @@ test('a provider refusal posts a notice with its status and next step, and the r
   }
 })
 
-test('each reply keeps its id, so a re-run turn neither repeats a filled reply nor stops the runner', async () => {
+async function loseRunnerMidTurn(host: Awaited<ReturnType<typeof startHost>>, replies: string[]) {
+  const controller = new AbortController()
+  const lost = runRunner({ url: host.url, token: host.token, signal: controller.signal })
+  for (const reply of replies) expect(await host.reply()).toBe(reply)
+  await host.revoke()
+  controller.abort()
+  await lost
+}
+
+test('a re-run turn keeps the replies its lost run posted and adds its own after them', async () => {
   const host = await startHost()
   sdk.respond = (call) =>
     (async function* () {
       yield sdk.assistant('first draft')
+      yield sdk.assistant('Let me check first.')
       await untilAborted(call)
     })()
-  const first = new AbortController()
-  const lost = runRunner({ url: host.url, token: host.token, signal: first.signal })
+  const controller = new AbortController()
   try {
-    expect(await host.reply()).toBe('first draft')
-    await host.revoke()
-    first.abort()
-    await lost
+    await loseRunnerMidTurn(host, ['first draft', 'Let me check first.'])
 
     sdk.respond = (call) =>
       (async function* () {
         if (call.prompt === 'hello') {
-          yield sdk.assistant('second draft')
-          yield sdk.assistant('closing')
+          yield sdk.assistant('first draft')
+          yield sdk.assistant('The answer is 42.')
         } else yield sdk.assistant(`answer to ${call.prompt}`)
         yield sdk.success('ses-rerun')
       })()
     await host.send('next')
-    const second = new AbortController()
     const replacement = runRunner({
       url: host.url,
       token: host.latestToken(),
-      signal: second.signal,
+      signal: controller.signal,
     })
-    expect(await host.reply()).toBe('closing')
+    expect(await host.reply()).toBe('The answer is 42.')
     expect(await host.reply()).toBe('answer to next')
     expect(
       host.db
@@ -188,12 +193,44 @@ test('each reply keeps its id, so a re-run turn neither repeats a filled reply n
         .from(outboundMessage)
         .all()
         .map((row) => row.content),
-    ).toEqual(['first draft', 'closing', 'answer to next'])
+    ).toEqual(['first draft', 'Let me check first.', 'The answer is 42.', 'answer to next'])
     await waitFor(allCompleted(host), 'both lines completed')
-    second.abort()
+    controller.abort()
     await replacement
   } finally {
-    first.abort()
+    controller.abort()
+    await host.stop()
+  }
+})
+
+test('a turn lost after the model started resumes that conversation when it re-runs', async () => {
+  const host = await startHost()
+  sdk.respond = (call) =>
+    (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'ses-lost' }
+      yield sdk.assistant('working on it')
+      await untilAborted(call)
+    })()
+  const controller = new AbortController()
+  try {
+    await loseRunnerMidTurn(host, ['working on it'])
+
+    sdk.respond = (call) =>
+      (async function* () {
+        yield sdk.assistant(`resumed ${call.resume} for ${call.prompt}`)
+        yield sdk.success(call.resume ?? 'ses-fresh')
+      })()
+    await host.send('next')
+    const replacement = runRunner({
+      url: host.url,
+      token: host.latestToken(),
+      signal: controller.signal,
+    })
+    expect(await host.reply()).toBe('resumed ses-lost for hello')
+    controller.abort()
+    await replacement
+  } finally {
+    controller.abort()
     await host.stop()
   }
 })

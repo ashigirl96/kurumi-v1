@@ -12,9 +12,8 @@ export type Turn = {
   continuation: string | null
   signal: AbortSignal
   reply(text: string): Promise<void>
+  remember(continuation: string): Promise<void>
 }
-
-type Outcome = { continuation: string | null; notice: string | null }
 
 function options(continuation: string | null, abortController: AbortController): Options {
   const workspace = process.cwd()
@@ -70,13 +69,12 @@ function noticeOf(result: SDKResultMessage): string {
     : `Provider error ${status}: ${text}`
 }
 
-async function attempt(turn: Turn, continuation: string | null): Promise<Outcome> {
+async function attempt(turn: Turn, continuation: string | null): Promise<string | null> {
   turn.signal.throwIfAborted()
   const abortController = new AbortController()
   const abort = () => abortController.abort()
   turn.signal.addEventListener('abort', abort, { once: true })
   const messages = query({ prompt: turn.prompt, options: options(continuation, abortController) })
-  let session = continuation
   let failed: SDKResultMessage | null = null
   try {
     while (true) {
@@ -86,22 +84,21 @@ async function attempt(turn: Turn, continuation: string | null): Promise<Outcome
       } catch (error) {
         turn.signal.throwIfAborted()
         if (failed) break
-        return {
-          continuation: session,
-          notice: `Provider error: ${error instanceof Error ? error.message : String(error)}`,
-        }
+        return `Provider error: ${error instanceof Error ? error.message : String(error)}`
       }
       if (next.done) break
       const message = next.value
-      if (message.type === 'system' && message.subtype === 'init') session = message.session_id
+      if (
+        message.type === 'system' &&
+        message.subtype === 'init' &&
+        message.session_id !== continuation
+      )
+        await turn.remember(message.session_id)
       if (message.type === 'assistant' && message.error === undefined) {
         const text = textOf(message)
         if (text) await turn.reply(text)
       }
-      if (message.type === 'result') {
-        session = message.session_id
-        if (message.is_error) failed = message
-      }
+      if (message.type === 'result' && message.is_error) failed = message
     }
   } catch (error) {
     abort()
@@ -109,18 +106,17 @@ async function attempt(turn: Turn, continuation: string | null): Promise<Outcome
   } finally {
     turn.signal.removeEventListener('abort', abort)
   }
-  if (!failed) return { continuation: session, notice: null }
+  if (!failed) return null
   if (
     continuation !== null &&
     failed.subtype === 'error_during_execution' &&
     failed.errors.some((error) => error.startsWith('No conversation found'))
   )
     return attempt(turn, null)
-  return { continuation: session, notice: noticeOf(failed) }
+  return noticeOf(failed)
 }
 
-export async function runTurn(turn: Turn): Promise<{ continuation: string | null }> {
-  const { continuation, notice } = await attempt(turn, turn.continuation)
+export async function runTurn(turn: Turn): Promise<void> {
+  const notice = await attempt(turn, turn.continuation)
   if (notice !== null) await turn.reply(notice)
-  return { continuation }
 }

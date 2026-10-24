@@ -12,7 +12,7 @@ type Host = ContractRouterClient<{ session: typeof contract }>
 
 const CONTINUATION = 'continuation'
 
-function replyAlreadyFilled(error: unknown): boolean {
+function slotTaken(error: unknown): boolean {
   return error instanceof ORPCError && error.code === 'CONFLICT'
 }
 
@@ -50,7 +50,7 @@ export async function runRunner(options: {
       }
     }
   }
-  async function post(id: string, inReplyTo: string, text: string): Promise<void> {
+  async function fill(id: string, inReplyTo: string, text: string): Promise<boolean> {
     try {
       await retry(() =>
         host.session.channel.post(
@@ -58,8 +58,10 @@ export async function runRunner(options: {
           { signal },
         ),
       )
+      return true
     } catch (error) {
-      if (!replyAlreadyFilled(error)) throw error
+      if (slotTaken(error)) return false
+      throw error
     }
   }
   async function answer(message: { id: string; content: string }): Promise<void> {
@@ -71,18 +73,23 @@ export async function runRunner(options: {
         .heartbeat({ currentTool: null, toolTimeoutMs: null }, { signal })
         .catch(() => {})
     }, options.heartbeatMs ?? 10_000)
-    let replies = 0
+    let slot = 0
     try {
-      const { continuation } = await runTurn({
+      await runTurn({
         prompt: message.content,
         continuation: saved.value,
         signal,
-        reply: (text) => post(replyId(message.id, replies++), message.id, text),
+        // A re-run turn finds the slots its lost run filled, and a slot with other text is not ours.
+        async reply(text) {
+          while (!(await fill(replyId(message.id, slot), message.id, text))) slot++
+          slot++
+        },
+        async remember(continuation) {
+          await retry(() =>
+            host.session.channel.state.put({ key: CONTINUATION, value: continuation }, { signal }),
+          )
+        },
       })
-      if (continuation !== null && continuation !== saved.value)
-        await retry(() =>
-          host.session.channel.state.put({ key: CONTINUATION, value: continuation }, { signal }),
-        )
     } finally {
       clearInterval(heartbeat)
     }
