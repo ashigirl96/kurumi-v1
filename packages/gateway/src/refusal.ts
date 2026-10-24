@@ -5,15 +5,21 @@ import type { CredentialRefusal } from '@kurumi/account/server'
 export type GatewayRefusal =
   | CredentialRefusal
   | { code: 'upstream_not_public'; host: string; reason: string }
+  | { code: 'port_not_allowed'; host: string; port: number }
 
 export const REFUSAL_STATUS = {
-  account_not_connected: 404,
+  account_not_connected: 403,
   account_ambiguous: 409,
   account_not_granted: 403,
   account_needs_reauth: 403,
+  selector_unreadable: 400,
   duplicate_slot: 400,
+  method_not_allowed: 405,
   upstream_not_public: 403,
+  port_not_allowed: 403,
 } as const satisfies Record<GatewayRefusal['code'], number>
+
+const askToGrant = 'ask the owner to grant one with kurumi account grant'
 
 export function nextStep(refusal: GatewayRefusal): string {
   switch (refusal.code) {
@@ -21,14 +27,22 @@ export function nextStep(refusal: GatewayRefusal): string {
       return `no account is granted ${refusal.service} for this agent group; ask the owner to add one with kurumi account add-key and grant it`
     case 'account_ambiguous':
       return `name one of ${refusal.granted.join(', ')}: put kurumi:<handle> where the token goes, or ask the owner to set a default`
-    case 'account_not_granted': {
-      const granted = refusal.granted.length > 0 ? refusal.granted.join(', ') : 'none'
-      return `${refusal.named} is not granted ${refusal.service} for this agent group; put kurumi:<handle> for one of ${granted} where the token goes`
-    }
+    case 'account_not_granted':
+      return refusal.granted.length > 0
+        ? `${refusal.named} is not granted ${refusal.service} for this agent group; put kurumi:<handle> for one of ${refusal.granted.join(', ')} where the token goes`
+        : `${refusal.named} is not granted ${refusal.service} for this agent group, and no account is; ${askToGrant}`
     case 'account_needs_reauth':
       return `ask the owner to add ${refusal.handle} again`
+    case 'selector_unreadable':
+      return refusal.accepted.length > 0
+        ? `kurumi cannot read the account named where the token goes; put one of ${refusal.accepted.join(', ')} there`
+        : `kurumi cannot read the account named where the token goes, and no account is granted ${refusal.service} for this agent group; ${askToGrant}`
     case 'duplicate_slot':
       return `send the ${refusal.header} header once`
+    case 'method_not_allowed':
+      return `send the request as one of ${refusal.allowed.join(', ')}; kurumi adds no credential to ${refusal.method}`
+    case 'port_not_allowed':
+      return `connect to ${refusal.host} on port 443; kurumi serves it on no other port`
     case 'upstream_not_public':
       return `ask the owner to check the DNS answer for ${refusal.host} on the kurumi host; it resolves to a ${refusal.reason} address, and kurumi forwards only to public addresses`
     default: {
@@ -53,6 +67,7 @@ export function refusalResponse(refusal: GatewayRefusal): {
       // The Anthropic SDK retries a 409 unless told not to.
       'x-should-retry': 'false',
       'x-kurumi-gateway': code,
+      ...(refusal.code === 'method_not_allowed' && { allow: refusal.allowed.join(', ') }),
     },
     body,
   }

@@ -688,10 +688,15 @@ const sealKey = (accountId: string, key: string) =>
 
 type HeaderLines = readonly (readonly [string, string])[]
 
-const egress = (host: string, path: string, lines: HeaderLines = []): EgressRequest => {
+const egress = (
+  host: string,
+  path: string,
+  lines: HeaderLines = [],
+  method = 'GET',
+): EgressRequest => {
   const headers = new Headers()
   for (const [name, value] of lines) headers.append(name, value)
-  return { host, path, headers, rawHeaders: lines.flat() }
+  return { host, method, path, headers, rawHeaders: lines.flat() }
 }
 
 const decide = (agentGroupId: string, request: EgressRequest) =>
@@ -703,11 +708,12 @@ function sent(decision: CredentialDecision) {
   return { handle: decision.injection.handle, path, headers: Object.fromEntries(headers) }
 }
 
-const anthropicApi = (lines: HeaderLines = [], path = '/v1/messages') =>
-  egress('api.anthropic.com', path, lines)
+const anthropicApi = (lines: HeaderLines = [], path = '/v1/messages', method = 'GET') =>
+  egress('api.anthropic.com', path, lines, method)
 
 const anthropicGroupSelector = 'sk-ant-kurumi-YW50aHJvcGlj'
 const secondSecret = 'sk-ant-api03-second'
+const oauthBeta = 'oauth-2025-04-20'
 
 const idOf = (label: string) => accountRow(label)?.id ?? ''
 
@@ -810,13 +816,21 @@ describe('the slot an Anthropic account is written to', () => {
       'an oauth-token account read from Authorization',
       'oauth-token',
       [['Authorization', `Bearer ${anthropicGroupSelector}`]],
-      { authorization: `Bearer ${secret}`, 'anthropic-version': '2023-06-01' },
+      {
+        authorization: `Bearer ${secret}`,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': oauthBeta,
+      },
     ],
     [
       'an oauth-token account read from x-api-key',
       'oauth-token',
       [['X-Api-Key', anthropicGroupSelector]],
-      { authorization: `Bearer ${secret}`, 'anthropic-version': '2023-06-01' },
+      {
+        authorization: `Bearer ${secret}`,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': oauthBeta,
+      },
     ],
     [
       'an api-key account read from x-api-key',
@@ -885,6 +899,97 @@ describe('the slot an Anthropic account is written to', () => {
     })
   })
 
+  test('x-api-key beside X_Api_Key is a duplicate slot', () => {
+    addKey({ autoGrant: true })
+
+    const request = anthropicApi([
+      ['X-Api-Key', anthropicGroupSelector],
+      ['X_Api_Key', 'sk-ant-other'],
+    ])
+
+    expect(decide('g1', request)).toEqual({
+      kind: 'refuse',
+      refusal: { code: 'duplicate_slot', service: 'anthropic-api', header: 'x-api-key' },
+    })
+  })
+
+  test.each([
+    ['x_api_key', 'api-key', { 'x-api-key': secret }],
+    [
+      'X-Api_Key',
+      'oauth-token',
+      { authorization: `Bearer ${secret}`, 'anthropic-beta': oauthBeta },
+    ],
+  ] as const)(
+    'a %s header does not reach the upstream beside an %s account',
+    (name, authMode, headers) => {
+      addKey({ authMode, autoGrant: true })
+
+      const request = anthropicApi([[name, 'sk-ant-api03-client-own']])
+
+      expect(sent(decide('g1', request)).headers).toEqual(headers)
+    },
+  )
+
+  test.each([
+    ['no beta', [], oauthBeta],
+    [
+      'another beta',
+      [['anthropic-beta', 'claude-code-20250219']],
+      `claude-code-20250219,${oauthBeta}`,
+    ],
+    [
+      'the OAuth beta among others',
+      [['anthropic-beta', `claude-code-20250219, ${oauthBeta}`]],
+      `claude-code-20250219, ${oauthBeta}`,
+    ],
+    [
+      'the OAuth beta on a second line',
+      [
+        ['anthropic-beta', 'claude-code-20250219'],
+        ['anthropic-beta', oauthBeta],
+      ],
+      `claude-code-20250219, ${oauthBeta}`,
+    ],
+  ] as const)(
+    'an oauth-token account opts a request with %s into the OAuth beta once',
+    (_name, lines, beta) => {
+      addKey({ authMode: 'oauth-token', autoGrant: true })
+
+      expect(sent(decide('g1', anthropicApi(lines))).headers['anthropic-beta']).toBe(beta)
+    },
+  )
+
+  test('an api-key account keeps the betas the client sent', () => {
+    addKey({ authMode: 'api-key', autoGrant: true })
+
+    const request = anthropicApi([['anthropic-beta', 'claude-code-20250219']])
+
+    expect(sent(decide('g1', request)).headers['anthropic-beta']).toBe('claude-code-20250219')
+  })
+
+  test('a selector kurumi cannot read is refused with the selectors the group may write', () => {
+    addKey({ autoGrant: true })
+    addKey({ label: 'second', value: secondSecret, autoGrant: true })
+
+    const request = anthropicApi([['Authorization', 'Bearer sk-ant-kurumi-anthropic/second']])
+
+    expect(decide('g1', request)).toEqual({
+      kind: 'refuse',
+      refusal: {
+        code: 'selector_unreadable',
+        service: 'anthropic-api',
+        written: 'sk-ant-kurumi-anthropic/second',
+        accepted: [
+          'sk-ant-kurumi-YW50aHJvcGljL21haW4',
+          'kurumi:anthropic/main',
+          'sk-ant-kurumi-YW50aHJvcGljL3NlY29uZA',
+          'kurumi:anthropic/second',
+        ],
+      },
+    })
+  })
+
   test('an injection holds its secret only for apply', () => {
     addKey({ autoGrant: true })
 
@@ -946,6 +1051,28 @@ describe('the container env as the client credential', () => {
       refusal: { code: 'account_not_connected', service: 'anthropic-api' },
     })
   })
+})
+
+describe('the methods a credential travels on', () => {
+  const allowed = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']
+
+  test.each(allowed)('%s carries the credential', (method) => {
+    addKey({ autoGrant: true })
+
+    expect(decide('g1', anthropicApi([], '/v1/messages', method)).kind).toBe('inject')
+  })
+
+  test.each(['TRACE', 'TRACK', 'CONNECT', 'OPTIONS', 'PROPFIND'])(
+    '%s is refused and carries no credential',
+    (method) => {
+      addKey({ autoGrant: true })
+
+      expect(decide('g1', anthropicApi([], '/v1/messages', method))).toEqual({
+        kind: 'refuse',
+        refusal: { code: 'method_not_allowed', service: 'anthropic-api', method, allowed },
+      })
+    },
+  )
 })
 
 test('the selector a container got at spawn follows every later grant change', () => {

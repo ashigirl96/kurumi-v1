@@ -2,13 +2,14 @@ import { expect, test } from 'bun:test'
 
 import { accountHandle } from '@kurumi/account/server'
 
-import { refusalHttp, refusalResponse, type GatewayRefusal } from './refusal.ts'
+import { REFUSAL_STATUS, refusalHttp, refusalResponse, type GatewayRefusal } from './refusal.ts'
 
 const main = accountHandle('anthropic', 'main')
 const nonAscii = accountHandle('anthropic', '日本')
+const googleA = accountHandle('google', 'a')
 
 test.each([
-  [{ code: 'account_not_connected', service: 'anthropic-api' }, 404],
+  [{ code: 'account_not_connected', service: 'anthropic-api' }, 403],
   [{ code: 'account_ambiguous', service: 'anthropic-api', granted: [main, nonAscii] }, 409],
   [
     { code: 'account_not_granted', service: 'anthropic-api', named: 'anthropic/x', granted: [] },
@@ -17,8 +18,18 @@ test.each([
   [{ code: 'account_needs_reauth', service: 'anthropic-api', handle: main }, 403],
   [{ code: 'duplicate_slot', service: 'anthropic-api', header: 'x-api-key' }, 400],
   [{ code: 'upstream_not_public', host: 'api.anthropic.com', reason: 'loopback' }, 403],
+  [{ code: 'selector_unreadable', service: 'anthropic-api', written: 'x', accepted: [] }, 400],
+  [
+    { code: 'method_not_allowed', service: 'anthropic-api', method: 'TRACE', allowed: ['GET'] },
+    405,
+  ],
+  [{ code: 'port_not_allowed', host: 'api.anthropic.com', port: 8443 }, 403],
 ] satisfies [GatewayRefusal, number][])('%o answers %d', (refusal, status) => {
   expect(refusalResponse(refusal).status).toBe(status)
+})
+
+test('no refusal answers 404, which Claude Code replaces with a model error and drops the body', () => {
+  expect(Object.values(REFUSAL_STATUS)).not.toContain(404)
 })
 
 test('a non-public upstream is named with its host and reason', () => {
@@ -58,7 +69,37 @@ test.each([
   ],
   [
     { code: 'account_not_granted', service: 'gmail', named: 'google/x', granted: [] },
-    'google/x is not granted gmail for this agent group; put kurumi:<handle> for one of none where the token goes',
+    'google/x is not granted gmail for this agent group, and no account is; ask the owner to grant one with kurumi account grant',
+  ],
+  [
+    { code: 'account_not_granted', service: 'gmail', named: 'google/x', granted: [googleA] },
+    'google/x is not granted gmail for this agent group; put kurumi:<handle> for one of google/a where the token goes',
+  ],
+  [
+    {
+      code: 'selector_unreadable',
+      service: 'anthropic-api',
+      written: 'sk-ant-kurumi-anthropic/second',
+      accepted: ['sk-ant-kurumi-YW50aHJvcGljL21haW4', 'kurumi:anthropic/main'],
+    },
+    'kurumi cannot read the account named where the token goes; put one of sk-ant-kurumi-YW50aHJvcGljL21haW4, kurumi:anthropic/main there',
+  ],
+  [
+    { code: 'selector_unreadable', service: 'anthropic-api', written: 'x', accepted: [] },
+    'kurumi cannot read the account named where the token goes, and no account is granted anthropic-api for this agent group; ask the owner to grant one with kurumi account grant',
+  ],
+  [
+    {
+      code: 'method_not_allowed',
+      service: 'anthropic-api',
+      method: 'TRACE',
+      allowed: ['GET', 'POST'],
+    },
+    'send the request as one of GET, POST; kurumi adds no credential to TRACE',
+  ],
+  [
+    { code: 'port_not_allowed', host: 'api.anthropic.com', port: 8443 },
+    'connect to api.anthropic.com on port 443; kurumi serves it on no other port',
   ],
   [
     { code: 'account_needs_reauth', service: 'anthropic-api', handle: main },
@@ -88,13 +129,25 @@ test('the headers mark a gateway answer the client must not retry, sized in byte
   expect(Number(headers['content-length'])).toBeGreaterThan(body.length)
 })
 
+test('a refused method is answered with the methods allowed', () => {
+  const { status, headers } = refusalResponse({
+    code: 'method_not_allowed',
+    service: 'anthropic-api',
+    method: 'TRACE',
+    allowed: ['GET', 'POST'],
+  })
+
+  expect(status).toBe(405)
+  expect(headers.allow).toBe('GET, POST')
+})
+
 test('the raw form is the same response as HTTP/1.1 bytes', () => {
   const refusal: GatewayRefusal = { code: 'account_not_connected', service: 'anthropic-api' }
   const { body } = refusalResponse(refusal)
 
   const raw = refusalHttp(refusal)
 
-  expect(raw.startsWith('HTTP/1.1 404 Not Found\r\n')).toBe(true)
+  expect(raw.startsWith('HTTP/1.1 403 Forbidden\r\n')).toBe(true)
   expect(raw).toContain('\r\nx-should-retry: false\r\n')
   expect(raw).toContain('\r\nconnection: close\r\n')
   expect(raw.slice(raw.indexOf('\r\n\r\n') + 4)).toBe(body)

@@ -2,6 +2,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { createHash, randomBytes } from 'node:crypto'
 import type { LookupAddress } from 'node:dns'
 import { once } from 'node:events'
+import type { IncomingHttpHeaders } from 'node:http'
 import { request } from 'node:https'
 import { createServer } from 'node:net'
 import type { TLSSocket } from 'node:tls'
@@ -14,7 +15,7 @@ import {
 } from '@kurumi/account/server'
 import { inMemoryDb, insertAgentGroup } from '@kurumi/account/testing'
 
-import { credentialInject, pinnedLookup, type ForwardDeps } from './forward.ts'
+import { credentialInject, pinnedLookup, type ConnectTarget, type ForwardDeps } from './forward.ts'
 import { startAgentPort } from './port.ts'
 import { openTestTunnel, sendTestRequest, startFakeUpstream, startTestGateway } from './testing.ts'
 
@@ -214,11 +215,14 @@ test('a closed upstream returns host-bearing 502 JSON while the upload is unfini
 const groupSelector = 'sk-ant-kurumi-YW50aHJvcGlj'
 const secrets = { main: 'sk-ant-api03-main-secret', second: 'sk-ant-oat01-second-secret' }
 
-async function setupCredentials(forward: Partial<ForwardDeps<CredentialPrincipal>> = {}) {
+async function setupCredentials({
+  target = { host: 'api.anthropic.com', port: 443 },
+  ...forward
+}: Partial<ForwardDeps<CredentialPrincipal>> & { target?: ConnectTarget } = {}) {
   const db = inMemoryDb()
   insertAgentGroup(db, 'g1')
   const ledger = createAccountLedger({ db, vaultKey: randomBytes(32) })
-  const upstream = await startFakeUpstream({ host: 'api.anthropic.com' })
+  const upstream = await startFakeUpstream({ host: target.host })
   stops.push(upstream.stop)
   const gateway = await startAgentPort({
     bind: { host: '127.0.0.1', port: 0 },
@@ -231,7 +235,7 @@ async function setupCredentials(forward: Partial<ForwardDeps<CredentialPrincipal
     proxyPort: gateway.port,
     token: 'test-token',
     caPem: gateway.caPem,
-    target: { host: 'api.anthropic.com', port: 443 },
+    target,
   })
   stops.push(tunnel.close)
   const addKey = (label: string, value: string, authMode: AuthMode = 'api-key') =>
@@ -254,7 +258,7 @@ async function setupCredentials(forward: Partial<ForwardDeps<CredentialPrincipal
         service: 'anthropic-api',
       })
     })
-  return { upstream, tunnel, addKey, setDefault }
+  return { upstream, tunnel, addKey, setDefault, containerEnv: () => ledger.containerEnv('g1') }
 }
 
 async function exchangeRaw(socket: TLSSocket, bytes: string) {
@@ -313,15 +317,137 @@ test('the account the upstream names is replaced by the one the gateway chose', 
   upstream.setResponse('/v1/models', {
     status: 200,
     body: '{}',
-    headers: { 'x-kurumi-account': 'anthropic/forged' },
+    headers: { 'x-kurumi-account': 'anthropic/forged', x_kurumi_account: 'anthropic/forged' },
   })
 
   const response = await sendTestRequest(tunnel, { path: '/v1/models' })
 
-  expect(response.headers['x-kurumi-account']).toBe('anthropic/main')
+  expect(accountHeaders(response.headers)).toEqual([['x-kurumi-account', 'anthropic/main']])
 })
 
-test('a group with no account is refused with a JSON 404 and nothing goes upstream', async () => {
+const accountHeaders = (headers: IncomingHttpHeaders) =>
+  Object.entries(headers).filter(([name]) => name.replaceAll('_', '-') === 'x-kurumi-account')
+
+test.each(['x-kurumi-account', 'X_Kurumi_Account'])(
+  'an upstream %s on a request kurumi passes untouched never reaches the client',
+  async (name) => {
+    const { upstream, tunnel } = await setupCredentials({
+      target: { host: 'www.googleapis.com', port: 443 },
+    })
+    upstream.setResponse('/discovery/v1/apis', {
+      status: 200,
+      body: '{}',
+      headers: { [name]: 'google/forged' },
+    })
+
+    const response = await sendTestRequest(tunnel, { path: '/discovery/v1/apis' })
+
+    expect(response.status).toBe(200)
+    expect(upstream.requests).toHaveLength(1)
+    expect(accountHeaders(response.headers)).toEqual([])
+  },
+)
+
+const slotLines = (rawHeaders: readonly string[]) =>
+  rawHeaders.flatMap((name, index) =>
+    index % 2 === 0 &&
+    ['authorization', 'x-api-key'].includes(name.toLowerCase().replaceAll('_', '-'))
+      ? [[name, rawHeaders[index + 1]]]
+      : [],
+  )
+
+test.each([
+  [
+    'Authorization',
+    'api-key',
+    { 'x-api-key': groupSelector, authorization: 'Bearer sk-ant-oat01-client-own' },
+    ['x-api-key', secrets.main],
+  ],
+  [
+    'Authorization',
+    'oauth-token',
+    { 'x-api-key': groupSelector, authorization: 'Bearer sk-ant-oat01-client-own' },
+    ['authorization', `Bearer ${secrets.main}`],
+  ],
+  [
+    'x_api_key',
+    'oauth-token',
+    { authorization: `Bearer ${groupSelector}`, x_api_key: 'sk-ant-api03-client-own' },
+    ['authorization', `Bearer ${secrets.main}`],
+  ],
+] as const)(
+  'the container own %s never reaches the upstream beside an %s account',
+  async (_header, authMode, headers, injected) => {
+    const { upstream, tunnel, addKey } = await setupCredentials()
+    addKey('main', secrets.main, authMode)
+
+    const response = await sendTestRequest(tunnel, { path: '/v1/models', headers })
+
+    expect(response.status).toBe(200)
+    expect(slotLines(upstream.requests[0]?.rawHeaders ?? [])).toEqual([[...injected]])
+  },
+)
+
+test('a container spawned before its oauth-token key reaches the upstream as an OAuth request', async () => {
+  const { upstream, tunnel, addKey, containerEnv } = await setupCredentials()
+  const env = containerEnv()
+  expect(Object.keys(env)).toEqual(['ANTHROPIC_API_KEY'])
+  addKey('main', secrets.second, 'oauth-token')
+
+  const response = await sendTestRequest(tunnel, {
+    method: 'POST',
+    path: '/v1/messages',
+    headers: { 'x-api-key': env.ANTHROPIC_API_KEY ?? '', 'anthropic-version': '2023-06-01' },
+    body: '{}',
+  })
+
+  expect(response.status).toBe(200)
+  expect(response.headers['x-kurumi-account']).toBe('anthropic/main')
+  expect(upstream.requests[0]?.headers).toMatchObject({
+    authorization: `Bearer ${secrets.second}`,
+    'anthropic-beta': 'oauth-2025-04-20',
+  })
+  expect(upstream.requests[0]?.headers['x-api-key']).toBeUndefined()
+})
+
+test('an intercepted host on a port other than 443 is refused before any account is chosen', async () => {
+  const { upstream, tunnel, addKey } = await setupCredentials({
+    target: { host: 'api.anthropic.com', port: 8443 },
+  })
+  addKey('main', secrets.main)
+
+  const response = await sendTestRequest(tunnel, {
+    path: '/v1/models',
+    headers: { 'x-api-key': groupSelector },
+  })
+
+  expect(response.status).toBe(403)
+  expect(JSON.parse(response.body)).toEqual({
+    error: 'port_not_allowed',
+    host: 'api.anthropic.com',
+    port: 8443,
+    next: 'connect to api.anthropic.com on port 443; kurumi serves it on no other port',
+  })
+  expect(upstream.requests).toEqual([])
+})
+
+test('a TRACE to a credentialed host is refused with 405 and nothing goes upstream', async () => {
+  const { upstream, tunnel, addKey } = await setupCredentials()
+  addKey('main', secrets.main)
+
+  const response = await sendTestRequest(tunnel, {
+    method: 'TRACE',
+    path: '/v1/models',
+    headers: { 'x-api-key': groupSelector },
+  })
+
+  expect(response.status).toBe(405)
+  expect(response.headers.allow).toBe('GET, HEAD, POST, PUT, PATCH, DELETE')
+  expect(JSON.parse(response.body)).toMatchObject({ error: 'method_not_allowed', method: 'TRACE' })
+  expect(upstream.requests).toEqual([])
+})
+
+test('a group with no account is refused with a JSON 403 and nothing goes upstream', async () => {
   const { upstream, tunnel } = await setupCredentials()
 
   const response = await sendTestRequest(tunnel, {
@@ -329,7 +455,7 @@ test('a group with no account is refused with a JSON 404 and nothing goes upstre
     headers: { 'x-api-key': groupSelector },
   })
 
-  expect(response.status).toBe(404)
+  expect(response.status).toBe(403)
   expect(response.headers['content-type']).toBe('application/json')
   expect(response.headers['x-should-retry']).toBe('false')
   expect(response.headers['x-kurumi-gateway']).toBe('account_not_connected')
@@ -353,7 +479,7 @@ test('a credential refusal is decided before the upstream host is resolved', asy
 
   const response = await sendTestRequest(tunnel, { path: '/v1/models' })
 
-  expect(response.status).toBe(404)
+  expect(response.status).toBe(403)
   expect(JSON.parse(response.body)).toMatchObject({ error: 'account_not_connected' })
   expect(resolved).toBe(0)
 })
@@ -391,7 +517,7 @@ test('a refused POST with a 16 MiB body still reads the JSON refusal', async () 
   for (let upload = 0; upload < uploadsToLoseTheResetRace; upload++) {
     const response = await postToUnconnectedGroup(body)
 
-    expect(response.status).toBe(404)
+    expect(response.status).toBe(403)
     expect(JSON.parse(response.body)).toMatchObject({ error: 'account_not_connected' })
     expect(response.upstreamRequests).toEqual([])
   }
@@ -469,7 +595,7 @@ test('a refused WebSocket upgrade gets the same JSON response', async () => {
     `GET /v1/stream HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\n\r\n`,
   )
 
-  expect(response.status).toBe(404)
+  expect(response.status).toBe(403)
   expect(response.headers['content-type']).toBe('application/json')
   expect(response.headers['x-kurumi-gateway']).toBe('account_not_connected')
   expect(JSON.parse(response.body)).toMatchObject({ error: 'account_not_connected' })

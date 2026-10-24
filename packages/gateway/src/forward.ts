@@ -81,8 +81,9 @@ async function pinPublicUpstream(
 export function credentialInject(
   ledger: Pick<AccountLedger, 'credentialFor'>,
 ): ForwardDeps<CredentialPrincipal>['inject'] {
-  return ({ principal, host, path, headers, rawHeaders }) => {
-    const decision = ledger.credentialFor(principal, { host, path, headers, rawHeaders })
+  return ({ principal, host, port, method, path, headers, rawHeaders }) => {
+    if (port !== 443) return { refusal: { code: 'port_not_allowed', host, port } }
+    const decision = ledger.credentialFor(principal, { host, method, path, headers, rawHeaders })
     switch (decision.kind) {
       case 'inject':
         return { ...decision.injection.apply(), account: decision.injection.handle }
@@ -123,9 +124,11 @@ function withoutHopHeaders(headers: Headers): Headers {
 
 /** `writeHead` throws on a non-Latin1 or control character, and a label is any text. */
 function replaceAccountHeader(headers: Headers, account: AccountHandle | undefined): Headers {
-  headers.delete('x-kurumi-account')
-  if (account !== undefined) headers.set('x-kurumi-account', encodeURI(account.toWellFormed()))
-  return headers
+  const replaced = new Headers(
+    [...headers].filter(([name]) => name.replaceAll('_', '-') !== 'x-kurumi-account'),
+  )
+  if (account !== undefined) replaced.set('x-kurumi-account', encodeURI(account.toWellFormed()))
+  return replaced
 }
 
 function requestHeaders(req: IncomingMessage): Headers {

@@ -155,7 +155,7 @@ export function referenceSelection(
   candidates: readonly GrantedCandidate[],
   selector: ReferenceSelector,
 ): ReferenceDecision {
-  if (selector.kind === 'refused') return { ok: false, code: 'account_not_granted' }
+  if (selector.kind === 'refused') return { ok: false, code: 'selector_unreadable' }
   if (selector.kind === 'handle') {
     const match = candidates.find((candidate) => candidate.handle === selector.handle)
     return match ? use(match, 'named') : { ok: false, code: 'account_not_granted' }

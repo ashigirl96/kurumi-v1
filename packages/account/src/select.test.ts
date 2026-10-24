@@ -21,6 +21,7 @@ import {
   type AccountHandle,
   type GrantedCandidate,
   type Selection,
+  type SelectionRefusal,
   type Selector,
 } from './select.ts'
 
@@ -203,17 +204,17 @@ describe('selectAccount over the Group 1 and Group 2 grants', () => {
     })
   })
 
-  test('a selector that could not be read is refused whatever the grants, naming what was written', () => {
-    const written = 'Bearer kurumi:google/a@work.example, Bearer kurumi:google/b'
+  test('a selector that could not be read is refused whatever the grants, with the selectors the group may write', () => {
+    const written = 'kurumi:google/a@work.example, Bearer kurumi:google/b'
 
     for (const candidates of [[grantA], group1Gmail, []]) {
       expect(selectAccount('gmail', candidates, { kind: 'unreadable', written })).toEqual({
         ok: false,
         refusal: {
-          code: 'account_not_granted',
+          code: 'selector_unreadable',
           service: 'gmail',
-          named: written,
-          granted: candidates.map(({ handle }) => handle),
+          written,
+          accepted: candidates.map(({ handle }) => `kurumi:${handle}`),
         },
       })
     }
@@ -224,7 +225,7 @@ describe('selectAccount over the Group 1 and Group 2 grants', () => {
 
     expect(
       selectAccount('gmail', candidates, { kind: 'unreadable', written: 'google/kurumi-team' }),
-    ).toMatchObject({ ok: false, refusal: { code: 'account_not_granted' } })
+    ).toMatchObject({ ok: false, refusal: { code: 'selector_unreadable' } })
   })
 
   test('a handle is matched exactly', () => {
@@ -266,6 +267,20 @@ describe('selectAccount with a dead refresh token', () => {
     )
   })
 })
+
+function handlesNamedBy(refusal: SelectionRefusal): (string | null)[] {
+  switch (refusal.code) {
+    case 'account_ambiguous':
+    case 'account_not_granted':
+      return refusal.granted
+    case 'account_needs_reauth':
+      return [refusal.handle]
+    case 'selector_unreadable':
+      return refusal.accepted.map((selector) => defaultSelectorShape.parse(selector))
+    case 'account_not_connected':
+      return []
+  }
+}
 
 describe('selectAccount invariants', () => {
   const pool = [handleA, handleB, handleC]
@@ -312,14 +327,8 @@ describe('selectAccount invariants', () => {
       for (const selector of selectors) {
         const selection = selectAccount('gmail', candidates, selector)
         if (selection.ok) continue
-        const { refusal } = selection
-        const mentioned =
-          refusal.code === 'account_ambiguous' || refusal.code === 'account_not_granted'
-            ? refusal.granted
-            : refusal.code === 'account_needs_reauth'
-              ? [refusal.handle]
-              : []
-        for (const handle of mentioned) expect(candidates.map((c) => c.handle)).toContain(handle)
+        const handles: (string | null)[] = candidates.map((c) => c.handle)
+        for (const handle of handlesNamedBy(selection.refusal)) expect(handles).toContain(handle)
       }
     }
   })
@@ -798,8 +807,8 @@ describe('what a refused Basic credential echoes', () => {
       basic('x', 'kurumi:github/kurumi-team'),
       'x:kurumi:github/kurumi-team',
     ],
-    ['not base64: the header as received', 'Basic kurumi:github/b', 'Basic kurumi:github/b'],
-    ['one blob with the word only as received: the header', 'Basic kurumi', 'Basic kurumi'],
+    ['not base64: the credential as received', 'Basic kurumi:github/b', 'kurumi:github/b'],
+    ['one blob with the word only as received: the credential', 'Basic kurumi', 'kurumi'],
     [
       'a doubled scheme word: the decoded credential',
       `Basic ${basic('x', 'kurumi:github/b')}`,
@@ -824,6 +833,20 @@ describe('what a refused Basic credential echoes', () => {
 
     expect(selector).toEqual({ kind: 'unreadable', written })
   })
+})
+
+test.each([
+  ['Bearer', 'Bearer sk-ant-kurumi-anthropic/second'],
+  ['token', 'token sk-ant-kurumi-anthropic/second'],
+  ['an unknown scheme', 'Digest sk-ant-kurumi-anthropic/second'],
+])('a refused %s credential is echoed without its scheme', (_scheme, authorization) => {
+  const { selector } = readSelector(
+    selectorShapeOf('anthropic'),
+    serviceSpec('anthropic-api').slot,
+    request({ headers: { authorization } }),
+  )
+
+  expect(selector).toEqual({ kind: 'unreadable', written: 'sk-ant-kurumi-anthropic/second' })
 })
 
 describe('an Authorization header read for the bearer and the basic slot alike', () => {

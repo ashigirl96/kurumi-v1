@@ -92,6 +92,7 @@ export type AccountView = {
 
 export type EgressRequest = {
   host: string
+  method: string
   path: string
   headers: Headers
   rawHeaders: readonly string[]
@@ -100,6 +101,7 @@ export type EgressRequest = {
 export type CredentialRefusal =
   | SelectionRefusal
   | { code: 'duplicate_slot'; service: ServiceId; header: string }
+  | { code: 'method_not_allowed'; service: ServiceId; method: string; allowed: readonly string[] }
 
 export type Injection = {
   readonly handle: AccountHandle
@@ -142,16 +144,34 @@ function slotHeadersOf(service: ServiceId): string[] {
   return [...new Set(['authorization', ...named])]
 }
 
+/** Some servers read `_` as `-` in a header name, so `x_api_key` would be a second key beside the injected one. */
+const slotNameOf = (header: string): string => header.toLowerCase().replaceAll('_', '-')
+
 function duplicatedHeader(
   headers: readonly string[],
   rawHeaders: readonly string[],
 ): string | undefined {
   const lines = new Map<string, number>()
   for (let index = 0; index < rawHeaders.length; index += 2) {
-    const name = rawHeaders[index]?.toLowerCase()
-    if (name !== undefined) lines.set(name, (lines.get(name) ?? 0) + 1)
+    const name = rawHeaders[index]
+    if (name === undefined) continue
+    const slot = slotNameOf(name)
+    lines.set(slot, (lines.get(slot) ?? 0) + 1)
   }
   return headers.find((header) => (lines.get(header) ?? 0) > 1)
+}
+
+/** TRACE and its kin echo the request back, credential included. */
+const credentialedMethods: readonly string[] = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']
+
+/** Anthropic refuses an OAuth bearer unless the request opts into this beta, which a client set up for an API key leaves out. */
+const optInOf: Partial<Record<AuthMode, { header: string; token: string }>> = {
+  'oauth-token': { header: 'anthropic-beta', token: 'oauth-2025-04-20' },
+}
+
+function optedIn(value: string | null, token: string): string {
+  if (value === null) return token
+  return value.split(',').some((listed) => listed.trim() === token) ? value : `${value},${token}`
 }
 
 function keyOf(vaultKey: Uint8Array, row: GrantRow): string | null {
@@ -187,13 +207,16 @@ function injectionFor({
   requested: { path: string; url: URL }
 }): Injection {
   const { slot } = placementOf(service, row.authMode)
+  const optIn = row.authMode === null ? undefined : optInOf[row.authMode]
   return Object.freeze({
     handle: row.handle,
     accountId: row.accountId,
     apply() {
-      const headers = new Headers(stripped.headers)
+      const headers = new Headers(
+        [...stripped.headers].filter(([name]) => !slotHeaders.includes(slotNameOf(name))),
+      )
       const url = new URL(stripped.url)
-      for (const header of slotHeaders) headers.delete(header)
+      if (optIn) headers.set(optIn.header, optedIn(headers.get(optIn.header), optIn.token))
       switch (slot.kind) {
         case 'bearer':
           headers.set('authorization', `Bearer ${secret}`)
@@ -485,6 +508,17 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
       const located = serviceFor(request.host, request.path)
       if (!located) return { kind: 'pass' }
       const { vendor, service } = located
+      if (!credentialedMethods.includes(request.method)) {
+        return {
+          kind: 'refuse',
+          refusal: {
+            code: 'method_not_allowed',
+            service,
+            method: request.method,
+            allowed: credentialedMethods,
+          },
+        }
+      }
       const slotHeaders = slotHeadersOf(service)
       const header = duplicatedHeader(slotHeaders, request.rawHeaders)
       if (header !== undefined) {
