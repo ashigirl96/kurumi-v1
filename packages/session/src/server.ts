@@ -65,6 +65,19 @@ export type SessionRuntime = {
       supervision: { staleAfterMs: number; intervalMs: number }
     }
 )
+const REVISION_PLACEHOLDER = { agentGroupId: '<agent-group>', sessionToken: '<session-token>' }
+
+export function containerRevision(input: {
+  image: string
+  contribution: SessionRuntime['egress']['contribution']
+  runner: Uint8Array
+}): string {
+  return createHash('sha256')
+    .update(JSON.stringify([input.image, input.contribution(REVISION_PLACEHOLDER)]))
+    .update(input.runner)
+    .digest('hex')
+    .slice(0, 16)
+}
 export type InboundLog = {
   kind: 'session.inbound.received' | 'session.inbound.committed'
   inboundId: string

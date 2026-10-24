@@ -3,11 +3,21 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./server": "./src/port.ts",
+    "./schema": "./src/schema.ts",
+    "./server": "./src/server.ts",
     "./testing": "./src/testing.ts"
   },
+  "scripts": {
+    "generate": "drizzle-kit generate"
+  },
   "dependencies": {
+    "@kurumi/account": "workspace:*",
+    "@kurumi/rpc": "workspace:*",
     "@peculiar/x509": "catalog:",
+    "drizzle-orm": "catalog:",
     "reflect-metadata": "catalog:"
+  },
+  "devDependencies": {
+    "drizzle-kit": "catalog:"
   }
 }

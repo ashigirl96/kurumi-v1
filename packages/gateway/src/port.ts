@@ -1,14 +1,19 @@
+import type { LookupAddress } from 'node:dns'
+import { lookup } from 'node:dns/promises'
 import { once } from 'node:events'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { connect, type Server } from 'node:net'
+import { connect, type LookupFunction, type Server } from 'node:net'
 import { pipeline, type Duplex } from 'node:stream'
 import { createServer as createTlsServer } from 'node:tls'
 
-import { createCertificateAuthority, type CertificateAuthority, type Leaf } from './ca.ts'
+import { addressRefusal, hostAddresses } from './address.ts'
+import {
+  CaExpiredError,
+  createCertificateAuthority,
+  type CertificateAuthority,
+  type Leaf,
+} from './ca.ts'
 import { forward, forwardUpgrade, type ConnectTarget, type ForwardDeps } from './forward.ts'
-
-export { startAdmission } from './admission.ts'
-export type { ForwardDeps, Injection, InjectionInput, UpstreamDestination } from './forward.ts'
 
 type Tunnel<Principal> = {
   target: ConnectTarget
@@ -54,15 +59,27 @@ function password(req: IncomingMessage): string | null {
   return colon >= 0 && colon < decoded.length - 1 ? decoded.slice(colon + 1) : null
 }
 
-function rejectConnect(socket: Duplex, status: 400 | 407 | 502): void {
-  const reason = { 400: 'Bad Request', 407: 'Proxy Authentication Required', 502: 'Bad Gateway' }[
-    status
-  ]
+function rejectConnect(socket: Duplex, status: 400 | 403 | 407 | 502, body = ''): void {
+  const reason = {
+    400: 'Bad Request',
+    403: 'Forbidden',
+    407: 'Proxy Authentication Required',
+    502: 'Bad Gateway',
+  }[status]
   const challenge = status === 407 ? 'Proxy-Authenticate: Basic realm="kurumi"\r\n' : ''
   socket.end(
-    `HTTP/1.1 ${status} ${reason}\r\n${challenge}Connection: close\r\nContent-Length: 0\r\n\r\n`,
+    `HTTP/1.1 ${status} ${reason}\r\n${challenge}Connection: close\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
     () => socket.destroy(),
   )
+}
+
+function pinnedLookup(addresses: LookupAddress[]): LookupFunction {
+  return (hostname, options, callback) => {
+    const [first] = addresses
+    if (!first) callback(new Error(`${hostname} resolved to no address`), '')
+    else if (options.all) callback(null, addresses)
+    else callback(null, first.address, first.family)
+  }
 }
 
 function closeServer(server: Server): Promise<void> {
@@ -75,6 +92,9 @@ export async function startAgentPort<Principal extends object>(deps: {
   bind: { host: string; port: number }
   authenticate(token: string): Principal | null | Promise<Principal | null>
   intercepts(host: string): boolean
+  addressRefusal?: (address: string, host: readonly string[]) => string | null
+  hostAddresses?: () => readonly string[]
+  resolve?: (host: string) => Promise<LookupAddress[]>
   forward: ForwardDeps<Principal>
   ca?: CertificateAuthority
   onConnect?(target: ConnectTarget): void
@@ -87,6 +107,9 @@ export async function startAgentPort<Principal extends object>(deps: {
   ): Promise<void>
 }): Promise<AgentPort> {
   const ca = deps.ca ?? (await createCertificateAuthority())
+  const refusal = deps.addressRefusal ?? addressRefusal
+  const readHostAddresses = deps.hostAddresses ?? hostAddresses
+  const resolve = deps.resolve ?? ((host: string) => lookup(host, { all: true }))
   const listeners = new Map<string, Promise<HostListener<Principal>>>()
   const sockets = new Map<Duplex, (() => void) | undefined>()
   let stopping = false
@@ -219,11 +242,25 @@ export async function startAgentPort<Principal extends object>(deps: {
     if (stopping || client.destroyed) return
     deps.onConnect?.(target)
     const listener = deps.intercepts(target.host) ? await listenerFor(target.host) : undefined
+    const addresses = listener ? [] : await resolve(target.host)
+    const host = listener ? [] : readHostAddresses()
+    const reason = addresses
+      .map(({ address }) => refusal(address, host))
+      .find((found) => found !== null)
+    if (reason) {
+      rejectConnect(
+        client,
+        403,
+        `kurumi refuses to tunnel to ${target.host}: it resolves to a ${reason} address\n`,
+      )
+      return
+    }
     if (stopping || client.destroyed) return
-    const outbound = connect({
-      host: listener ? '127.0.0.1' : target.host,
-      port: listener?.port ?? target.port,
-    })
+    const outbound = connect(
+      listener
+        ? { host: '127.0.0.1', port: listener.port }
+        : { host: target.host, port: target.port, lookup: pinnedLookup(addresses) },
+    )
     track(outbound)
     const cancel = () => outbound.destroy()
     aborted.signal.addEventListener('abort', cancel, { once: true })
@@ -300,8 +337,9 @@ export async function startAgentPort<Principal extends object>(deps: {
   outer.on('connection', track)
   outer.on('clientError', (_error, socket) => socket.destroy())
   outer.on('connect', (req, socket, head) => {
-    void handleConnect(req, socket, head).catch(() => {
-      if (!socket.destroyed) rejectConnect(socket, 502)
+    void handleConnect(req, socket, head).catch((error: unknown) => {
+      if (socket.destroyed) return
+      rejectConnect(socket, 502, error instanceof CaExpiredError ? `${error.message}\n` : '')
     })
   })
 

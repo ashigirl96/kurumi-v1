@@ -12,6 +12,7 @@ import {
   KeyUsagesExtension,
   SubjectAlternativeNameExtension,
   SubjectKeyIdentifierExtension,
+  X509Certificate,
   X509CertificateGenerator,
 } from '@peculiar/x509'
 
@@ -30,9 +31,23 @@ export type CertificateAuthority = {
   leafFor(host: string): Promise<Leaf>
 }
 
-export async function createCertificateAuthority({
-  now = Date.now,
-}: { now?: () => number } = {}): Promise<CertificateAuthority> {
+export type CaMaterial = { certPem: string; keyPem: string }
+
+export type CaExpired = { kind: 'gateway.ca.expired'; notAfter: string }
+
+export class CaExpiredError extends Error {}
+
+type Clock = { now?: () => number }
+
+async function pkcs8Pem(key: CryptoKey): Promise<string> {
+  const der = await crypto.subtle.exportKey('pkcs8', key)
+  const base64 = Buffer.from(der)
+    .toString('base64')
+    .replace(/(.{64})/g, '$1\n')
+  return `-----BEGIN PRIVATE KEY-----\n${base64}\n-----END PRIVATE KEY-----\n`
+}
+
+export async function generateCaMaterial({ now = Date.now }: Clock = {}): Promise<CaMaterial> {
   const keys = await crypto.subtle.generateKey(algorithm, true, ['sign', 'verify'])
   const certificate = await X509CertificateGenerator.createSelfSigned({
     serialNumber: '01',
@@ -47,9 +62,34 @@ export async function createCertificateAuthority({
       await SubjectKeyIdentifierExtension.create(keys.publicKey),
     ],
   })
+  return { certPem: certificate.toString('pem'), keyPem: await pkcs8Pem(keys.privateKey) }
+}
+
+export function certificateNotAfter(certPem: string): Date {
+  return new X509Certificate(certPem).notAfter
+}
+
+export async function certificateAuthority(
+  material: CaMaterial,
+  { now = Date.now, log = () => {} }: Clock & { log?: (event: CaExpired) => void } = {},
+): Promise<CertificateAuthority> {
+  const certificate = new X509Certificate(material.certPem)
+  const end = certificate.notAfter.getTime()
+  const der = Buffer.from(material.keyPem.replace(/-----[^-]+-----|\s/g, ''), 'base64')
+  const signingKey = await crypto.subtle.importKey('pkcs8', der, algorithm, false, ['sign'])
   const cache = new Map<string, { expiresAt: number; leaf: Promise<Leaf> }>()
+  let expiryLogged = false
 
   async function mintLeaf(host: string): Promise<Leaf> {
+    const issuedAt = now()
+    if (issuedAt >= end) {
+      const notAfter = certificate.notAfter.toISOString()
+      if (!expiryLogged) log({ kind: 'gateway.ca.expired', notAfter })
+      expiryLogged = true
+      throw new CaExpiredError(
+        `the gateway CA expired at ${notAfter}; restart the host to renew it`,
+      )
+    }
     const leafKeys = await crypto.subtle.generateKey(algorithm, true, ['sign', 'verify'])
     const serial = crypto.getRandomValues(new Uint8Array(16))
     serial[0] = 1
@@ -57,11 +97,11 @@ export async function createCertificateAuthority({
       serialNumber: Buffer.from(serial).toString('hex'),
       subject: 'CN=kurumi leaf',
       issuer: certificate.subject,
-      notBefore: new Date(now() - 60_000),
-      notAfter: new Date(now() + 7 * day),
+      notBefore: new Date(issuedAt - 60_000),
+      notAfter: new Date(Math.min(issuedAt + 7 * day, end)),
       signingAlgorithm: algorithm,
       publicKey: leafKeys.publicKey,
-      signingKey: keys.privateKey,
+      signingKey,
       extensions: [
         new BasicConstraintsExtension(false, undefined, true),
         new KeyUsagesExtension(KeyUsageFlags.digitalSignature, true),
@@ -70,11 +110,7 @@ export async function createCertificateAuthority({
         await AuthorityKeyIdentifierExtension.create(certificate),
       ],
     })
-    const der = await crypto.subtle.exportKey('pkcs8', leafKeys.privateKey)
-    const base64 = Buffer.from(der)
-      .toString('base64')
-      .replace(/(.{64})/g, '$1\n')
-    const keyPem = `-----BEGIN PRIVATE KEY-----\n${base64}\n-----END PRIVATE KEY-----\n`
+    const keyPem = await pkcs8Pem(leafKeys.privateKey)
     const certPem = leaf.toString('pem')
     return { certPem, keyPem, context: createSecureContext({ key: keyPem, cert: certPem }) }
   }
@@ -86,9 +122,13 @@ export async function createCertificateAuthority({
       if (cache.get(host)?.leaf === leaf) cache.delete(host)
       throw error
     })
-    cache.set(host, { expiresAt: now() + day, leaf })
+    cache.set(host, { expiresAt: Math.min(now() + day, end), leaf })
     return leaf
   }
 
-  return { certPem: certificate.toString('pem'), mintLeaf, leafFor }
+  return { certPem: material.certPem, mintLeaf, leafFor }
+}
+
+export async function createCertificateAuthority(clock: Clock = {}): Promise<CertificateAuthority> {
+  return certificateAuthority(await generateCaMaterial(clock), clock)
 }

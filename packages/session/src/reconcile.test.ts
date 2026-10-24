@@ -1,5 +1,7 @@
 import { expect, test } from 'bun:test'
 
+import { gatewayContribution, proxyEnv } from '@kurumi/gateway/server'
+
 import type { ContainerInventory, InventoryChange, ListedContainer } from './driver/docker.ts'
 import {
   createLiveness,
@@ -8,6 +10,7 @@ import {
   type ContainerRow,
   type SupervisionLog,
 } from './reconcile.ts'
+import { containerRevision } from './server.ts'
 
 const staleAfterMs = 30_000
 const revision = 'rev-1'
@@ -367,4 +370,41 @@ test('stopping before any listing answered rejects adoption, ends the loop and l
   await Bun.sleep(600)
   expect(fake.sweeps).toHaveLength(sweeps)
   expect(logs.filter((entry) => entry.kind === 'session.adoption.done')).toHaveLength(0)
+})
+
+type SessionEnv = typeof proxyEnv
+
+function revisionFor(sha: string, sessionEnv: SessionEnv = proxyEnv): string {
+  const gateway = gatewayContribution({
+    port: 4100,
+    caBundle: { path: `/home/ca/combined-${sha}.pem`, sha },
+  })
+  return containerRevision({
+    image: 'kurumi-agent:test',
+    runner: new TextEncoder().encode('runner'),
+    contribution: ({ sessionToken }) => ({
+      ...gateway,
+      env: { ...gateway.env, ...sessionEnv({ port: 4100, sessionToken }) },
+      network: { kind: 'lockdown', dockerNetwork: 'bridge' },
+    }),
+  })
+}
+
+test('an unchanged CA and proxy env keep the revision across host restarts, and a new CA changes it', () => {
+  expect(revisionFor('aaa')).toBe(revisionFor('aaa'))
+  expect(revisionFor('bbb')).not.toBe(revisionFor('aaa'))
+})
+
+const extraKey: SessionEnv = (input) => ({ ...proxyEnv(input), ALL_PROXY: 'x' })
+const rewrite =
+  (from: string, to: string): SessionEnv =>
+  (input) =>
+    Object.fromEntries(
+      Object.entries(proxyEnv(input)).map(([key, value]) => [key, value.replace(from, to)]),
+    )
+
+test('a change to the per-session proxy env keys, username, or scheme changes the revision', () => {
+  for (const changed of [extraKey, rewrite('http://s:', 'http://u:'), rewrite('http:', 'https:')]) {
+    expect(revisionFor('aaa', changed)).not.toBe(revisionFor('aaa'))
+  }
 })

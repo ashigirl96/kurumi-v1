@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { seal } from '@kurumi/account/server'
 import { createAgentLedger } from '@kurumi/agent/server'
 
 import { openKurumiDb, migrateAll } from './db.ts'
@@ -227,6 +228,113 @@ test('a killed host leaves a lock and socket that a new host can recover', async
   replacement.kill('SIGTERM')
   expect(await replacement.exited).toBe(0)
   expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
+}, 5000)
+
+async function startAndStop(home: string): Promise<string> {
+  const host = spawnHost(home)
+  await waitForHost(home, host)
+  host.kill('SIGTERM')
+  expect(await host.exited).toBe(0)
+  return new Response(host.stdout).text()
+}
+
+function storedCa(home: string): string | undefined {
+  const sqlite = new Database(join(home, 'kurumi.db'), { readonly: true })
+  try {
+    return sqlite.query<{ pem: string }, []>('SELECT cert_pem AS pem FROM gateway_ca').get()?.pem
+  } finally {
+    sqlite.close()
+  }
+}
+
+function storeAccount(home: string, material: Uint8Array): void {
+  const sqlite = new Database(join(home, 'kurumi.db'))
+  sqlite
+    .query(
+      `INSERT INTO account (id, vendor, label, kind, auth_mode, services, material, status, created_at)
+       VALUES ('acc-a', 'anthropic', 'main', 'key', 'api-key', '["anthropic-api"]', ?, 'active', 0)`,
+    )
+    .run(material)
+  sqlite.close()
+}
+
+test('with no accounts stored, a host whose vault.key was deleted starts with a new key and a new gateway CA', async () => {
+  const home = homeForTest()
+  await startAndStop(home)
+  const before = storedCa(home)
+  rmSync(join(home, 'vault.key'))
+
+  const stdout = await startAndStop(home)
+
+  expect(storedCa(home)).not.toBe(before)
+  expect(stdout).toContain('"kind":"gateway.ca.replaced"')
+}, 5000)
+
+test('after the start-over SQL deletes every account, a host without vault.key starts with a new gateway CA', async () => {
+  const home = homeForTest()
+  await startAndStop(home)
+  const before = storedCa(home)
+  storeAccount(home, Buffer.of(0))
+  rmSync(join(home, 'vault.key'))
+  const refused = spawnHost(home)
+  expect(await refused.exited).toBe(1)
+  const startOver = Bun.spawnSync([
+    'sqlite3',
+    join(home, 'kurumi.db'),
+    'PRAGMA foreign_keys = ON; DELETE FROM account;',
+  ])
+  expect(startOver.exitCode).toBe(0)
+
+  const stdout = await startAndStop(home)
+
+  expect(storedCa(home)).not.toBe(before)
+  expect(stdout).toContain('"kind":"gateway.ca.replaced"')
+}, 5000)
+
+test('with accounts stored, a wrong vault.key stops the host, names the backup, and keeps the gateway CA', async () => {
+  const home = homeForTest()
+  await startAndStop(home)
+  const before = storedCa(home)
+  storeAccount(home, Buffer.of(0))
+  writeFileSync(join(home, 'vault.key'), randomBytes(32), { mode: 0o600 })
+
+  const second = spawnHost(home)
+
+  expect(await second.exited).toBe(1)
+  const stderr = await new Response(second.stderr).text()
+  expect(stderr).toContain(join(home, 'vault.key'))
+  expect(stderr).toContain('from your backup')
+  expect(storedCa(home)).toBe(before)
+}, 5000)
+
+test('with accounts stored, a gateway CA the vault.key cannot open stops the host, and the printed command replaces it', async () => {
+  const home = mkdtempSync(join(tmpdir(), "kurumi host's "))
+  homes.push(home)
+  await startAndStop(home)
+  const key = readFileSync(join(home, 'vault.key'))
+  storeAccount(home, seal(key, 'acc-a', 'sk-ant-test'))
+  const sqlite = new Database(join(home, 'kurumi.db'))
+  sqlite
+    .query('UPDATE gateway_ca SET sealed_key = ?')
+    .run(seal(randomBytes(32), 'gateway_ca', 'not the CA key'))
+  sqlite.close()
+  const before = storedCa(home)
+
+  const refused = spawnHost(home)
+
+  expect(await refused.exited).toBe(1)
+  const stderr = await new Response(refused.stderr).text()
+  const db = join(home, 'kurumi.db')
+  expect(stderr).toContain(
+    `${join(home, 'vault.key')} cannot open the gateway CA in ${db}: sealed material for gateway_ca failed authentication, and accounts are stored, so the CA is not replaced under this key. If this vault.key did not seal the accounts, put back the one that did from your backup and start the host again. If it did, only the CA is unreadable: with the host stopped, run sqlite3 '${db.replaceAll("'", `'\\''`)}' 'DELETE FROM gateway_ca;' and start the host, and kurumi creates a new CA.`,
+  )
+  expect(storedCa(home)).toBe(before)
+  const printed = / run (sqlite3 .+;') and start/.exec(stderr)?.[1]
+  if (!printed) throw new Error('the refusal prints no sqlite3 command')
+  expect(Bun.spawnSync(['sh', '-c', printed]).exitCode).toBe(0)
+  await startAndStop(home)
+  expect(storedCa(home)).not.toBe(before)
+  expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(true)
 }, 5000)
 
 test('diagnostic SQL reads a WAL snapshot without writing rows or changing the host connection', () => {
