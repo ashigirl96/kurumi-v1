@@ -714,6 +714,10 @@ const anthropicApi = (lines: HeaderLines = [], path = '/v1/messages', method = '
 const anthropicGroupSelector = 'sk-ant-kurumi-YW50aHJvcGlj'
 const secondSecret = 'sk-ant-api03-second'
 const oauthBeta = 'oauth-2025-04-20'
+const sdkApiKeyBetas =
+  'claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,thinking-display-updates-2026-08-18'
+const sdkOauthBetas =
+  'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11'
 
 const idOf = (label: string) => accountRow(label)?.id ?? ''
 
@@ -931,41 +935,57 @@ describe('the slot an Anthropic account is written to', () => {
     },
   )
 
+  test('a selector in x_api_key names the account like one in x-api-key', () => {
+    addKey({ autoGrant: true })
+    addKey({ label: 'second', value: secondSecret, autoGrant: true })
+    setDefault('g1', idOf('main'), 'anthropic-api')
+
+    const request = anthropicApi([['x_api_key', 'kurumi:anthropic/second']])
+
+    expect(sent(decide('g1', request))).toMatchObject({
+      handle: accountHandle('anthropic', 'second'),
+      headers: { 'x-api-key': secondSecret },
+    })
+  })
+
   test.each([
-    ['no beta', [], oauthBeta],
+    ['the Agent SDK in OAuth mode', [['anthropic-beta', sdkOauthBetas]], sdkOauthBetas],
     [
-      'another beta',
-      [['anthropic-beta', 'claude-code-20250219']],
-      `claude-code-20250219,${oauthBeta}`,
+      'the Agent SDK in API-key mode',
+      [['anthropic-beta', sdkApiKeyBetas]],
+      `${sdkApiKeyBetas},${oauthBeta}`,
     ],
-    [
-      'the OAuth beta among others',
-      [['anthropic-beta', `claude-code-20250219, ${oauthBeta}`]],
-      `claude-code-20250219, ${oauthBeta}`,
-    ],
+    ['no beta header', [], oauthBeta],
+    ['an empty beta header', [['anthropic-beta', '']], oauthBeta],
     [
       'the OAuth beta on a second line',
       [
         ['anthropic-beta', 'claude-code-20250219'],
         ['anthropic-beta', oauthBeta],
       ],
-      `claude-code-20250219, ${oauthBeta}`,
+      `claude-code-20250219,${oauthBeta}`,
     ],
   ] as const)(
-    'an oauth-token account opts a request with %s into the OAuth beta once',
-    (_name, lines, beta) => {
+    'an oauth-token account lists the OAuth beta once after %s',
+    (_client, lines, beta) => {
       addKey({ authMode: 'oauth-token', autoGrant: true })
 
       expect(sent(decide('g1', anthropicApi(lines))).headers['anthropic-beta']).toBe(beta)
     },
   )
 
-  test('an api-key account keeps the betas the client sent', () => {
+  test.each([
+    ['the Agent SDK in API-key mode', [['anthropic-beta', sdkApiKeyBetas]], sdkApiKeyBetas],
+    [
+      'the Agent SDK in OAuth mode',
+      [['anthropic-beta', sdkOauthBetas]],
+      sdkOauthBetas.replace(`,${oauthBeta}`, ''),
+    ],
+    ['only the OAuth beta', [['anthropic-beta', oauthBeta]], undefined],
+  ] as const)('an api-key account drops only the OAuth beta after %s', (_client, lines, beta) => {
     addKey({ authMode: 'api-key', autoGrant: true })
 
-    const request = anthropicApi([['anthropic-beta', 'claude-code-20250219']])
-
-    expect(sent(decide('g1', request)).headers['anthropic-beta']).toBe('claude-code-20250219')
+    expect(sent(decide('g1', anthropicApi(lines))).headers['anthropic-beta']).toBe(beta)
   })
 
   test('a selector kurumi cannot read is refused with the selectors the group may write', () => {

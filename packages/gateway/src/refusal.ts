@@ -19,24 +19,24 @@ export const REFUSAL_STATUS = {
   port_not_allowed: 403,
 } as const satisfies Record<GatewayRefusal['code'], number>
 
-const askToGrant = 'ask the owner to grant one with kurumi account grant'
+const askToAdd = 'ask the owner to add one with kurumi account add-key and grant it'
 
 export function nextStep(refusal: GatewayRefusal): string {
   switch (refusal.code) {
     case 'account_not_connected':
-      return `no account is granted ${refusal.service} for this agent group; ask the owner to add one with kurumi account add-key and grant it`
+      return `no account is granted ${refusal.service} for this agent group; ${askToAdd}`
     case 'account_ambiguous':
       return `name one of ${refusal.granted.join(', ')}: put kurumi:<handle> where the token goes, or ask the owner to set a default`
     case 'account_not_granted':
       return refusal.granted.length > 0
         ? `${refusal.named} is not granted ${refusal.service} for this agent group; put kurumi:<handle> for one of ${refusal.granted.join(', ')} where the token goes`
-        : `${refusal.named} is not granted ${refusal.service} for this agent group, and no account is; ${askToGrant}`
+        : `${refusal.named} is not granted ${refusal.service} for this agent group, and no account is; ${askToAdd}`
     case 'account_needs_reauth':
       return `ask the owner to add ${refusal.handle} again`
     case 'selector_unreadable':
       return refusal.accepted.length > 0
         ? `kurumi cannot read the account named where the token goes; put one of ${refusal.accepted.join(', ')} there`
-        : `kurumi cannot read the account named where the token goes, and no account is granted ${refusal.service} for this agent group; ${askToGrant}`
+        : `kurumi cannot read the account named where the token goes, and no account is granted ${refusal.service} for this agent group; ${askToAdd}`
     case 'duplicate_slot':
       return `send the ${refusal.header} header once`
     case 'method_not_allowed':

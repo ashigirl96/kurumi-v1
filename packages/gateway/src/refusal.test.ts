@@ -69,7 +69,7 @@ test.each([
   ],
   [
     { code: 'account_not_granted', service: 'gmail', named: 'google/x', granted: [] },
-    'google/x is not granted gmail for this agent group, and no account is; ask the owner to grant one with kurumi account grant',
+    'google/x is not granted gmail for this agent group, and no account is; ask the owner to add one with kurumi account add-key and grant it',
   ],
   [
     { code: 'account_not_granted', service: 'gmail', named: 'google/x', granted: [googleA] },
@@ -86,7 +86,7 @@ test.each([
   ],
   [
     { code: 'selector_unreadable', service: 'anthropic-api', written: 'x', accepted: [] },
-    'kurumi cannot read the account named where the token goes, and no account is granted anthropic-api for this agent group; ask the owner to grant one with kurumi account grant',
+    'kurumi cannot read the account named where the token goes, and no account is granted anthropic-api for this agent group; ask the owner to add one with kurumi account add-key and grant it',
   ],
   [
     {

@@ -144,8 +144,17 @@ function slotHeadersOf(service: ServiceId): string[] {
   return [...new Set(['authorization', ...named])]
 }
 
-/** Some servers read `_` as `-` in a header name, so `x_api_key` would be a second key beside the injected one. */
-const slotNameOf = (header: string): string => header.toLowerCase().replaceAll('_', '-')
+/** Some servers read `_` as `-` in a header name, so `x_api_key` is the `x-api-key` slot. */
+export const headerNameAsRead = (name: string): string => name.toLowerCase().replaceAll('_', '-')
+
+function withSlotNames(headers: Headers, slotHeaders: readonly string[]): Headers {
+  return new Headers(
+    [...headers].map(([name, value]) => {
+      const read = headerNameAsRead(name)
+      return [slotHeaders.includes(read) ? read : name, value]
+    }),
+  )
+}
 
 function duplicatedHeader(
   headers: readonly string[],
@@ -155,8 +164,8 @@ function duplicatedHeader(
   for (let index = 0; index < rawHeaders.length; index += 2) {
     const name = rawHeaders[index]
     if (name === undefined) continue
-    const slot = slotNameOf(name)
-    lines.set(slot, (lines.get(slot) ?? 0) + 1)
+    const read = headerNameAsRead(name)
+    lines.set(read, (lines.get(read) ?? 0) + 1)
   }
   return headers.find((header) => (lines.get(header) ?? 0) > 1)
 }
@@ -164,14 +173,26 @@ function duplicatedHeader(
 /** TRACE and its kin echo the request back, credential included. */
 const credentialedMethods: readonly string[] = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']
 
-/** Anthropic refuses an OAuth bearer unless the request opts into this beta, which a client set up for an API key leaves out. */
-const optInOf: Partial<Record<AuthMode, { header: string; token: string }>> = {
-  'oauth-token': { header: 'anthropic-beta', token: 'oauth-2025-04-20' },
+type ModeBeta = { header: string; token: string; mode: AuthMode }
+
+/** Anthropic answers an OAuth bearer only when the request lists this beta, and a container keeps the mode it started in. */
+const modeBetaOf: Partial<Record<ServiceId, ModeBeta>> = {
+  'anthropic-api': { header: 'anthropic-beta', token: 'oauth-2025-04-20', mode: 'oauth-token' },
 }
 
-function optedIn(value: string | null, token: string): string {
-  if (value === null) return token
-  return value.split(',').some((listed) => listed.trim() === token) ? value : `${value},${token}`
+function listModeBeta(
+  headers: Headers,
+  { header, token, mode }: ModeBeta,
+  authMode: AuthMode | null,
+) {
+  const listed = (headers.get(header) ?? '')
+    .split(',')
+    .map((beta) => beta.trim())
+    .filter((beta) => beta !== '')
+  const betas =
+    authMode === mode ? [...new Set([...listed, token])] : listed.filter((beta) => beta !== token)
+  if (betas.length > 0) headers.set(header, betas.join(','))
+  else headers.delete(header)
 }
 
 function keyOf(vaultKey: Uint8Array, row: GrantRow): string | null {
@@ -207,16 +228,15 @@ function injectionFor({
   requested: { path: string; url: URL }
 }): Injection {
   const { slot } = placementOf(service, row.authMode)
-  const optIn = row.authMode === null ? undefined : optInOf[row.authMode]
+  const modeBeta = modeBetaOf[service]
   return Object.freeze({
     handle: row.handle,
     accountId: row.accountId,
     apply() {
-      const headers = new Headers(
-        [...stripped.headers].filter(([name]) => !slotHeaders.includes(slotNameOf(name))),
-      )
+      const headers = new Headers(stripped.headers)
       const url = new URL(stripped.url)
-      if (optIn) headers.set(optIn.header, optedIn(headers.get(optIn.header), optIn.token))
+      for (const header of slotHeaders) headers.delete(header)
+      if (modeBeta) listModeBeta(headers, modeBeta, row.authMode)
       switch (slot.kind) {
         case 'bearer':
           headers.set('authorization', `Bearer ${secret}`)
@@ -529,7 +549,7 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
       const { selector, stripped } = readSelector(
         selectorShapeOf(vendor),
         serviceSpec(service).slot,
-        { headers: request.headers, url },
+        { headers: withSlotNames(request.headers, slotHeaders), url },
       )
       const rows = grantRows(agentGroupId, service)
       const selection = selectAccount(service, rows, unnamedIfGroupSelector(vendor, selector))

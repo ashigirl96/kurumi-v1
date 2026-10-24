@@ -55,7 +55,7 @@ export const initialGuard: Guard = ({ caller, meta }) =>
     ? { kind: 'allow' }
     : { kind: 'deny', reason: 'This procedure is not available to agents' }
 
-/** A container keeps the env it was created with, so the env names each group's grants choose belong in its revision. */
+/** A container keeps the env it was created with, so the env names each group's grants choose at host start belong in its revision. */
 export function withAccountEnv(
   revision: string,
   {

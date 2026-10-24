@@ -5,7 +5,12 @@ import { request, type RequestOptions } from 'node:https'
 import { isIP, type LookupFunction } from 'node:net'
 import { PassThrough, pipeline, type Duplex } from 'node:stream'
 
-import type { AccountHandle, AccountLedger, CredentialPrincipal } from '@kurumi/account/server'
+import {
+  headerNameAsRead,
+  type AccountHandle,
+  type AccountLedger,
+  type CredentialPrincipal,
+} from '@kurumi/account/server'
 
 import { addressRefusal, hostAddresses } from './address.ts'
 import { refusalHttp, refusalResponse, type GatewayRefusal } from './refusal.ts'
@@ -125,7 +130,7 @@ function withoutHopHeaders(headers: Headers): Headers {
 /** `writeHead` throws on a non-Latin1 or control character, and a label is any text. */
 function replaceAccountHeader(headers: Headers, account: AccountHandle | undefined): Headers {
   const replaced = new Headers(
-    [...headers].filter(([name]) => name.replaceAll('_', '-') !== 'x-kurumi-account'),
+    [...headers].filter(([name]) => headerNameAsRead(name) !== 'x-kurumi-account'),
   )
   if (account !== undefined) replaced.set('x-kurumi-account', encodeURI(account.toWellFormed()))
   return replaced

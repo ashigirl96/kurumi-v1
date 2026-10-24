@@ -372,7 +372,7 @@ test.each([
   [
     'x_api_key',
     'oauth-token',
-    { authorization: `Bearer ${groupSelector}`, x_api_key: 'sk-ant-api03-client-own' },
+    { x_api_key: groupSelector },
     ['authorization', `Bearer ${secrets.main}`],
   ],
 ] as const)(
