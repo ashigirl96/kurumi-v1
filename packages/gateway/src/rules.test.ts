@@ -176,7 +176,6 @@ describe('exactly one target', () => {
 test.each([
   ['/v1/messages', '/v1/messages'],
   ['/v1/messages?beta=true', '/v1/messages'],
-  ['/v1/messages#top', '/v1/messages'],
   ['/v1/%6Dessages', '/v1/messages'],
   ['/users/me%40example.com', '/users/me@example.com'],
   ['/users/me@example.com', '/users/me@example.com'],
@@ -204,6 +203,9 @@ test.each([
   ['an encoded control character', '/v1/%00'],
   ['an escape that is not UTF-8', '/v1/%FF'],
   ['an unrooted path', 'v1/messages'],
+  ['a raw fragment mark', '/v1/messages#top'],
+  ['a raw fragment mark that hides a dot segment', '/v1/models#/../messages'],
+  ['a raw fragment mark after the query', '/v1/models?x#/../messages'],
 ])('a path with %s is ambiguous', (_name, raw) => {
   expect(canonicalPath(raw)).toEqual({ kind: 'ambiguous' })
 })
@@ -217,6 +219,7 @@ describe('doubt holds', () => {
     expect(verdictOf(rules, anthropic({ pathAsSent: '/V1/Messages/' }))).toEqual(held)
     expect(verdictOf(rules, anthropic({ pathAsSent: '/v1/%6Dessages?beta=true' }))).toEqual(held)
     expect(verdictOf(rules, anthropic({ pathAsSent: '/v1/models/../messages' }))).toEqual(held)
+    expect(verdictOf(rules, anthropic({ pathAsSent: '/v1/models#/../messages' }))).toEqual(held)
     expect(verdictOf(rules, anthropic({ pathAsSent: '/v1/messages/batches' }))).toBeNull()
   })
 
@@ -234,7 +237,12 @@ describe('doubt holds', () => {
       effect: 'allow',
       ruleId: allow.id,
     })
-    for (const path of ['/v1/models/../messages', '/v1/models/%2e%2e/messages', '/V1/models/x']) {
+    for (const path of [
+      '/v1/models/../messages',
+      '/v1/models/%2e%2e/messages',
+      '/V1/models/x',
+      '/v1/models/claude#x',
+    ]) {
       expect(verdictOf(rules, anthropic({ pathAsSent: path }))).toEqual({
         effect: 'approve',
         ruleId: approve.id,
@@ -272,6 +280,37 @@ describe('doubt holds', () => {
       verdictOf(rules, anthropic({ method: 'POST', methodOverrides: ['PUT, Delete'] })),
     ).toEqual({ effect: 'approve', ruleId: approve.id })
     expect(verdictOf(rules, anthropic({ method: 'GET', methodOverrides: ['GET'] }))).toBeNull()
+  })
+
+  test('a GET approve rule also holds HEAD, and a GET allow rule matches GET alone', () => {
+    const { rules, add } = setup()
+    const approve = add({ account: 'anthropic/main', method: 'GET', path: '/v1/models/*' })
+    const allow = add({
+      account: 'anthropic/main',
+      method: 'GET',
+      path: '/v1/models/claude',
+      effect: 'allow',
+      priority: 10,
+    })
+    const held = { effect: 'approve' as const, ruleId: approve.id }
+
+    expect(verdictOf(rules, anthropic({ method: 'HEAD', pathAsSent: '/v1/models' }))).toEqual(held)
+    expect(
+      verdictOf(
+        rules,
+        anthropic({ method: 'POST', methodOverrides: ['head'], pathAsSent: '/v1/models' }),
+      ),
+    ).toEqual(held)
+    expect(verdictOf(rules, anthropic({ method: 'GET', pathAsSent: '/v1/models/claude' }))).toEqual(
+      {
+        effect: 'allow',
+        ruleId: allow.id,
+      },
+    )
+    expect(
+      verdictOf(rules, anthropic({ method: 'HEAD', pathAsSent: '/v1/models/claude' })),
+    ).toEqual(held)
+    expect(verdictOf(rules, anthropic({ method: 'OPTIONS', pathAsSent: '/v1/models' }))).toBeNull()
   })
 })
 

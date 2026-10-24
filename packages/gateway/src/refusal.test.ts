@@ -27,6 +27,7 @@ test.each([
   [{ code: 'approval_pending', service: 'anthropic-api', approvalId: 'apr-1' }, 403],
   [{ code: 'approval_denied', service: 'anthropic-api', approvalId: 'apr-1' }, 403],
   [{ code: 'body_too_large', service: 'anthropic-api', limit: 10 }, 413],
+  [{ code: 'body_timeout', service: 'anthropic-api', limitMs: 30_000 }, 408],
   [{ code: 'approval_limit', service: 'anthropic-api', waiting: 'undecided', limit: 32 }, 429],
   [
     {
