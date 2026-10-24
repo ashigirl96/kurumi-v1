@@ -1,0 +1,415 @@
+{
+  "version": "6",
+  "dialect": "sqlite",
+  "id": "6cad17d2-5908-4817-9de6-5c2b132af007",
+  "prevId": "d7b6b304-f22b-442b-8083-0922e4d26940",
+  "tables": {
+    "egress_allowance": {
+      "name": "egress_allowance",
+      "columns": {
+        "approval_id": {
+          "name": "approval_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "agent_group_id": {
+          "name": "agent_group_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "rule_id": {
+          "name": "rule_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "account_handle": {
+          "name": "account_handle",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "method": {
+          "name": "method",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "host": {
+          "name": "host",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "path": {
+          "name": "path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "fingerprint": {
+          "name": "fingerprint",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "used_at": {
+          "name": "used_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "egress_allowance_session_fingerprint": {
+          "name": "egress_allowance_session_fingerprint",
+          "columns": [
+            "session_id",
+            "fingerprint"
+          ],
+          "isUnique": false
+        },
+        "egress_allowance_agent_group_state": {
+          "name": "egress_allowance_agent_group_state",
+          "columns": [
+            "agent_group_id",
+            "state"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "egress_allowance_state": {
+          "name": "egress_allowance_state",
+          "value": "\"egress_allowance\".\"state\" in ('pending', 'granted', 'used', 'denied')"
+        },
+        "egress_allowance_expires_iff_granted": {
+          "name": "egress_allowance_expires_iff_granted",
+          "value": "(\"egress_allowance\".\"state\" in ('granted', 'used')) = (\"egress_allowance\".\"expires_at\" is not null)"
+        },
+        "egress_allowance_used_at_iff_used": {
+          "name": "egress_allowance_used_at_iff_used",
+          "value": "(\"egress_allowance\".\"state\" = 'used') = (\"egress_allowance\".\"used_at\" is not null)"
+        }
+      }
+    },
+    "egress_log": {
+      "name": "egress_log",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "at": {
+          "name": "at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "agent_group_id": {
+          "name": "agent_group_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "host": {
+          "name": "host",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "method": {
+          "name": "method",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "path": {
+          "name": "path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "account": {
+          "name": "account",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "service": {
+          "name": "service",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "decision": {
+          "name": "decision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "refusal": {
+          "name": "refusal",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "duration_ms": {
+          "name": "duration_ms",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "egress_log_at": {
+          "name": "egress_log_at",
+          "columns": [
+            "at"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "egress_log_refusal": {
+          "name": "egress_log_refusal",
+          "value": "(\"egress_log\".\"decision\" = 'refused') = (\"egress_log\".\"refusal\" is not null)"
+        },
+        "egress_log_account": {
+          "name": "egress_log_account",
+          "value": "(\"egress_log\".\"decision\" = 'injected') = (\"egress_log\".\"account\" is not null)"
+        }
+      }
+    },
+    "egress_rule": {
+      "name": "egress_rule",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "priority": {
+          "name": "priority",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "effect": {
+          "name": "effect",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "account_handle": {
+          "name": "account_handle",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "service": {
+          "name": "service",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "host": {
+          "name": "host",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "method": {
+          "name": "method",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "path": {
+          "name": "path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "egress_rule_account_handle": {
+          "name": "egress_rule_account_handle",
+          "columns": [
+            "account_handle"
+          ],
+          "isUnique": false
+        },
+        "egress_rule_service": {
+          "name": "egress_rule_service",
+          "columns": [
+            "service"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "egress_rule_one_target": {
+          "name": "egress_rule_one_target",
+          "value": "(\"egress_rule\".\"account_handle\" is null) <> (\"egress_rule\".\"service\" is null)"
+        },
+        "egress_rule_effect": {
+          "name": "egress_rule_effect",
+          "value": "\"egress_rule\".\"effect\" in ('approve', 'allow')"
+        },
+        "egress_rule_exact_host": {
+          "name": "egress_rule_exact_host",
+          "value": "\"egress_rule\".\"host\" is null or instr(\"egress_rule\".\"host\", '*') = 0"
+        },
+        "egress_rule_rooted_path": {
+          "name": "egress_rule_rooted_path",
+          "value": "\"egress_rule\".\"path\" is null or substr(\"egress_rule\".\"path\", 1, 1) = '/'"
+        }
+      }
+    },
+    "gateway_ca": {
+      "name": "gateway_ca",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "cert_pem": {
+          "name": "cert_pem",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "sealed_key": {
+          "name": "sealed_key",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "gateway_ca_single_row": {
+          "name": "gateway_ca_single_row",
+          "value": "\"gateway_ca\".\"id\" = 1"
+        }
+      }
+    }
+  },
+  "views": {},
+  "enums": {},
+  "_meta": {
+    "schemas": {},
+    "tables": {},
+    "columns": {}
+  },
+  "internal": {
+    "indexes": {}
+  }
+}

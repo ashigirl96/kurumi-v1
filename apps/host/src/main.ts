@@ -26,6 +26,7 @@ import {
 } from '@kurumi/approval/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import {
+  createEgressApproval,
   createEgressLog,
   credentialInject,
   gatewayContribution,
@@ -37,6 +38,7 @@ import {
   startAdmission,
   startAgentPort,
   type EgressLog,
+  type RuleStore,
 } from '@kurumi/gateway/server'
 import { hostContract, type Caller } from '@kurumi/rpc/contract'
 import { callByPath, guardRouter, type ApprovalGrant, type KurumiContext } from '@kurumi/rpc/server'
@@ -67,7 +69,11 @@ export type HostContext = KurumiContext & {
   chatLedger: ReturnType<typeof createChatLedger>
   sessionLedger: ReturnType<typeof createSessionLedger>
   accountLedger: ReturnType<typeof createAccountLedger>
-  gateway: { status(): ReturnType<typeof gatewayStatus>; egressLog: Pick<EgressLog, 'rows'> }
+  gateway: {
+    status(): ReturnType<typeof gatewayStatus>
+    egressLog: Pick<EgressLog, 'rows'>
+    rules: Pick<RuleStore, 'list' | 'add' | 'remove'>
+  }
   agentPrincipal: AgentPrincipal | null
   requestSignal?: AbortSignal
 }
@@ -256,6 +262,12 @@ export async function startHost(config: HostConfig) {
       },
     })
     sessions = sessionLedger
+    const egressApproval = createEgressApproval({
+      db,
+      accounts: accountLedger,
+      approvals: approvalLedger,
+      notify: (notice) => sessionLedger.notify(notice),
+    })
     const ledgers = {
       agentLedger,
       accessLedger,
@@ -271,6 +283,7 @@ export async function startHost(config: HostConfig) {
             caPem: ca.certPem,
           }),
         egressLog: requestLog,
+        rules: egressApproval.rules,
       },
     }
     const contextFor = (caller: Caller, grant: ApprovalGrant | null = null): HostContext => ({
@@ -287,10 +300,7 @@ export async function startHost(config: HostConfig) {
         const { path, input, caller } = approval.payload
         await callByPath(hostRouter, path, input, contextFor(caller, { approvalId: approval.id }))
       },
-      'gateway.request': () =>
-        Promise.reject(
-          new Error('gateway.request approvals have no handler until the gateway produces them'),
-        ),
+      'gateway.request': (approval, decision) => egressApproval.decided(approval, decision),
     }
     const rpc = createRpcFronts(hostRouter, contextFor)
     const agentHandler = new RPCHandler(hostRouter)
@@ -305,7 +315,11 @@ export async function startHost(config: HostConfig) {
           authenticate: (token) => sessionLedger.authenticate(token),
           ca,
           intercepts: isInterceptedHost,
-          forward: { inject: credentialInject(accountLedger), log: requestLog.record },
+          forward: {
+            inject: credentialInject(accountLedger),
+            log: requestLog.record,
+            gate: egressApproval,
+          },
           async rpc(request, response, principal, signal) {
             const result = await agentHandler.handle(request, response, {
               prefix: '/rpc',

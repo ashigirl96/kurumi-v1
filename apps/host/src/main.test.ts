@@ -587,7 +587,7 @@ test('the host router answers gateway status and log for the host and refuses th
     chatLedger: unused,
     sessionLedger: unused,
     accountLedger: unused,
-    gateway: { status: () => status, egressLog: { rows: () => [] } },
+    gateway: { status: () => status, egressLog: { rows: () => [] }, rules: unused },
     agentPrincipal: null,
   })
   try {
@@ -605,7 +605,7 @@ test('the host router answers gateway status and log for the host and refuses th
   }
 })
 
-async function cli(home: string, args: string[], stdin = ''): Promise<void> {
+async function cli(home: string, args: string[], stdin = ''): Promise<string> {
   const child = Bun.spawn(
     [process.execPath, join(import.meta.dir, '../../cli/src/main.ts'), ...args],
     {
@@ -620,6 +620,7 @@ async function cli(home: string, args: string[], stdin = ''): Promise<void> {
     exit: await child.exited,
     stderr: await new Response(child.stderr).text(),
   }).toEqual({ args, exit: 0, stderr: '' })
+  return new Response(child.stdout).text()
 }
 
 async function homeWithGrantedAccount(prefix?: string): Promise<{ home: string; key: Buffer }> {
@@ -697,3 +698,109 @@ test('a FIFO at vault.key is refused as not a regular file instead of blocking s
     `${join(home, 'vault.key')} is not a regular file`,
   )
 }, 5000)
+
+test('a gateway approval decided before a restart grants its allowance and notifies its session at the next start', async () => {
+  const home = homeForTest()
+  await startAndStop(home)
+  const sqlite = new Database(join(home, 'kurumi.db'))
+  sqlite.run(
+    `INSERT INTO agent_group (id, name, folder, created_at) VALUES ('ag-1', 'work', 'work', 0)`,
+  )
+  sqlite.run(
+    `INSERT INTO session (id, agent_group_id, mode, status, last_active_at, created_at)
+     VALUES ('ses-1', 'ag-1', 'shared', 'active', 0, 0)`,
+  )
+  sqlite.run(
+    `INSERT INTO egress_allowance (approval_id, agent_group_id, session_id, rule_id, account_handle, method, host, path, fingerprint, state, created_at)
+     VALUES ('apr-1', 'ag-1', 'ses-1', 'rul-1', 'anthropic/main', 'POST', 'api.anthropic.com', '/v1/messages', x'00', 'pending', 0)`,
+  )
+  sqlite.run(
+    `INSERT INTO pending_approval (id, kind, agent_group_id, session_id, title, body, payload, approvers, status, decided_by, created_at, decided_at)
+     VALUES ('apr-1', 'gateway.request', 'ag-1', 'ses-1', 'POST', '[]', '{}', '[]', 'approved', '{"kind":"host"}', 0, 0)`,
+  )
+  sqlite.close()
+
+  await startAndStop(home)
+
+  const after = new Database(join(home, 'kurumi.db'), { readonly: true })
+  try {
+    expect(after.query(`SELECT state FROM egress_allowance`).all()).toEqual([{ state: 'granted' }])
+    expect(after.query(`SELECT id, kind, status, content FROM inbound_message`).all()).toEqual([
+      {
+        id: 'ntf-apr-1',
+        kind: 'system',
+        status: 'pending',
+        content: expect.stringMatching(
+          /^kurumi: approval apr-1 was approved: POST https:\/\/api\.anthropic\.com\/v1\/messages as anthropic\/main\. /,
+        ),
+      },
+    ])
+    expect(
+      after
+        .query(`SELECT handled_at IS NOT NULL AS handled, handler_error FROM pending_approval`)
+        .all(),
+    ).toEqual([{ handled: 1, handler_error: null }])
+  } finally {
+    after.close()
+  }
+}, 10000)
+
+test('kurumi gateway rules adds, lists, and removes a rule through the host, and names the fix for a bad one', async () => {
+  const home = homeForTest()
+  const host = spawnHost(home)
+  await waitForHost(home, host)
+  const view = z.object({ id: z.string() }).passthrough()
+
+  const added = view.parse(
+    JSON.parse(
+      await cli(home, [
+        'gateway',
+        'rules',
+        'add',
+        '--service',
+        'anthropic-api',
+        '--method',
+        'post',
+        '--path',
+        '/v1/messages/count_tokens',
+        '--priority',
+        '5',
+        '--effect',
+        'allow',
+      ]),
+    ),
+  )
+  const listed = z.array(view).parse(JSON.parse(await cli(home, ['gateway', 'rules', 'list'])))
+  const refused = Bun.spawn(
+    [
+      process.execPath,
+      join(import.meta.dir, '../../cli/src/main.ts'),
+      'gateway',
+      'rules',
+      'add',
+      '--service',
+      'gmail',
+      '--host',
+      '*.googleapis.com',
+    ],
+    { env: { ...process.env, KURUMI_HOME: home }, stdout: 'pipe', stderr: 'pipe' },
+  )
+  const refusal = { exit: await refused.exited, stderr: await new Response(refused.stderr).text() }
+  const removed = JSON.parse(await cli(home, ['gateway', 'rules', 'remove', added.id]))
+  host.kill('SIGTERM')
+  expect(await host.exited).toBe(0)
+
+  expect(added).toMatchObject({
+    service: 'anthropic-api',
+    method: 'POST',
+    path: '/v1/messages/count_tokens',
+    priority: 5,
+    effect: 'allow',
+  })
+  expect(listed).toEqual([added])
+  expect(refusal.exit).not.toBe(0)
+  expect(refusal.stderr).toContain(
+    'kurumi matches exact hosts only; add one rule per host, such as www.googleapis.com',
+  )
+  expect(removed).toEqual({ removed: true })
+}, 10000)

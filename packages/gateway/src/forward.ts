@@ -1,9 +1,9 @@
 import type { LookupAddress } from 'node:dns'
 import { lookup } from 'node:dns/promises'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http'
 import { request, type RequestOptions } from 'node:https'
 import { isIP, type LookupFunction } from 'node:net'
-import { PassThrough, pipeline, type Duplex } from 'node:stream'
+import { PassThrough, pipeline, type Duplex, type Readable } from 'node:stream'
 
 import {
   headerNameAsRead,
@@ -14,7 +14,13 @@ import {
 } from '@kurumi/account/server'
 
 import { addressRefusal, hostAddresses } from './address.ts'
-import { REFUSAL_STATUS, refusalHttp, refusalResponse, type GatewayRefusal } from './refusal.ts'
+import {
+  REFUSAL_STATUS,
+  refusalHttp,
+  refusalResponse,
+  type GatewayRefusal,
+  type HoldRefusal,
+} from './refusal.ts'
 
 export type ConnectTarget = { host: string; port: number }
 
@@ -38,6 +44,7 @@ export type EgressDecision =
   | { decision: 'injected'; account: AccountHandle; service: ServiceId }
   | { decision: 'passed' }
   | { decision: 'refused'; refusal: GatewayRefusal['code']; service: ServiceId | null }
+  | { decision: 'held'; service: ServiceId }
 
 export type EgressEvent<Principal> = EgressDecision & {
   principal: Principal
@@ -56,14 +63,55 @@ export type UpstreamDestination = {
   caPem: string
 }
 
+export type ScreenInput<Principal> = {
+  principal: Principal
+  account: { handle: AccountHandle; service: ServiceId }
+  host: string
+  method: string
+  /** Values of X-HTTP-Method-Override, X-HTTP-Method, and X-Method-Override, as sent. */
+  methodOverrides: readonly string[]
+  /** One value per header line, as sent; empty when the header is absent. */
+  contentType: readonly string[]
+  contentEncoding: readonly string[]
+  /** As sent, query included. */
+  path: string
+  /** null for a WebSocket upgrade, which carries no body. */
+  body: Readable | null
+  declaredLength: number | null
+  /** Aborts when the tunnel closes or the client hangs up. */
+  signal: AbortSignal
+  bodyDeadlineMs: number
+  /** Called once per wait, when the request starts waiting on a person. */
+  held(): void
+}
+
+export type Screened =
+  | {
+      kind: 'forward'
+      body: Buffer
+      /** Called when no byte of the request reached the upstream. A repeat call does nothing. */
+      undelivered: () => void
+    }
+  | { kind: 'refuse'; refusal: HoldRefusal }
+  | { kind: 'abandoned' }
+
+export type EgressGate<Principal> = {
+  /** null, synchronously, unless an approve rule matches. Otherwise settles once. */
+  screen(input: ScreenInput<Principal>): Promise<Screened> | null
+}
+
 export type ForwardDeps<Principal> = {
   inject(input: InjectionInput<Principal>): Injected | Promise<Injected>
+  gate?: EgressGate<Principal>
   upstream?: UpstreamDestination
   resolve?: (host: string) => Promise<LookupAddress[]>
   addressRefusal?: (address: string, host: readonly string[]) => string | null
   hostAddresses?: () => readonly string[]
   log?(event: EgressEvent<Principal>): void
+  bodyDeadlineMs?: number
 }
+
+const REQUEST_BODY_DEADLINE_MS = 30_000
 
 const resolveAll = (host: string) => lookup(host, { all: true })
 
@@ -184,10 +232,20 @@ type Prepared =
       options: Omit<RequestOptions, 'headers'> & { headers: Record<string, string> }
       account?: AccountHandle
       decision: EgressDecision
+      approvedBody?: Buffer
+      undelivered: () => void
     }
   | { kind: 'bad_request' }
   | { kind: 'refused'; refusal: GatewayRefusal; decision: EgressDecision }
   | { kind: 'unreachable'; decision: EgressDecision }
+  | { kind: 'abandoned' }
+
+type Exchange = {
+  body: Readable | null
+  closes: NodeJS.EventEmitter & { readonly destroyed: boolean }
+  bodyDeadlineMs: number
+  held(service: ServiceId): void
+}
 
 function refusedDecision(refusal: GatewayRefusal): EgressDecision {
   return {
@@ -203,7 +261,7 @@ function forwardedDecision({ account }: Forwarded): EgressDecision {
     : { decision: 'passed' }
 }
 
-function pathWithoutQuery(path: string): string {
+export function pathWithoutQuery(path: string): string {
   const end = path.search(/[?#]/)
   return end === -1 ? path : path.slice(0, end)
 }
@@ -228,10 +286,62 @@ function egressRecorder<Principal>(
     })
 }
 
+const methodOverrideHeaders = ['x-http-method-override', 'x-http-method', 'x-method-override']
+
+function valuesAsRead(rawHeaders: readonly string[], names: readonly string[]): string[] {
+  return rawHeaders.flatMap((name, index) => {
+    const value = rawHeaders[index + 1]
+    return index % 2 === 0 && value !== undefined && names.includes(headerNameAsRead(name))
+      ? [value]
+      : []
+  })
+}
+
+function declaredLengthOf(req: IncomingMessage): number | null {
+  const declared = req.headers['content-length']
+  return declared !== undefined && /^\d+$/.test(declared) ? Number(declared) : null
+}
+
+function screening<Principal>(
+  context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
+  req: IncomingMessage,
+  gate: EgressGate<Principal> | undefined,
+  account: Forwarded['account'],
+  exchange: Exchange,
+): Promise<Screened> | null {
+  if (!gate || !account) return null
+  const ended = new AbortController()
+  const screened = gate.screen({
+    principal: context.principal,
+    account,
+    host: context.target.host,
+    method: req.method ?? 'GET',
+    methodOverrides: valuesAsRead(req.rawHeaders, methodOverrideHeaders),
+    contentType: valuesAsRead(req.rawHeaders, ['content-type']),
+    contentEncoding: valuesAsRead(req.rawHeaders, ['content-encoding']),
+    path: req.url ?? '/',
+    body: exchange.body,
+    declaredLength: declaredLengthOf(req),
+    signal: ended.signal,
+    bodyDeadlineMs: exchange.bodyDeadlineMs,
+    held: () => exchange.held(account.service),
+  })
+  if (!screened) return null
+  const end = () => ended.abort()
+  context.signal.addEventListener('abort', end, { once: true })
+  exchange.closes.once('close', end)
+  if (context.signal.aborted || exchange.closes.destroyed) end()
+  return screened.finally(() => {
+    context.signal.removeEventListener('abort', end)
+    exchange.closes.off('close', end)
+  })
+}
+
 async function prepareRequest<Principal>(
   context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
   req: IncomingMessage,
   deps: ForwardDeps<Principal>,
+  exchange: Exchange,
 ): Promise<Prepared> {
   const { target } = context
   const path = req.url ?? '/'
@@ -239,6 +349,7 @@ async function prepareRequest<Principal>(
   if (
     !path.startsWith('/') ||
     path.startsWith('//') ||
+    path.includes('#') ||
     !host ||
     (host !== authority(target) && !(target.port === 443 && host === `${authority(target)}:443`))
   ) {
@@ -266,10 +377,24 @@ async function prepareRequest<Principal>(
     return { ...pinned, decision: refusedDecision(pinned.refusal) }
   }
   if (pinned?.kind === 'unreachable') return { kind: 'unreachable', decision }
+  const held = screening(context, req, deps.gate, injected.account, exchange)
+  const screened = held && (await held)
+  if (screened?.kind === 'refuse') {
+    return {
+      kind: 'refused',
+      refusal: screened.refusal,
+      decision: refusedDecision(screened.refusal),
+    }
+  }
+  if (screened?.kind === 'abandoned') return screened
+  const body = screened?.kind === 'forward' && exchange.body ? screened.body : undefined
   const headers = withoutHopHeaders(injected.headers)
   headers.set('host', authority(target))
   headers.delete('content-length')
-  if (req.headers['transfer-encoding'] !== undefined) {
+  if (body) {
+    headers.delete('expect')
+    headers.set('content-length', String(body.length))
+  } else if (req.headers['transfer-encoding'] !== undefined) {
     headers.set('transfer-encoding', req.headers['transfer-encoding'])
   } else if (req.headers['content-length'] !== undefined) {
     headers.set('content-length', req.headers['content-length'])
@@ -289,7 +414,28 @@ async function prepareRequest<Principal>(
     },
     account: injected.account?.handle,
     decision,
+    approvedBody: body,
+    undelivered: screened?.kind === 'forward' ? screened.undelivered : nothingToHandBack,
   }
+}
+
+const nothingToHandBack = () => {}
+
+/** Before the TLS handshake ends, the upstream has read no byte of the request. */
+function requestUpstream(options: RequestOptions, undelivered: () => void): ClientRequest {
+  const upstream = request(options)
+  let handshaken = false
+  upstream.once('socket', (socket) =>
+    socket.once('secureConnect', () => {
+      handshaken = true
+    }),
+  )
+  const ended = () => {
+    if (!handshaken) undelivered()
+  }
+  upstream.prependOnceListener('error', ended)
+  upstream.once('close', ended)
+  return upstream
 }
 
 function respondUnreachable(res: ServerResponse, host: string): void {
@@ -297,10 +443,31 @@ function respondUnreachable(res: ServerResponse, host: string): void {
   res.end(JSON.stringify({ error: 'upstream_unreachable', host }))
 }
 
-function respondAfterBodyDrains(req: IncomingMessage, respond: () => void): void {
+/** A client reads an answer sent after its body instead of a reset; past `answerBy` kurumi stops waiting and closes. */
+function respondAfterBodyDrains(
+  req: IncomingMessage,
+  res: ServerResponse,
+  answerBy: number,
+  respond: (close: boolean) => void,
+): void {
   req.resume()
-  if (req.complete) respond()
-  else req.once('end', respond)
+  if (req.complete) {
+    respond(false)
+    return
+  }
+  const drained = () => {
+    clearTimeout(stalled)
+    respond(false)
+  }
+  const stalled = setTimeout(() => {
+    req.off('end', drained)
+    respond(true)
+  }, answerBy - performance.now())
+  req.once('end', drained)
+  res.once('close', () => {
+    clearTimeout(stalled)
+    req.off('end', drained)
+  })
 }
 
 const badGateway = 'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
@@ -312,30 +479,41 @@ export async function forward<Principal>(
   deps: ForwardDeps<Principal>,
 ): Promise<void> {
   const record = egressRecorder(context, req, deps)
-  const prepared = await prepareRequest(context, req, deps)
+  const bodyDeadlineMs = deps.bodyDeadlineMs ?? REQUEST_BODY_DEADLINE_MS
+  const answerBy = performance.now() + bodyDeadlineMs
+  const prepared = await prepareRequest(context, req, deps, {
+    body: req,
+    closes: res,
+    bodyDeadlineMs,
+    held: (service) => record({ decision: 'held', service }, null),
+  })
   const gone = context.signal.aborted || res.destroyed
+  if (prepared.kind === 'abandoned') return
   if (prepared.kind === 'bad_request') {
     if (!gone) res.writeHead(400, { connection: 'close' }).end()
     return
   }
   const { decision } = prepared
   if (gone) {
+    if (prepared.kind === 'forward') prepared.undelivered()
     record(decision, null)
     return
   }
   res.once('close', () => record(decision, res.headersSent ? res.statusCode : null))
   if (prepared.kind === 'refused') {
     const { status, headers, body } = refusalResponse(prepared.refusal)
-    respondAfterBodyDrains(req, () => res.writeHead(status, headers).end(body))
+    respondAfterBodyDrains(req, res, answerBy, (close) =>
+      res.writeHead(status, close ? { ...headers, connection: 'close' } : headers).end(body),
+    )
     return
   }
   if (prepared.kind === 'unreachable') {
-    respondAfterBodyDrains(req, () => respondUnreachable(res, context.target.host))
+    respondAfterBodyDrains(req, res, answerBy, () => respondUnreachable(res, context.target.host))
     return
   }
   const { options, account } = prepared
   const body = new PassThrough()
-  const upstream = request(options)
+  const upstream = requestUpstream(options, prepared.undelivered)
 
   const cancel = () => {
     upstream.destroy()
@@ -377,7 +555,8 @@ export async function forward<Principal>(
       if (error) cancel()
     })
   })
-  req.pipe(body)
+  if (prepared.approvedBody) body.end(prepared.approvedBody)
+  else req.pipe(body)
   pipeline(body, upstream, (error) => {
     if (error) body.destroy()
   })
@@ -400,8 +579,14 @@ export async function forwardUpgrade<Principal>(
     return
   }
   const record = egressRecorder(context, req, deps)
-  const prepared = await prepareRequest(context, req, deps)
+  const prepared = await prepareRequest(context, req, deps, {
+    body: null,
+    closes: client,
+    bodyDeadlineMs: deps.bodyDeadlineMs ?? REQUEST_BODY_DEADLINE_MS,
+    held: (service) => record({ decision: 'held', service }, null),
+  })
   const gone = context.signal.aborted || client.destroyed
+  if (prepared.kind === 'abandoned') return
   if (prepared.kind === 'bad_request') {
     if (!gone) {
       client.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
@@ -410,6 +595,7 @@ export async function forwardUpgrade<Principal>(
   }
   const { decision } = prepared
   if (gone) {
+    if (prepared.kind === 'forward') prepared.undelivered()
     record(decision, null)
     return
   }
@@ -426,10 +612,10 @@ export async function forwardUpgrade<Principal>(
     return
   }
   const { options, account } = prepared
-  const upstream = request({
-    ...options,
-    headers: { ...options.headers, connection: 'Upgrade', upgrade: 'websocket' },
-  })
+  const upstream = requestUpstream(
+    { ...options, headers: { ...options.headers, connection: 'Upgrade', upgrade: 'websocket' } },
+    prepared.undelivered,
+  )
   let upgraded: Duplex | undefined
   const cancel = () => {
     upstream.destroy()

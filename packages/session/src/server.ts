@@ -109,12 +109,16 @@ export type RuntimeLog =
     }
   | SupervisionLog
 type OutboundInput = { id: string; sessionId: string; text: string; inReplyTo?: string }
+export type SessionNotice = { key: string; sessionId: string; text: string }
+export type NoticeReceipt = 'queued' | 'duplicate' | 'no_session'
 export type SessionLedger = {
   start(): Promise<void>
   adopted(): Promise<void>
   stop(): Promise<void>
   routeInbound(event: InboundEvent): Promise<InboundReceipt>
   postOutbound(input: OutboundInput): Promise<void>
+  /** Starts a turn with `text` as a system message, once per key, and shows the same text in the chat. */
+  notify(notice: SessionNotice): NoticeReceipt
   authenticate(token: string): AgentPrincipal | null
   channel: {
     pull(
@@ -144,6 +148,16 @@ function parse<S extends z.ZodType>(schema: S, input: unknown): z.output<S> {
   const result = schema.safeParse(input)
   if (!result.success) throw new ORPCError('BAD_REQUEST', { message: result.error.message })
   return result.data
+}
+
+function nextInboundSeq(tx: Tx, id: string): number {
+  return (
+    (tx
+      .select({ seq: sql<number>`coalesce(max(${inboundMessage.seq}), 0)` })
+      .from(inboundMessage)
+      .where(eq(inboundMessage.sessionId, id))
+      .get()?.seq ?? 0) + 1
+  )
 }
 
 export function createSessionLedger({
@@ -645,13 +659,7 @@ export function createSessionLedger({
             message: 'inbound id already has different content or session',
           })
         }
-        const seq =
-          existing?.seq ??
-          (tx
-            .select({ seq: sql<number>`coalesce(max(${inboundMessage.seq}), 0)` })
-            .from(inboundMessage)
-            .where(eq(inboundMessage.sessionId, current.id))
-            .get()?.seq ?? 0) + 1
+        const seq = existing?.seq ?? nextInboundSeq(tx, current.id)
         if (!existing) {
           tx.insert(inboundMessage)
             .values({
@@ -702,6 +710,44 @@ export function createSessionLedger({
       } catch (error) {
         if (!(error instanceof ORPCError) || error.code !== 'SERVICE_UNAVAILABLE') throw error
       }
+    },
+    notify({ key, sessionId: id, text }) {
+      const noticeId = `ntf-${key}`
+      const receipt = transaction(db, (tx): NoticeReceipt => {
+        const current = tx
+          .select({ id: session.id })
+          .from(session)
+          .where(and(eq(session.id, id), eq(session.status, 'active')))
+          .get()
+        if (!current) return 'no_session'
+        const existing = tx
+          .select({ id: inboundMessage.id })
+          .from(inboundMessage)
+          .where(eq(inboundMessage.id, noticeId))
+          .get()
+        if (existing) return 'duplicate'
+        const now = new Date()
+        tx.insert(inboundMessage)
+          .values({
+            id: noticeId,
+            sessionId: id,
+            seq: nextInboundSeq(tx, id),
+            kind: 'system',
+            trigger: true,
+            status: 'pending',
+            content: text,
+            createdAt: now,
+          })
+          .run()
+        tx.update(session).set({ lastActiveAt: now }).where(eq(session.id, id)).run()
+        return 'queued'
+      })
+      if (receipt !== 'queued' || stopped) return receipt
+      wake(id)
+      if (enabled) void reconcile(id).catch(() => {})
+      // An agent names its own outbound ids, so a guessable id here could be taken first.
+      void deliver({ id: `ntf-${crypto.randomUUID()}`, sessionId: id, text }).catch(() => {})
+      return receipt
     },
     channel: {
       pull(principal, input, signal) {
