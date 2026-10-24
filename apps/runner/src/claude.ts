@@ -51,7 +51,6 @@ function options(continuation: string | null, abortController: AbortController):
     abortController,
     ...(continuation === null ? {} : { resume: continuation }),
     systemPrompt: { type: 'preset', preset: 'claude_code' },
-    // The model can write the whole workspace, config dir included, so no settings file is trusted.
     settingSources: [],
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,

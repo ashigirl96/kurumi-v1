@@ -50,7 +50,7 @@ export async function runRunner(options: {
       }
     }
   }
-  async function fill(id: string, inReplyTo: string, text: string): Promise<boolean> {
+  async function fillSlot(id: string, inReplyTo: string, text: string): Promise<boolean> {
     try {
       await retry(() =>
         host.session.channel.post(
@@ -79,9 +79,8 @@ export async function runRunner(options: {
         prompt: message.content,
         continuation: saved.value,
         signal,
-        // A re-run turn finds the slots its lost run filled, and a slot with other text is not ours.
         async reply(text) {
-          while (!(await fill(replyId(message.id, slot), message.id, text))) slot++
+          while (!(await fillSlot(replyId(message.id, slot), message.id, text))) slot++
           slot++
         },
         async remember(continuation) {
