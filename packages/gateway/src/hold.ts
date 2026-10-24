@@ -28,7 +28,7 @@ export type GatewayApprovals = {
 export type SessionNotice = { key: string; sessionId: string; text: string }
 
 export type EgressApproval = EgressGate<EgressPrincipal> & {
-  /** The 'gateway.request' handler. Idempotent; never waits on the upstream. Throws when no allowance row exists. */
+  /** Idempotent; never waits on the upstream. Throws when no allowance row exists. */
   decided(approval: { id: string }, decision: 'approve' | 'deny'): Promise<void>
   rules: RuleStore
 }
@@ -36,7 +36,6 @@ export type EgressApproval = EgressGate<EgressPrincipal> & {
 export const HOLD_MS = 180_000
 export const ALLOWANCE_MS = 10 * 60_000
 export const MAX_HELD_BODY_BYTES = 10 * 1024 * 1024
-/** nanoclaw's gateway approval coordinator refuses a held request at once when 32 already wait. */
 export const MAX_HELD = 32
 const PREVIEW_BYTES = 1024
 
@@ -116,10 +115,10 @@ function noticeText(
   decision: 'approve' | 'deny',
   row: Pick<
     typeof egressAllowance.$inferSelect,
-    'approvalId' | 'method' | 'host' | 'path' | 'accountHandle'
+    'approvalId' | 'method' | 'host' | 'pathWithoutQuery' | 'accountHandle'
   >,
 ): string {
-  const request = `${row.method} https://${row.host}${row.path} as ${row.accountHandle}`
+  const request = `${row.method} https://${row.host}${row.pathWithoutQuery} as ${row.accountHandle}`
   switch (decision) {
     case 'approve':
       return `kurumi: approval ${row.approvalId} was approved: ${request}. The first attempt ended before the decision. Send exactly the same request with the same body within 10 minutes; it passes once. A changed body needs a new approval.`
@@ -144,7 +143,6 @@ export function createEgressApproval(deps: {
   const holdMs = deps.holdMs ?? HOLD_MS
   const now = deps.now ?? Date.now
   const rules = createRuleStore({ db: deps.db, accounts: deps.accounts, now })
-  /** approval id -> the one live hold on it. Only `wait` adds or deletes an entry. */
   const waiters = new Map<string, (end: HoldEnd) => void>()
   let inFlight = 0
 
@@ -228,7 +226,7 @@ export function createEgressApproval(deps: {
         accountHandle: account.handle,
         method: held.method,
         host: held.host,
-        path: pathWithoutQuery(input.path),
+        pathWithoutQuery: pathWithoutQuery(input.path),
         fingerprint,
         state: 'pending',
         createdAt: at,
@@ -237,7 +235,6 @@ export function createEgressApproval(deps: {
     return { kind: 'wait', approvalId }
   }
 
-  /** Every ending goes through `settle`, and the first one wins. */
   function wait(approvalId: string, signal: AbortSignal): Promise<HoldEnd> {
     if (signal.aborted) return Promise.resolve('gone')
     const ended = Promise.withResolvers<HoldEnd>()
@@ -310,7 +307,6 @@ export function createEgressApproval(deps: {
   const allowanceOf = (approvalId: string) =>
     deps.db.select().from(egressAllowance).where(eq(egressAllowance.approvalId, approvalId)).get()
 
-  /** Synchronous, so the live waiter takes the grant before any client event can run. */
   function takeLive(approvalId: string): boolean {
     const settle = waiters.get(approvalId)
     if (!settle) return false
@@ -338,7 +334,7 @@ export function createEgressApproval(deps: {
         host: input.host,
         method: input.method,
         methodOverrides: input.methodOverrides,
-        path: input.path,
+        pathAsSent: input.path,
       })
       if (verdict?.effect !== 'approve') return null
       if (inFlight >= MAX_HELD) {

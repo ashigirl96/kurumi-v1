@@ -53,7 +53,7 @@ const anthropic = (overrides: Partial<RuleRequest> = {}): RuleRequest => ({
   host: 'api.anthropic.com',
   method: 'POST',
   methodOverrides: [],
-  path: '/v1/messages',
+  pathAsSent: '/v1/messages',
   ...overrides,
 })
 
@@ -63,7 +63,7 @@ const gmail = (overrides: Partial<RuleRequest> = {}): RuleRequest => ({
   host: 'gmail.googleapis.com',
   method: 'POST',
   methodOverrides: [],
-  path: '/gmail/v1/users/me/messages/send',
+  pathAsSent: '/gmail/v1/users/me/messages/send',
   ...overrides,
 })
 
@@ -89,7 +89,7 @@ test('a service rule matches every account of that service and no other service'
     effect: 'approve',
     ruleId: rule.id,
   })
-  expect(verdictOf(rules, gmail({ path: '/v1/messages' }))).toBeNull()
+  expect(verdictOf(rules, gmail({ pathAsSent: '/v1/messages' }))).toBeNull()
 })
 
 describe('priority order', () => {
@@ -103,7 +103,7 @@ describe('priority order', () => {
       priority: 10,
     })
 
-    expect(verdictOf(rules, anthropic({ path: '/v1/messages/count_tokens' }))).toEqual({
+    expect(verdictOf(rules, anthropic({ pathAsSent: '/v1/messages/count_tokens' }))).toEqual({
       effect: 'allow',
       ruleId: carveOut.id,
     })
@@ -214,10 +214,10 @@ describe('doubt holds', () => {
     const rule = add({ account: 'anthropic/main', path: '/v1/messages' })
     const held = { effect: 'approve' as const, ruleId: rule.id }
 
-    expect(verdictOf(rules, anthropic({ path: '/V1/Messages/' }))).toEqual(held)
-    expect(verdictOf(rules, anthropic({ path: '/v1/%6Dessages?beta=true' }))).toEqual(held)
-    expect(verdictOf(rules, anthropic({ path: '/v1/models/../messages' }))).toEqual(held)
-    expect(verdictOf(rules, anthropic({ path: '/v1/messages/batches' }))).toBeNull()
+    expect(verdictOf(rules, anthropic({ pathAsSent: '/V1/Messages/' }))).toEqual(held)
+    expect(verdictOf(rules, anthropic({ pathAsSent: '/v1/%6Dessages?beta=true' }))).toEqual(held)
+    expect(verdictOf(rules, anthropic({ pathAsSent: '/v1/models/../messages' }))).toEqual(held)
+    expect(verdictOf(rules, anthropic({ pathAsSent: '/v1/messages/batches' }))).toBeNull()
   })
 
   test('an allow rule never matches an ambiguous or differently cased path', () => {
@@ -230,12 +230,12 @@ describe('doubt holds', () => {
       priority: 10,
     })
 
-    expect(verdictOf(rules, anthropic({ path: '/v1/models/claude' }))).toEqual({
+    expect(verdictOf(rules, anthropic({ pathAsSent: '/v1/models/claude' }))).toEqual({
       effect: 'allow',
       ruleId: allow.id,
     })
     for (const path of ['/v1/models/../messages', '/v1/models/%2e%2e/messages', '/V1/models/x']) {
-      expect(verdictOf(rules, anthropic({ path }))).toEqual({
+      expect(verdictOf(rules, anthropic({ pathAsSent: path }))).toEqual({
         effect: 'approve',
         ruleId: approve.id,
       })
@@ -247,9 +247,12 @@ describe('doubt holds', () => {
     const rule = add({ service: 'gmail', path: '/gmail/v1/users/me/messages/*' })
 
     for (const path of ['/gmail/v1/users/me/messages', '/gmail/v1/users/me/messages/send']) {
-      expect(verdictOf(rules, gmail({ path }))).toEqual({ effect: 'approve', ruleId: rule.id })
+      expect(verdictOf(rules, gmail({ pathAsSent: path }))).toEqual({
+        effect: 'approve',
+        ruleId: rule.id,
+      })
     }
-    expect(verdictOf(rules, gmail({ path: '/gmail/v1/users/me/messagesX' }))).toBeNull()
+    expect(verdictOf(rules, gmail({ pathAsSent: '/gmail/v1/users/me/messagesX' }))).toBeNull()
   })
 
   test('a method override header reaches an approve rule and keeps an allow rule from matching', () => {

@@ -33,15 +33,13 @@ export type EgressRule = {
   path: PathPattern | null
 }
 
-/** Headers-level facts after account selection. `path` is as sent, query included. */
 export type RuleRequest = {
   handle: AccountHandle
   service: ServiceId
   host: string
   method: string
-  /** Values of X-HTTP-Method-Override, X-HTTP-Method, X-Method-Override, in any order. */
   methodOverrides: readonly string[]
-  path: string
+  pathAsSent: string
 }
 
 export type Verdict = { effect: RuleEffect; ruleId: RuleId } | null
@@ -51,7 +49,7 @@ export type CanonicalPath = { kind: 'canonical'; path: string } | { kind: 'ambig
 export type RuleStore = {
   /** Evaluation order: the first row that matches wins. */
   list(): RuleView[]
-  /** Throws ORPCError BAD_REQUEST with a message that names the fix. The table CHECKs are the backstop. */
+  /** Throws ORPCError BAD_REQUEST with a message that names the fix. */
   add(input: RuleInput): RuleView
   remove(id: string): { removed: boolean }
   read(key: { handle: AccountHandle; service: ServiceId }): EgressRule[]
@@ -143,7 +141,7 @@ function outranks(a: EgressRule, b: EgressRule): boolean {
 }
 
 export function evaluate(rules: readonly EgressRule[], request: RuleRequest): Verdict {
-  const path = canonicalPath(request.path)
+  const path = canonicalPath(request.pathAsSent)
   const host = normalizeHost(request.host)
   const method = request.method.toUpperCase()
   const overrides = request.methodOverrides.flatMap((value) =>
@@ -175,7 +173,6 @@ function patternOf(path: string): PathPattern {
     : { kind: 'exact', path }
 }
 
-/** A stored pattern is exactly what matching compares, so it must already be canonical. */
 function isRulePath(path: string): boolean {
   const literal = path.endsWith(PREFIX_MARK) ? path.slice(0, -1) : path
   if (/[*?#]/.test(literal)) return false

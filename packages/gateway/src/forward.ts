@@ -219,8 +219,7 @@ type Prepared =
       options: Omit<RequestOptions, 'headers'> & { headers: Record<string, string> }
       account?: AccountHandle
       decision: EgressDecision
-      /** The body a person approved, read in full; absent when the request body streams. */
-      body?: Buffer
+      approvedBody?: Buffer
     }
   | { kind: 'bad_request' }
   | { kind: 'refused'; refusal: GatewayRefusal; decision: EgressDecision }
@@ -290,7 +289,6 @@ function declaredLengthOf(req: IncomingMessage): number | null {
   return declared !== undefined && /^\d+$/.test(declared) ? Number(declared) : null
 }
 
-/** Drops its listeners once screening settles, so a keep-alive tunnel does not gather one per request. */
 function screening<Principal>(
   context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
   req: IncomingMessage,
@@ -403,7 +401,7 @@ async function prepareRequest<Principal>(
     },
     account: injected.account?.handle,
     decision,
-    body,
+    approvedBody: body,
   }
 }
 
@@ -454,7 +452,7 @@ export async function forward<Principal>(
     return
   }
   const { options, account } = prepared
-  const body = prepared.body ? undefined : new PassThrough()
+  const body = prepared.approvedBody ? undefined : new PassThrough()
   const upstream = request(options)
 
   const cancel = () => {
@@ -500,7 +498,7 @@ export async function forward<Principal>(
     })
   })
   if (!body) {
-    upstream.end(prepared.body)
+    upstream.end(prepared.approvedBody)
     return
   }
   req.pipe(body)

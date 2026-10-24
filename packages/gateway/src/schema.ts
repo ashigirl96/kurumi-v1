@@ -73,8 +73,7 @@ export const egressAllowance = sqliteTable(
     accountHandle: text('account_handle').notNull(),
     method: text('method').notNull(),
     host: text('host').notNull(),
-    /** Without the query, as the notice names it. */
-    path: text('path').notNull(),
+    pathWithoutQuery: text('path').notNull(),
     fingerprint: blob('fingerprint', { mode: 'buffer' }).notNull(),
     state: text('state', { enum: allowanceStates }).notNull(),
     expiresAt: integer('expires_at', { mode: 'timestamp_ms' }),
