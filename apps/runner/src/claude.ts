@@ -15,6 +15,35 @@ export type Turn = {
   remember(continuation: string): Promise<void>
 }
 
+const inheritedNames = new Set([
+  'HOME',
+  'PATH',
+  'HTTPS_PROXY',
+  'https_proxy',
+  'HTTP_PROXY',
+  'http_proxy',
+  'NO_PROXY',
+  'no_proxy',
+  'NODE_EXTRA_CA_CERTS',
+  'SSL_CERT_FILE',
+])
+const inheritedPrefixes = ['ANTHROPIC_', 'CLAUDE_CODE_']
+
+// Claude Code hands its env to every tool the model runs, so the runner's KURUMI_* stays behind.
+function claudeCodeEnv(workspace: string): Record<string, string> {
+  const inherited = Object.entries(process.env).filter(
+    (entry): entry is [string, string] =>
+      entry[1] !== undefined &&
+      (inheritedNames.has(entry[0]) ||
+        inheritedPrefixes.some((prefix) => entry[0].startsWith(prefix))),
+  )
+  return {
+    ...Object.fromEntries(inherited),
+    CLAUDE_CONFIG_DIR: join(workspace, '.claude'),
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+  }
+}
+
 function options(continuation: string | null, abortController: AbortController): Options {
   const workspace = process.cwd()
   return {
@@ -22,16 +51,11 @@ function options(continuation: string | null, abortController: AbortController):
     abortController,
     ...(continuation === null ? {} : { resume: continuation }),
     systemPrompt: { type: 'preset', preset: 'claude_code' },
-    settingSources: ['project'],
+    // The model can write the whole workspace, config dir included, so no settings file is trusted.
+    settingSources: [],
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
-    env: {
-      ...process.env,
-      CLAUDE_CONFIG_DIR: join(workspace, '.claude'),
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      // Claude Code refuses bypassPermissions as root unless it is told the container is the sandbox.
-      IS_SANDBOX: '1',
-    },
+    env: claudeCodeEnv(workspace),
   }
 }
 
