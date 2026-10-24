@@ -13,14 +13,16 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { createAccessLedger } from '@kurumi/access/server'
 import { seal } from '@kurumi/account/server'
 import { createAgentLedger } from '@kurumi/agent/server'
+import { createApprovalLedger } from '@kurumi/approval/server'
 import { createRouterClient } from '@orpc/server'
 import { z } from 'zod'
 
 import { openKurumiDb, migrateAll } from './db.ts'
 import { queryReadOnly } from './fronts.ts'
-import { hostRouter, initialGuard, type HostContext } from './main.ts'
+import { hostRouter, type HostContext } from './main.ts'
 import { migrations } from './migrations.ts'
 
 const homes: string[] = []
@@ -550,24 +552,6 @@ test('diagnostic worker preserves blobs and reports query errors and timeout', (
   }
 }, 5000)
 
-test('the temporary host guard allows host and human callers and only agent channel calls', () => {
-  const common = { path: ['probe'], input: undefined, grant: null }
-  expect(initialGuard({ ...common, caller: { kind: 'host' }, meta: {} })).toEqual({ kind: 'allow' })
-  expect(
-    initialGuard({ ...common, caller: { kind: 'human', userId: 'u' }, meta: { agent: 'hold' } }),
-  ).toEqual({ kind: 'allow' })
-  const caller = { kind: 'agent', agentGroupId: 'ag-test', sessionId: 's' } as const
-  expect(initialGuard({ ...common, caller, meta: { agent: 'channel' } })).toEqual({ kind: 'allow' })
-  for (const meta of [
-    {},
-    { agent: 'own-group' },
-    { agent: 'scoped' },
-    { agent: 'hold' },
-  ] as const) {
-    expect(initialGuard({ ...common, caller, meta }).kind).toBe('deny')
-  }
-})
-
 const outcome = (call: Promise<unknown>) =>
   call.then(
     () => 'answered',
@@ -576,6 +560,15 @@ const outcome = (call: Promise<unknown>) =>
 
 test('the host router answers gateway status and log for the host and refuses them to an agent', async () => {
   const db = openKurumiDb(join(homeForTest(), 'kurumi.db'))
+  migrateAll(db, migrations)
+  const accessLedger = createAccessLedger({ db })
+  const approvalLedger = createApprovalLedger({
+    db,
+    accessLedger,
+    handlers: () => ({ procedure: async () => {}, 'gateway.request': async () => {} }),
+    decidePath: ['approval', 'decide'],
+    log: () => {},
+  })
   const status = {
     admission: 'open',
     detail: null,
@@ -586,9 +579,11 @@ test('the host router answers gateway status and log for the host and refuses th
   const contextFor = (caller: HostContext['caller']): HostContext => ({
     db,
     caller,
-    guard: initialGuard,
+    guard: approvalLedger.guard,
     grant: null,
     agentLedger: unused,
+    accessLedger,
+    approvalLedger,
     chatLedger: unused,
     sessionLedger: unused,
     accountLedger: unused,

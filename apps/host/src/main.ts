@@ -10,6 +10,7 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 
+import { createAccessLedger, router as accessRouter } from '@kurumi/access/server'
 import {
   createAccountLedger,
   isInterceptedHost,
@@ -18,6 +19,11 @@ import {
   VaultError,
 } from '@kurumi/account/server'
 import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
+import {
+  createApprovalLedger,
+  router as approvalRouter,
+  type ApprovalHandlers,
+} from '@kurumi/approval/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import {
   createEgressLog,
@@ -33,7 +39,7 @@ import {
   type EgressLog,
 } from '@kurumi/gateway/server'
 import { hostContract, type Caller } from '@kurumi/rpc/contract'
-import { guardRouter, type Guard, type KurumiContext } from '@kurumi/rpc/server'
+import { callByPath, guardRouter, type ApprovalGrant, type KurumiContext } from '@kurumi/rpc/server'
 import {
   containerRevision,
   createDockerDriver,
@@ -53,14 +59,11 @@ import { acquireLock } from './lock.ts'
 import { migrations } from './migrations.ts'
 import { loadVaultKey } from './vault-key.ts'
 
-export const initialGuard: Guard = ({ caller, meta }) =>
-  caller.kind !== 'agent' || meta.agent === 'channel'
-    ? { kind: 'allow' }
-    : { kind: 'deny', reason: 'This procedure is not available to agents' }
-
 export type HostContext = KurumiContext & {
   db: KurumiDb
   agentLedger: ReturnType<typeof createAgentLedger>
+  accessLedger: ReturnType<typeof createAccessLedger>
+  approvalLedger: ReturnType<typeof createApprovalLedger>
   chatLedger: ReturnType<typeof createChatLedger>
   sessionLedger: ReturnType<typeof createSessionLedger>
   accountLedger: ReturnType<typeof createAccountLedger>
@@ -73,6 +76,8 @@ const admin = implement(hostContract).$context<HostContext>()
 
 export const hostRouter = guardRouter<HostContext>().router({
   agent: agentRouter,
+  access: accessRouter,
+  approval: approvalRouter,
   account: accountRouter,
   chat: chatRouter,
   session: sessionRouter,
@@ -205,6 +210,14 @@ export async function startHost(config: HostConfig) {
       home: config.home,
       onCreate: (tx, agentGroupId) => accountLedger.grantAutoGrants(tx, agentGroupId),
     })
+    const accessLedger = createAccessLedger({ db })
+    const approvalLedger = createApprovalLedger({
+      db,
+      accessLedger,
+      handlers: () => approvalHandlers,
+      decidePath: ['approval', 'decide'],
+      log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
+    })
     const chatLedger = createChatLedger({
       db,
       agentLedger,
@@ -245,6 +258,8 @@ export async function startHost(config: HostConfig) {
     sessions = sessionLedger
     const ledgers = {
       agentLedger,
+      accessLedger,
+      approvalLedger,
       chatLedger,
       sessionLedger,
       accountLedger,
@@ -258,16 +273,28 @@ export async function startHost(config: HostConfig) {
         egressLog: requestLog,
       },
     }
-    const contextFor = (caller: Caller): HostContext => ({
+    const contextFor = (caller: Caller, grant: ApprovalGrant | null = null): HostContext => ({
       db,
       caller,
-      guard: initialGuard,
-      grant: null,
+      guard: approvalLedger.guard,
+      grant,
       agentPrincipal: null,
       ...ledgers,
     })
+    const approvalHandlers: ApprovalHandlers = {
+      async procedure(approval, decision) {
+        if (decision === 'deny') return
+        const { path, input, caller } = approval.payload
+        await callByPath(hostRouter, path, input, contextFor(caller, { approvalId: approval.id }))
+      },
+      'gateway.request': () =>
+        Promise.reject(
+          new Error('gateway.request approvals have no handler until the gateway produces them'),
+        ),
+    }
     const rpc = createRpcFronts(hostRouter, contextFor)
     const agentHandler = new RPCHandler(hostRouter)
+    await approvalLedger.start()
     const started = sessionLedger.start()
     admission = startAdmission({
       bind: async (probeNonce) => {

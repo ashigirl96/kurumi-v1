@@ -1,0 +1,175 @@
+{
+  "version": "6",
+  "dialect": "sqlite",
+  "id": "fb453fef-0a68-43cb-b09e-727eb8bd8273",
+  "prevId": "00000000-0000-0000-0000-000000000000",
+  "tables": {
+    "pending_approval": {
+      "name": "pending_approval",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "agent_group_id": {
+          "name": "agent_group_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "title": {
+          "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "body": {
+          "name": "body",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "payload": {
+          "name": "payload",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "dedupe_key": {
+          "name": "dedupe_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "approvers": {
+          "name": "approvers",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "decided_by": {
+          "name": "decided_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "decided_at": {
+          "name": "decided_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "handled_at": {
+          "name": "handled_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "handler_error": {
+          "name": "handler_error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "pending_approval_pending_dedupe_key": {
+          "name": "pending_approval_pending_dedupe_key",
+          "columns": [
+            "dedupe_key"
+          ],
+          "isUnique": true,
+          "where": "\"pending_approval\".\"status\" = 'pending'"
+        },
+        "pending_approval_agent_group_status": {
+          "name": "pending_approval_agent_group_status",
+          "columns": [
+            "agent_group_id",
+            "status"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "pending_approval_kind": {
+          "name": "pending_approval_kind",
+          "value": "\"pending_approval\".\"kind\" IN ('procedure', 'gateway.request')"
+        },
+        "pending_approval_status": {
+          "name": "pending_approval_status",
+          "value": "\"pending_approval\".\"status\" IN ('pending', 'approved', 'denied')"
+        },
+        "pending_approval_decided_by_iff_decided": {
+          "name": "pending_approval_decided_by_iff_decided",
+          "value": "(\"pending_approval\".\"status\" = 'pending') = (\"pending_approval\".\"decided_by\" IS NULL)"
+        },
+        "pending_approval_decided_at_iff_decided": {
+          "name": "pending_approval_decided_at_iff_decided",
+          "value": "(\"pending_approval\".\"status\" = 'pending') = (\"pending_approval\".\"decided_at\" IS NULL)"
+        },
+        "pending_approval_handled_only_when_decided": {
+          "name": "pending_approval_handled_only_when_decided",
+          "value": "\"pending_approval\".\"handled_at\" IS NULL OR \"pending_approval\".\"status\" <> 'pending'"
+        },
+        "pending_approval_handler_error_only_when_handled": {
+          "name": "pending_approval_handler_error_only_when_handled",
+          "value": "\"pending_approval\".\"handler_error\" IS NULL OR \"pending_approval\".\"handled_at\" IS NOT NULL"
+        }
+      }
+    }
+  },
+  "views": {},
+  "enums": {},
+  "_meta": {
+    "schemas": {},
+    "tables": {},
+    "columns": {}
+  },
+  "internal": {
+    "indexes": {}
+  }
+}

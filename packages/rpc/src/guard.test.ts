@@ -5,11 +5,21 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { createRouterClient, ORPCError, os } from '@orpc/server'
+import { RPCHandler } from '@orpc/server/fetch'
 import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { z } from 'zod'
 
-import type { Meta } from './contract.ts'
-import { guardRouter, transaction, type KurumiContext } from './server.ts'
+import type { Caller, Meta } from './contract.ts'
+import {
+  guardRouter,
+  transaction,
+  verdict,
+  type GrantFact,
+  type GuardCall,
+  type GuardOutcome,
+  type KurumiContext,
+  type Verdict,
+} from './server.ts'
 
 const sqlite = new Database(':memory:')
 const db = drizzle(sqlite)
@@ -69,7 +79,10 @@ test('a held call returns APPROVAL_PENDING with HTTP status 409 and the approval
     }),
   })
   const client = createRouterClient(router, {
-    context: { ...context, guard: () => ({ kind: 'held', approvalId: 'approval-test' }) },
+    context: {
+      ...context,
+      guard: () => ({ kind: 'hold', request: () => ({ approvalId: 'approval-test' }) }),
+    },
   })
 
   const error = await client.action().catch((caught: unknown) => caught)
@@ -92,6 +105,195 @@ test('a denied call preserves the guard reason and an allowed call reaches its h
   expect(error).toMatchObject({ code: 'FORBIDDEN', message: 'outside your group' })
   expect(await createRouterClient(router, { context }).action()).toBe('received')
 })
+
+const callers = {
+  agent: { kind: 'agent', agentGroupId: 'ag-own', sessionId: 'session-own' },
+  host: { kind: 'host' },
+  owner: { kind: 'human', userId: 'slack:owner' },
+  member: { kind: 'human', userId: 'slack:member' },
+} as const satisfies Record<string, Caller>
+
+const calls: {
+  name: string
+  meta: Meta
+  input: unknown
+  grant: GrantFact
+  agent: Verdict['kind']
+}[] = [
+  { name: 'channel', meta: { agent: 'channel' }, input: undefined, grant: 'none', agent: 'allow' },
+  {
+    name: 'own-group, same group',
+    meta: { agent: 'own-group' },
+    input: { agentGroupId: 'ag-own' },
+    grant: 'none',
+    agent: 'allow',
+  },
+  {
+    name: 'own-group, no group named',
+    meta: { agent: 'own-group' },
+    input: {},
+    grant: 'none',
+    agent: 'allow',
+  },
+  {
+    name: 'own-group, other group',
+    meta: { agent: 'own-group' },
+    input: { agentGroupId: 'ag-other' },
+    grant: 'none',
+    agent: 'deny',
+  },
+  { name: 'scoped', meta: { agent: 'scoped' }, input: undefined, grant: 'none', agent: 'deny' },
+  {
+    name: 'hold, no grant',
+    meta: { agent: 'hold' },
+    input: undefined,
+    grant: 'none',
+    agent: 'hold',
+  },
+  {
+    name: 'hold, valid grant',
+    meta: { agent: 'hold' },
+    input: undefined,
+    grant: 'valid',
+    agent: 'allow',
+  },
+  {
+    name: 'hold, invalid grant',
+    meta: { agent: 'hold' },
+    input: undefined,
+    grant: 'invalid',
+    agent: 'deny',
+  },
+  { name: 'missing meta', meta: {}, input: undefined, grant: 'none', agent: 'deny' },
+]
+
+type VerdictCase = {
+  callerName: string
+  caller: Caller
+  call: (typeof calls)[number]
+  expected: Verdict['kind']
+}
+
+const verdictCases: VerdictCase[] = calls.flatMap((call) => [
+  { callerName: 'agent', caller: callers.agent, call, expected: call.agent },
+  { callerName: 'host', caller: callers.host, call, expected: 'allow' },
+  { callerName: 'human owner', caller: callers.owner, call, expected: 'allow' },
+  { callerName: 'human non-owner', caller: callers.member, call, expected: 'deny' },
+])
+
+const request = ({ caller, call }: VerdictCase) => ({
+  path: ['probe', 'action'],
+  meta: call.meta,
+  caller,
+  input: call.input,
+})
+
+test.each(verdictCases)('the verdict for $callerName calling $call.name', (testCase) => {
+  const result = verdict(request(testCase), {
+    callerIsOwner: testCase.caller === callers.owner,
+    callerIsApprover: false,
+    grant: testCase.call.grant,
+  })
+  expect(result.kind).toBe(testCase.expected)
+  if (result.kind === 'hold') expect(result.caller).toEqual(callers.agent)
+})
+
+test.each(verdictCases)(
+  'a grant never loosens a deny for $callerName calling $call.name',
+  (testCase) => {
+    const facts = { callerIsOwner: testCase.caller === callers.owner, callerIsApprover: false }
+    if (verdict(request(testCase), { ...facts, grant: 'none' }).kind !== 'deny') return
+    for (const grant of ['valid', 'invalid'] as const) {
+      expect(verdict(request(testCase), { ...facts, grant }).kind).toBe('deny')
+    }
+  },
+)
+
+test('a human the approval names as approver passes the verdict, other humans do not', () => {
+  const call = { path: ['approval', 'decide'], meta: {}, caller: callers.member, input: ['apr-1'] }
+  const grant = 'none'
+  expect(verdict(call, { callerIsOwner: false, callerIsApprover: true, grant }).kind).toBe('allow')
+  expect(verdict(call, { callerIsOwner: false, callerIsApprover: false, grant }).kind).toBe('deny')
+})
+
+test('a malformed held call is a 400 and records no approval', async () => {
+  let requested = 0
+  let handled = false
+  const router = guardRouter<KurumiContext>().router({
+    users: {
+      create: base
+        .meta({ agent: 'hold' })
+        .input(z.object({ id: z.string() }))
+        .handler(() => {
+          handled = true
+        }),
+    },
+  })
+  const response = await new RPCHandler(router).handle(
+    new Request('http://agent.invalid/rpc/users/create', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ json: { id: 1 } }),
+    }),
+    {
+      prefix: '/rpc',
+      context: {
+        ...context,
+        guard: () => ({
+          kind: 'hold',
+          request: () => {
+            requested++
+            return { approvalId: 'approval-test' }
+          },
+        }),
+      },
+    },
+  )
+  expect(response.response?.status).toBe(400)
+  expect(requested).toBe(0)
+  expect(handled).toBe(false)
+})
+
+test.each([
+  ['an agent calling a scoped procedure', callers.agent, { agent: 'scoped' }],
+  ['a non-owner human', callers.member, { agent: 'hold' }],
+] as const)(
+  'malformed input from %s is refused as 403 without the schema issues',
+  async (_name, caller, meta) => {
+    const router = guardRouter<KurumiContext>().router({
+      agents: {
+        create: base
+          .meta(meta)
+          .input(z.object({ name: z.string() }))
+          .handler(() => 'ran'),
+      },
+    })
+    const response = await new RPCHandler(router).handle(
+      new Request('http://agent.invalid/rpc/agents/create', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ json: { name: 42 } }),
+      }),
+      {
+        prefix: '/rpc',
+        context: {
+          ...context,
+          caller,
+          guard: verdictGuard,
+        },
+      },
+    )
+    expect(response.response?.status).toBe(403)
+    expect(await response.response?.text()).not.toContain('issues')
+  },
+)
+
+function verdictGuard(call: GuardCall): GuardOutcome {
+  const result = verdict(call, { callerIsOwner: false, callerIsApprover: false, grant: 'none' })
+  return result.kind === 'hold'
+    ? { kind: 'hold', request: () => ({ approvalId: 'approval-test' }) }
+    : result
+}
 
 test('the transaction helper returns synchronous values and rolls back failed writes', () => {
   sqlite.run('CREATE TABLE transaction_probe (value TEXT)')
