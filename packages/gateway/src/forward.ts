@@ -452,12 +452,12 @@ export async function forward<Principal>(
     return
   }
   const { options, account } = prepared
-  const body = prepared.approvedBody ? undefined : new PassThrough()
+  const body = new PassThrough()
   const upstream = request(options)
 
   const cancel = () => {
     upstream.destroy()
-    body?.destroy()
+    body.destroy()
   }
   const responseClosed = () => {
     if (!res.writableFinished) cancel()
@@ -471,10 +471,8 @@ export async function forward<Principal>(
     req.off('aborted', cancel)
     req.off('error', cancel)
     res.off('close', responseClosed)
-    if (body) {
-      req.unpipe(body)
-      body.destroy()
-    }
+    req.unpipe(body)
+    body.destroy()
   })
   upstream.once('error', () => {
     if (res.destroyed) return
@@ -497,11 +495,8 @@ export async function forward<Principal>(
       if (error) cancel()
     })
   })
-  if (!body) {
-    upstream.end(prepared.approvedBody)
-    return
-  }
-  req.pipe(body)
+  if (prepared.approvedBody) body.end(prepared.approvedBody)
+  else req.pipe(body)
   pipeline(body, upstream, (error) => {
     if (error) body.destroy()
   })
