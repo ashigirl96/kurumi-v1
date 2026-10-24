@@ -62,10 +62,12 @@ const isSeparatorOrControl = (byte: number) =>
 
 /**
  * The path an upstream routes, or ambiguous when two readings are possible: an upstream may decode an escape,
- * resolve a dot segment, or split on a separator that the raw text hides.
+ * resolve a dot segment, split on a separator that the raw text hides, or keep a raw `#`, which a request
+ * target never carries, as part of the path.
  */
 export function canonicalPath(raw: string): CanonicalPath {
-  const end = raw.search(/[?#]/)
+  if (raw.includes('#')) return ambiguous
+  const end = raw.indexOf('?')
   const path = end === -1 ? raw : raw.slice(0, end)
   if (!path.startsWith('/') || /[\\;]|\/\//.test(path)) return ambiguous
   for (const [, hex] of path.matchAll(/%([0-9A-Fa-f]{2})?/g)) {
