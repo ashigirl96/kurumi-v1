@@ -587,7 +587,7 @@ test('the host router answers gateway status and log for the host and refuses th
     chatLedger: unused,
     sessionLedger: unused,
     accountLedger: unused,
-    gateway: { status: () => status, egressLog: { rows: () => [] } },
+    gateway: { status: () => status, egressLog: { rows: () => [] }, rules: unused },
     agentPrincipal: null,
   })
   try {

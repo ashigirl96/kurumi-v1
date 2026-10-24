@@ -27,6 +27,7 @@ import {
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import {
   createEgressLog,
+  createRuleStore,
   credentialInject,
   gatewayContribution,
   gatewayStatus,
@@ -37,6 +38,7 @@ import {
   startAdmission,
   startAgentPort,
   type EgressLog,
+  type RuleStore,
 } from '@kurumi/gateway/server'
 import { hostContract, type Caller } from '@kurumi/rpc/contract'
 import { callByPath, guardRouter, type ApprovalGrant, type KurumiContext } from '@kurumi/rpc/server'
@@ -67,7 +69,11 @@ export type HostContext = KurumiContext & {
   chatLedger: ReturnType<typeof createChatLedger>
   sessionLedger: ReturnType<typeof createSessionLedger>
   accountLedger: ReturnType<typeof createAccountLedger>
-  gateway: { status(): ReturnType<typeof gatewayStatus>; egressLog: Pick<EgressLog, 'rows'> }
+  gateway: {
+    status(): ReturnType<typeof gatewayStatus>
+    egressLog: Pick<EgressLog, 'rows'>
+    rules: Pick<RuleStore, 'list' | 'add' | 'remove'>
+  }
   agentPrincipal: AgentPrincipal | null
   requestSignal?: AbortSignal
 }
@@ -271,6 +277,7 @@ export async function startHost(config: HostConfig) {
             caPem: ca.certPem,
           }),
         egressLog: requestLog,
+        rules: createRuleStore({ db, accounts: accountLedger }),
       },
     }
     const contextFor = (caller: Caller, grant: ApprovalGrant | null = null): HostContext => ({

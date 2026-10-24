@@ -17,6 +17,7 @@ import {
 } from './ca.ts'
 import { contract, type GatewayStatus } from './contract.ts'
 import type { EgressLog } from './egress-log.ts'
+import type { RuleStore } from './rules.ts'
 import { gatewayCa } from './schema.ts'
 
 export { migrations } from '../migrations/index.ts'
@@ -33,6 +34,7 @@ export type {
 } from './forward.ts'
 export { startAgentPort, type AgentPort } from './port.ts'
 export { REFUSAL_STATUS, type GatewayRefusal } from './refusal.ts'
+export { createRuleStore, type RuleStore } from './rules.ts'
 export type { CertificateAuthority } from './ca.ts'
 
 const CA_ROW = 1
@@ -175,10 +177,21 @@ export function gatewayStatus(input: {
 }
 
 const os = implement(contract).$context<
-  KurumiContext & { gateway: { status(): GatewayStatus; egressLog: Pick<EgressLog, 'rows'> } }
+  KurumiContext & {
+    gateway: {
+      status(): GatewayStatus
+      egressLog: Pick<EgressLog, 'rows'>
+      rules: Pick<RuleStore, 'list' | 'add' | 'remove'>
+    }
+  }
 >()
 
 export const router = os.router({
   status: os.status.handler(({ context }) => context.gateway.status()),
   log: os.log.handler(({ context, input }) => context.gateway.egressLog.rows(input)),
+  rules: {
+    list: os.rules.list.handler(({ context }) => context.gateway.rules.list()),
+    add: os.rules.add.handler(({ context, input }) => context.gateway.rules.add(input)),
+    remove: os.rules.remove.handler(({ context, input: [id] }) => context.gateway.rules.remove(id)),
+  },
 })
