@@ -1024,7 +1024,15 @@ test('an injected request names the service of the injection the ledger chose', 
 
 type Requested = Parameters<GatewayApprovals['request']>[1] & { approvalId: string }
 
-async function setupHeld({ holdMs, now }: { holdMs?: number; now?: () => number } = {}) {
+async function setupHeld({
+  holdMs,
+  now,
+  deps,
+}: {
+  holdMs?: number
+  now?: () => number
+  deps?: Pick<ForwardDeps<EgressPrincipal>, 'upstream' | 'resolve'>
+} = {}) {
   const db = inMemoryDb()
   migrate(db, { migrationsFolder: migrations.folder, migrationsTable: migrations.table })
   insertAgentGroup(db, 'g1')
@@ -1078,6 +1086,7 @@ async function setupHeld({ holdMs, now }: { holdMs?: number; now?: () => number 
       inject: credentialInject(ledger),
       log: (event) => events.push(event),
       gate,
+      ...deps,
     },
   })
   stops.push(port.stop)
@@ -1539,6 +1548,46 @@ describe('held requests', () => {
 
     expect(warnings).toEqual([])
   })
+
+  test.each([
+    [
+      'resolves to a non-public address',
+      async () => [{ address: '127.0.0.1', family: 4 }],
+      403,
+      { error: 'upstream_not_public', host: 'api.anthropic.com', reason: 'loopback' },
+      ['refused', 'upstream_not_public', 403],
+    ],
+    [
+      'fails to resolve',
+      () => Promise.reject(new Error('ENOTFOUND')),
+      502,
+      { error: 'upstream_unreachable', host: 'api.anthropic.com' },
+      ['injected', null, 502],
+    ],
+  ] satisfies [
+    string,
+    (host: string) => Promise<LookupAddress[]>,
+    number,
+    object,
+    ReturnType<typeof decisions>[number],
+  ][])(
+    'an approve-ruled request to a host that %s is answered at once and asks no one',
+    async (_name, resolve, status, body, decision) => {
+      const { upstream, tunnel, requested, events } = await setupHeld({
+        holdMs: 50,
+        deps: { upstream: undefined, resolve },
+      })
+
+      const answer = await sendMessage(tunnel)
+
+      expect(answer.status).toBe(status)
+      expect(JSON.parse(answer.body)).toMatchObject(body)
+      expect(requested).toEqual([])
+      expect(upstream.requests).toEqual([])
+      await until(() => events.length === 1)
+      expect(decisions(events)).toEqual([decision])
+    },
+  )
 
   test('a gate that throws at once leaves no listener on the tunnel signal or the response', async () => {
     const tunnel = new AbortController()

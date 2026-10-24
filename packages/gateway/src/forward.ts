@@ -353,6 +353,13 @@ async function prepareRequest<Principal>(
       decision: refusedDecision(injected.refusal),
     }
   }
+  const decision = forwardedDecision(injected)
+  const destination = deps.upstream?.host === target.host ? deps.upstream : undefined
+  const pinned = destination ? undefined : await pinPublicUpstream(target.host, deps)
+  if (pinned?.kind === 'refused') {
+    return { ...pinned, decision: refusedDecision(pinned.refusal) }
+  }
+  if (pinned?.kind === 'unreachable') return { kind: 'unreachable', decision }
   const held = screening(context, req, deps.gate, injected.account, exchange)
   const screened = held && (await held)
   if (screened?.kind === 'refuse') {
@@ -364,13 +371,6 @@ async function prepareRequest<Principal>(
   }
   if (screened?.kind === 'abandoned') return screened
   const body = screened?.kind === 'forward' && exchange.body ? screened.body : undefined
-  const decision = forwardedDecision(injected)
-  const destination = deps.upstream?.host === target.host ? deps.upstream : undefined
-  const pinned = destination ? undefined : await pinPublicUpstream(target.host, deps)
-  if (pinned?.kind === 'refused') {
-    return { ...pinned, decision: refusedDecision(pinned.refusal) }
-  }
-  if (pinned?.kind === 'unreachable') return { kind: 'unreachable', decision }
   const headers = withoutHopHeaders(injected.headers)
   headers.set('host', authority(target))
   headers.delete('content-length')
