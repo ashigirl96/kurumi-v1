@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash, randomBytes } from 'node:crypto'
 import type { LookupAddress } from 'node:dns'
-import { once } from 'node:events'
-import { request as httpRequest, type IncomingHttpHeaders } from 'node:http'
+import { getEventListeners, once } from 'node:events'
+import {
+  createServer as createHttpServer,
+  request as httpRequest,
+  type IncomingHttpHeaders,
+} from 'node:http'
 import { request } from 'node:https'
 import { createServer } from 'node:net'
 import type { TLSSocket } from 'node:tls'
@@ -21,6 +25,7 @@ import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 import type { EgressPrincipal } from './egress-log.ts'
 import {
   credentialInject,
+  forward,
   pinnedLookup,
   type ConnectTarget,
   type EgressEvent,
@@ -237,7 +242,7 @@ const secrets = { main: 'sk-ant-api03-main-secret', second: 'sk-ant-oat01-second
 
 async function setupCredentials({
   target = { host: 'api.anthropic.com', port: 443 },
-  ...forward
+  ...deps
 }: Partial<ForwardDeps<CredentialPrincipal>> & { target?: ConnectTarget } = {}) {
   const db = inMemoryDb()
   insertAgentGroup(db, 'g1')
@@ -248,7 +253,7 @@ async function setupCredentials({
     bind: { host: '127.0.0.1', port: 0 },
     authenticate: (token) => (token === 'test-token' ? { agentGroupId: 'g1' } : null),
     intercepts: isInterceptedHost,
-    forward: { upstream: upstream.destination, inject: credentialInject(ledger), ...forward },
+    forward: { upstream: upstream.destination, inject: credentialInject(ledger), ...deps },
   })
   stops.push(gateway.stop)
   const tunnel = await openTestTunnel({
@@ -1533,6 +1538,68 @@ describe('held requests', () => {
     await Bun.sleep(20)
 
     expect(warnings).toEqual([])
+  })
+
+  test('a gate that throws at once leaves no listener on the tunnel signal or the response', async () => {
+    const tunnel = new AbortController()
+    const observed = Promise.withResolvers<{
+      failed: unknown
+      abortListeners: number
+      closeListenersAdded: number
+    }>()
+    const server = createHttpServer(async (req, res) => {
+      const closeListeners = res.listenerCount('close')
+      const failed = await forward(
+        { principal: {}, target: { host: 'api.anthropic.com', port: 443 }, signal: tunnel.signal },
+        req,
+        res,
+        {
+          upstream: { host: 'api.anthropic.com', address: '127.0.0.1', caPem: '' },
+          inject: ({ path, headers }) => ({
+            path,
+            headers,
+            account: { handle: accountHandle('anthropic', 'main'), service: 'anthropic-api' },
+          }),
+          gate: {
+            screen: () => {
+              throw new Error('egress rule rul-1 names no readable target')
+            },
+          },
+        },
+      ).then(
+        () => null,
+        (error: unknown) => error,
+      )
+      observed.resolve({
+        failed,
+        abortListeners: getEventListeners(tunnel.signal, 'abort').length,
+        closeListenersAdded: res.listenerCount('close') - closeListeners,
+      })
+      res.writeHead(500).end()
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    stops.push(() => {
+      server.close()
+    })
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('server has no TCP address')
+
+    httpRequest({
+      port: address.port,
+      host: '127.0.0.1',
+      method: 'POST',
+      path: '/v1/messages',
+      headers: { host: 'api.anthropic.com' },
+    })
+      .on('error', () => {})
+      .end(prompt())
+
+    expect(await observed.promise).toEqual({
+      failed: new Error('egress rule rul-1 names no readable target'),
+      abortListeners: 0,
+      closeListenersAdded: 0,
+    })
   })
 
   test('a WebSocket upgrade an approve rule covers waits and is refused when denied', async () => {

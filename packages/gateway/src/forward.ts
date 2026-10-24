@@ -298,14 +298,6 @@ function screening<Principal>(
 ): Promise<Screened> | null {
   if (!gate || !account) return null
   const ended = new AbortController()
-  const end = () => ended.abort()
-  context.signal.addEventListener('abort', end, { once: true })
-  exchange.closes.once('close', end)
-  if (context.signal.aborted || exchange.closes.destroyed) end()
-  const release = () => {
-    context.signal.removeEventListener('abort', end)
-    exchange.closes.off('close', end)
-  }
   const screened = gate.screen({
     principal: context.principal,
     account,
@@ -318,11 +310,15 @@ function screening<Principal>(
     signal: ended.signal,
     held: () => exchange.held(account.service),
   })
-  if (!screened) {
-    release()
-    return null
-  }
-  return screened.finally(release)
+  if (!screened) return null
+  const end = () => ended.abort()
+  context.signal.addEventListener('abort', end, { once: true })
+  exchange.closes.once('close', end)
+  if (context.signal.aborted || exchange.closes.destroyed) end()
+  return screened.finally(() => {
+    context.signal.removeEventListener('abort', end)
+    exchange.closes.off('close', end)
+  })
 }
 
 async function prepareRequest<Principal>(
