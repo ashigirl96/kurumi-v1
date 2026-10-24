@@ -58,6 +58,36 @@ export const initialGuard: Guard = ({ caller, meta }) =>
     ? { kind: 'allow' }
     : { kind: 'deny', reason: 'This procedure is not available to agents' }
 
+export type HostContext = KurumiContext & {
+  db: KurumiDb
+  agentLedger: ReturnType<typeof createAgentLedger>
+  chatLedger: ReturnType<typeof createChatLedger>
+  sessionLedger: ReturnType<typeof createSessionLedger>
+  accountLedger: ReturnType<typeof createAccountLedger>
+  gateway: { status(): ReturnType<typeof gatewayStatus>; egressLog: Pick<EgressLog, 'rows'> }
+  agentPrincipal: AgentPrincipal | null
+  requestSignal?: AbortSignal
+}
+
+const admin = implement(hostContract).$context<HostContext>()
+
+export const hostRouter = guardRouter<HostContext>().router({
+  agent: agentRouter,
+  account: accountRouter,
+  chat: chatRouter,
+  session: sessionRouter,
+  gateway: gatewayRouter,
+  status: admin.status.handler(() => ({ ready: true })),
+  db: {
+    query: admin.db.query.handler(({ context, input }) => {
+      if (context.caller.kind !== 'host') {
+        throw new ORPCError('FORBIDDEN', { message: 'db query requires a host caller' })
+      }
+      return queryReadOnly(context.db.$client, input[0])
+    }),
+  },
+})
+
 export async function startHost(config: HostConfig) {
   process.stdout.write(
     `${JSON.stringify({ kind: 'host.start', pid: process.pid, timeOrigin: performance.timeOrigin, monotonicMs: performance.now() })}\n`,
@@ -228,28 +258,6 @@ export async function startHost(config: HostConfig) {
         egressLog: requestLog,
       },
     }
-    type HostContext = KurumiContext &
-      typeof ledgers & {
-        agentPrincipal: AgentPrincipal | null
-        requestSignal?: AbortSignal
-      }
-    const admin = implement(hostContract).$context<HostContext>()
-    const router = guardRouter<HostContext>().router({
-      agent: agentRouter,
-      account: accountRouter,
-      chat: chatRouter,
-      session: sessionRouter,
-      gateway: gatewayRouter,
-      status: admin.status.handler(() => ({ ready: true })),
-      db: {
-        query: admin.db.query.handler(({ context, input }) => {
-          if (context.caller.kind !== 'host') {
-            throw new ORPCError('FORBIDDEN', { message: 'db query requires a host caller' })
-          }
-          return queryReadOnly(db.$client, input[0])
-        }),
-      },
-    })
     const contextFor = (caller: Caller): HostContext => ({
       db,
       caller,
@@ -258,8 +266,8 @@ export async function startHost(config: HostConfig) {
       agentPrincipal: null,
       ...ledgers,
     })
-    const rpc = createRpcFronts(router, contextFor)
-    const agentHandler = new RPCHandler(router)
+    const rpc = createRpcFronts(hostRouter, contextFor)
+    const agentHandler = new RPCHandler(hostRouter)
     const started = sessionLedger.start()
     admission = startAdmission({
       bind: async (probeNonce) => {
