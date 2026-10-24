@@ -546,7 +546,11 @@ async function startLoggedPort(
     ...deps,
   })
   const rowsAfterHostStop = async () => {
-    await port.stop()
+    const outcome = await Promise.race([
+      port.stop().then(() => 'stopped'),
+      Bun.sleep(1_000).then(() => 'hung'),
+    ])
+    expect(outcome).toBe('stopped')
     log.stop()
     await silent.stop(true)
     return sqlite.query('SELECT method, path, decision, status FROM egress_log').all()
@@ -639,4 +643,110 @@ test('a CONNECT still resolving when the Agent Port stops is written as refused 
     expect.objectContaining({ method: 'CONNECT', path: 'private.test:443', decision: 'refused' }),
   ])
   client.destroy()
+})
+
+const neverSettles = () => new Promise<never>(() => {})
+
+test('a CONNECT whose lookup never settles does not hold the Agent Port stop, and a finished request keeps its row', async () => {
+  let resolving = false
+  const { port, received, rowsAfterHostStop } = await startLoggedPort(
+    {},
+    {
+      stopGraceMs: 50,
+      resolve: () => {
+        resolving = true
+        return neverSettles()
+      },
+    },
+  )
+  const tunnel = await openTestTunnel({
+    proxyPort: port.port,
+    token: 't',
+    caPem: port.caPem,
+    target: anthropic,
+  })
+  sendTestRequest(tunnel, { path: '/v1/models' }).catch(ignore)
+  const client = connect(port.port, '127.0.0.1')
+  client.on('error', ignore)
+  client.write(
+    'CONNECT stalled.test:443 HTTP/1.1\r\nHost: stalled.test:443\r\n' +
+      `Proxy-Authorization: Basic ${Buffer.from('s:t').toString('base64')}\r\n\r\n`,
+  )
+  await until(() => received() === 1 && resolving)
+
+  expect(await rowsAfterHostStop()).toEqual([
+    expect.objectContaining({ method: 'GET', path: '/v1/models', decision: 'passed' }),
+  ])
+  tunnel.close()
+  client.destroy()
+})
+
+test('a request whose injection never settles does not hold the Agent Port stop, and a finished request keeps its row', async () => {
+  let injecting = false
+  const { port, received, rowsAfterHostStop } = await startLoggedPort(
+    {
+      inject: ({ path, headers }) => {
+        if (path !== '/v1/stalled') return { path, headers }
+        injecting = true
+        return neverSettles()
+      },
+    },
+    { stopGraceMs: 50 },
+  )
+  const tunnel = await openTestTunnel({
+    proxyPort: port.port,
+    token: 't',
+    caPem: port.caPem,
+    target: anthropic,
+  })
+  const stalled = await openTestTunnel({
+    proxyPort: port.port,
+    token: 't',
+    caPem: port.caPem,
+    target: anthropic,
+  })
+  sendTestRequest(tunnel, { path: '/v1/models' }).catch(ignore)
+  sendTestRequest(stalled, { path: '/v1/stalled' }).catch(ignore)
+  await until(() => received() === 1 && injecting)
+
+  expect(await rowsAfterHostStop()).toEqual([
+    expect.objectContaining({ method: 'GET', path: '/v1/models', decision: 'passed' }),
+  ])
+  tunnel.close()
+  stalled.close()
+})
+
+test('a request whose upstream lookup never settles does not hold the Agent Port stop, and a finished request keeps its row', async () => {
+  const stalledTarget = { host: 'stalled.test', port: 443 }
+  let resolving = false
+  const { port, received, rowsAfterHostStop } = await startLoggedPort(
+    {
+      resolve: () => {
+        resolving = true
+        return neverSettles()
+      },
+    },
+    { stopGraceMs: 50, intercepts: () => true },
+  )
+  const tunnel = await openTestTunnel({
+    proxyPort: port.port,
+    token: 't',
+    caPem: port.caPem,
+    target: anthropic,
+  })
+  const stalled = await openTestTunnel({
+    proxyPort: port.port,
+    token: 't',
+    caPem: port.caPem,
+    target: stalledTarget,
+  })
+  sendTestRequest(tunnel, { path: '/v1/models' }).catch(ignore)
+  sendTestRequest(stalled, { path: '/v1/models' }).catch(ignore)
+  await until(() => received() === 1 && resolving)
+
+  expect(await rowsAfterHostStop()).toEqual([
+    expect.objectContaining({ method: 'GET', path: '/v1/models', decision: 'passed' }),
+  ])
+  tunnel.close()
+  stalled.close()
 })

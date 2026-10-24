@@ -82,6 +82,9 @@ function pinnedLookup(addresses: LookupAddress[]): LookupFunction {
   }
 }
 
+// A lookup or injection that ignores the abort could otherwise hold stop, and the host's flush and lock release behind it, forever.
+const STOP_GRACE_MS = 2_000
+
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve) => {
     server.close(() => resolve())
@@ -99,6 +102,7 @@ export async function startAgentPort<Principal extends object>(deps: {
   ca?: CertificateAuthority
   onConnect?(target: ConnectTarget): void
   probeNonce?(): string | null
+  stopGraceMs?: number
   rpc?(
     request: IncomingMessage,
     response: ServerResponse,
@@ -116,7 +120,7 @@ export async function startAgentPort<Principal extends object>(deps: {
   let stopping = false
   let stopped: Promise<void> | undefined
 
-  // stop() waits for every exchange so its egress row is recorded before the caller stops the log.
+  // stop() waits, up to STOP_GRACE_MS, for every exchange so its egress row is recorded before the caller stops the log.
   function hold(work: Promise<unknown>, closed?: Duplex | ServerResponse): void {
     const done: Promise<unknown> = Promise.allSettled([
       work,
@@ -387,7 +391,14 @@ export async function startAgentPort<Principal extends object>(deps: {
       )
       listeners.clear()
       await outerClosed
-      await Promise.all(inFlight)
+      let grace: ReturnType<typeof setTimeout> | undefined
+      await Promise.race([
+        Promise.all(inFlight),
+        new Promise((expire) => {
+          grace = setTimeout(expire, deps.stopGraceMs ?? STOP_GRACE_MS)
+        }),
+      ])
+      clearTimeout(grace)
     })()
     return stopped
   }
