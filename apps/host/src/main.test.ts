@@ -1,16 +1,24 @@
 import { Database } from 'bun:sqlite'
 import { afterEach, expect, test } from 'bun:test'
 import { randomBytes } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { createAccountLedger, seal, type AuthMode } from '@kurumi/account/server'
+import { seal } from '@kurumi/account/server'
 import { createAgentLedger } from '@kurumi/agent/server'
 
 import { openKurumiDb, migrateAll } from './db.ts'
 import { queryReadOnly } from './fronts.ts'
-import { initialGuard, withAccountEnv } from './main.ts'
+import { initialGuard } from './main.ts'
 import { migrations } from './migrations.ts'
 
 const homes: string[] = []
@@ -337,45 +345,58 @@ test('with accounts stored, a gateway CA the vault.key cannot open stops the hos
   expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(true)
 }, 5000)
 
-test('the container revision changes when a group moves from an api-key to an oauth-token account', () => {
+const revisionRecordingDocker = `#!/bin/sh
+case "$1" in
+create)
+  for arg; do
+    case "$arg" in kurumi.revision=*) echo "\${arg#kurumi.revision=}" >> "$KURUMI_HOME/revisions" ;; esac
+    url=$arg
+  done
+  case "$*" in *kurumi.role=probe*) printf %s "$url" > "$KURUMI_HOME/probe-url" ;; esac ;;
+start)
+  if [ "$2" = --attach ]; then
+    exec curl -fsS "$(sed s/host.docker.internal/127.0.0.1/ "$KURUMI_HOME/probe-url")"
+  fi ;;
+wait) while kill -0 "$PPID" 2>/dev/null; do sleep 0.05; done ;;
+esac
+`
+
+test('creating a second agent group and restarting the host keeps the container revision', async () => {
   const home = homeForTest()
-  const db = openKurumiDb(join(home, 'kurumi.db'))
-  try {
-    migrateAll(db, migrations)
-    const accountLedger = createAccountLedger({ db, vaultKey: randomBytes(32) })
-    const agentLedger = createAgentLedger({
-      db,
-      home,
-      onCreate: (tx, agentGroupId) => accountLedger.grantAutoGrants(tx, agentGroupId),
-    })
-    agentLedger.create({ name: 'work' })
-    const revision = () => withAccountEnv('base', { agentLedger, accountLedger })
-    const addKey = (label: string, authMode: AuthMode) =>
-      db.transaction((tx) =>
-        accountLedger.addKey(tx, {
-          vendor: 'anthropic',
-          label,
-          authMode,
-          value: 'test-key',
-          autoGrant: true,
-        }),
-      )
-
-    addKey('main', 'api-key')
-    const apiKey = revision()
-    addKey('second', 'api-key')
-    expect(revision()).toBe(apiKey)
-
-    db.transaction((tx) => {
-      accountLedger.remove(tx, 'anthropic/main')
-      accountLedger.remove(tx, 'anthropic/second')
-    })
-    addKey('subscription', 'oauth-token')
-    expect(revision()).not.toBe(apiKey)
-  } finally {
-    db.$client.close()
+  writeFileSync(join(home, 'docker'), revisionRecordingDocker, { mode: 0o755 })
+  mkdirSync(join(home, 'runner'))
+  writeFileSync(join(home, 'runner/runner.js'), '')
+  const unused = Bun.serve({ port: 0, fetch: () => new Response() })
+  const env = { PATH: `${home}:${process.env.PATH}`, KURUMI_AGENT_PORT: String(unused.port) }
+  await unused.stop(true)
+  const recorded = () => {
+    const path = join(home, 'revisions')
+    return existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n') : []
   }
-})
+  const spawnByChat = async (agent: string) => {
+    const count = recorded().length
+    await cli(home, ['chat', agent], 'hello\n')
+    for (let attempt = 0; attempt < 250; attempt++) {
+      if (recorded().length > count) return
+      await Bun.sleep(20)
+    }
+    throw new Error(`no container was created for ${agent}`)
+  }
+
+  const first = spawnHost(home, undefined, env)
+  await waitForHost(home, first)
+  await cli(home, ['agent', 'create', '--name', 'work'])
+  await spawnByChat('work')
+  const before = recorded()
+  await cli(home, ['agent', 'create', '--name', 'play'])
+  first.kill('SIGTERM')
+  expect(await first.exited).toBe(0)
+  const second = spawnHost(home, undefined, env)
+  await waitForHost(home, second)
+  await spawnByChat('play')
+
+  expect(new Set(recorded())).toEqual(new Set(before))
+}, 20000)
 
 test('diagnostic SQL reads a WAL snapshot without writing rows or changing the host connection', () => {
   const home = homeForTest()
