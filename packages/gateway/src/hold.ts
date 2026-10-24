@@ -160,8 +160,9 @@ function cardOf(held: HeldRequest) {
       `agent group ${input.principal.agentGroupId}, session ${input.principal.sessionId}`,
       `rule ${ruleId}, service ${input.account.service}`,
       ...framingLine(held),
-      `body ${body.length} bytes, sha256 ${bodySha256}`,
-      preview(body),
+      ...(input.body === null
+        ? ['WebSocket upgrade: an approval covers the whole connection and every message on it']
+        : [`body ${body.length} bytes, sha256 ${bodySha256}`, preview(body)]),
     ],
   }
 }
@@ -336,6 +337,7 @@ export function createEgressApproval(deps: {
       fingerprint: sha256(
         JSON.stringify([
           'kurumi.egress.v1',
+          input.body === null ? 'websocket' : 'http',
           method,
           methodOverrides,
           host,

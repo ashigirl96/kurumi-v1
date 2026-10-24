@@ -38,6 +38,7 @@ import {
   MAX_IN_FLIGHT,
   MAX_IN_FLIGHT_PER_GROUP,
   MAX_UNDECIDED_PER_GROUP,
+  type EgressApproval,
   type GatewayApprovals,
   type SessionNotice,
 } from './hold.ts'
@@ -1151,6 +1152,17 @@ const decisions = (events: readonly EgressEvent<EgressPrincipal>[]) =>
     event.status,
   ])
 
+const streamUpgrade = () =>
+  `GET /v1/stream HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\n\r\n`
+
+const addStreamRule = (gate: EgressApproval) =>
+  gate.rules.add({
+    account: 'anthropic/main',
+    path: '/v1/stream',
+    priority: 0,
+    effect: 'approve',
+  })
+
 describe('held requests', () => {
   test('hold then approve: the upstream receives the exact body once and the client its 200', async () => {
     const { gate, upstream, tunnel, requested, approvalId, events, notices } = await setupHeld()
@@ -1779,18 +1791,18 @@ describe('held requests', () => {
 
   test('a WebSocket upgrade an approve rule covers waits and is refused when denied', async () => {
     const { gate, tunnel, requested, approvalId } = await setupHeld()
-    gate.rules.add({
-      account: 'anthropic/main',
-      path: '/v1/stream',
-      priority: 0,
-      effect: 'approve',
-    })
-    const exchanged = exchangeRaw(
-      tunnel.socket,
-      `GET /v1/stream HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\n\r\n`,
-    )
+    const rule = addStreamRule(gate)
+    const exchanged = exchangeRaw(tunnel.socket, streamUpgrade())
     await until(() => requested.length === 1)
 
+    expect(requested[0]).toMatchObject({
+      title: 'GET https://api.anthropic.com/v1/stream as anthropic/main',
+      body: [
+        'agent group g1, session s1',
+        `rule ${rule.id}, service anthropic-api`,
+        'WebSocket upgrade: an approval covers the whole connection and every message on it',
+      ],
+    })
     await gate.decided({ id: approvalId(0) }, 'deny')
 
     const response = await exchanged
@@ -1799,5 +1811,24 @@ describe('held requests', () => {
       error: 'approval_denied',
       approvalId: approvalId(0),
     })
+  })
+
+  test('an approved plain GET does not open a WebSocket on the same path', async () => {
+    const { gate, upstream, tunnel, openTunnel, approvalId, allowance } = await setupHeld({
+      holdMs: 50,
+    })
+    addStreamRule(gate)
+    expect((await sendTestRequest(tunnel, { path: '/v1/stream' })).status).toBe(403)
+    await gate.decided({ id: approvalId(0) }, 'approve')
+
+    const upgraded = await exchangeRaw((await openTunnel()).socket, streamUpgrade())
+
+    expect(upgraded.status).toBe(403)
+    expect(JSON.parse(upgraded.body)).toMatchObject({
+      error: 'approval_pending',
+      approvalId: approvalId(1),
+    })
+    expect(upstream.requests).toEqual([])
+    expect(allowance(approvalId(0))).toMatchObject({ state: 'granted' })
   })
 })
