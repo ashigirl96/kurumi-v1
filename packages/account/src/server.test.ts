@@ -760,6 +760,16 @@ describe('the credential for a Google request', () => {
     })
   })
 
+  test.each([
+    ['gmail', gmail()],
+    ['google-calendar', calendar],
+  ] as const)('an injection names %s, the service it was decided for', (service, request) => {
+    const decision = decide('g2', request)
+    if (decision.kind !== 'inject') throw new Error(`expected an injection, not ${decision.kind}`)
+
+    expect(decision.injection.service).toBe(service)
+  })
+
   test('an account the group was not granted is refused with the handles it was', () => {
     expect(decide('g2', gmail('Bearer kurumi:google/a@work.example'))).toEqual({
       kind: 'refuse',

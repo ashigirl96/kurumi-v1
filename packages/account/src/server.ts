@@ -104,6 +104,7 @@ export type CredentialRefusal =
   | { code: 'method_not_allowed'; service: ServiceId; method: string; allowed: readonly string[] }
 
 export type Injection = {
+  readonly service: ServiceId
   readonly handle: AccountHandle
   readonly accountId: string
   /** Rewrites the request this decision was made for: every slot header of the service removed, the account's one slot set. */
@@ -234,6 +235,7 @@ function injectionFor({
   const { slot } = placementOf(service, row.authMode)
   const modeBeta = modeBetaOf[service]
   return Object.freeze({
+    service,
     handle: row.handle,
     accountId: row.accountId,
     apply() {
