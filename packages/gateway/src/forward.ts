@@ -1,6 +1,6 @@
 import type { LookupAddress } from 'node:dns'
 import { lookup } from 'node:dns/promises'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http'
 import { request, type RequestOptions } from 'node:https'
 import { isIP, type LookupFunction } from 'node:net'
 import { PassThrough, pipeline, type Duplex, type Readable } from 'node:stream'
@@ -85,7 +85,12 @@ export type ScreenInput<Principal> = {
 }
 
 export type Screened =
-  | { kind: 'forward'; body: Buffer }
+  | {
+      kind: 'forward'
+      body: Buffer
+      /** Called at most once, when no byte of the request reached the upstream. */
+      undelivered: () => void
+    }
   | { kind: 'refuse'; refusal: HoldRefusal }
   | { kind: 'abandoned' }
 
@@ -224,6 +229,7 @@ type Prepared =
       account?: AccountHandle
       decision: EgressDecision
       approvedBody?: Buffer
+      undelivered: () => void
     }
   | { kind: 'bad_request' }
   | { kind: 'refused'; refusal: GatewayRefusal; decision: EgressDecision }
@@ -402,7 +408,27 @@ async function prepareRequest<Principal>(
     account: injected.account?.handle,
     decision,
     approvedBody: body,
+    undelivered: screened?.kind === 'forward' ? screened.undelivered : nothingToHandBack,
   }
+}
+
+const nothingToHandBack = () => {}
+
+/** Before the TLS handshake ends, the upstream has read no byte of the request. */
+function whenUndelivered(upstream: ClientRequest, undelivered: () => void): void {
+  let handshaken = false
+  upstream.once('socket', (socket) =>
+    socket.once('secureConnect', () => {
+      handshaken = true
+    }),
+  )
+  const ended = () => {
+    upstream.off('error', ended)
+    upstream.off('close', ended)
+    if (!handshaken) undelivered()
+  }
+  upstream.once('error', ended)
+  upstream.once('close', ended)
 }
 
 function respondUnreachable(res: ServerResponse, host: string): void {
@@ -438,6 +464,7 @@ export async function forward<Principal>(
   }
   const { decision } = prepared
   if (gone) {
+    if (prepared.kind === 'forward') prepared.undelivered()
     record(decision, null)
     return
   }
@@ -458,6 +485,7 @@ export async function forward<Principal>(
   const { options, account } = prepared
   const body = new PassThrough()
   const upstream = request(options)
+  whenUndelivered(upstream, prepared.undelivered)
 
   const cancel = () => {
     upstream.destroy()
@@ -538,6 +566,7 @@ export async function forwardUpgrade<Principal>(
   }
   const { decision } = prepared
   if (gone) {
+    if (prepared.kind === 'forward') prepared.undelivered()
     record(decision, null)
     return
   }
@@ -558,6 +587,7 @@ export async function forwardUpgrade<Principal>(
     ...options,
     headers: { ...options.headers, connection: 'Upgrade', upgrade: 'websocket' },
   })
+  whenUndelivered(upstream, prepared.undelivered)
   let upgraded: Duplex | undefined
   const cancel = () => {
     upstream.destroy()

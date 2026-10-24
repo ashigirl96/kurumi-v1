@@ -57,7 +57,7 @@ const PREVIEW_BYTES = 1024
 type HoldEnd = 'approved' | 'denied' | 'timeout' | 'gone'
 
 type Admission =
-  | { kind: 'pass' }
+  | { kind: 'pass'; approvalId: string }
   | { kind: 'wait'; approvalId: string }
   | { kind: 'refuse'; refusal: HoldRefusal }
 
@@ -236,7 +236,7 @@ export function createEgressApproval(deps: {
         .set({ state: 'used', usedAt: at })
         .where(eq(egressAllowance.approvalId, granted.approvalId))
         .run()
-      return { kind: 'pass' }
+      return { kind: 'pass', approvalId: granted.approvalId }
     }
     const pending = tx
       .select({ approvalId: egressAllowance.approvalId })
@@ -320,6 +320,16 @@ export function createEgressApproval(deps: {
     return ended.promise
   }
 
+  /** Admission marks the allowance `used` before the send, so no second request takes it while this one is on its way. */
+  const handBack = (approvalId: string) => () => {
+    transaction(deps.db, (tx) => {
+      tx.update(egressAllowance)
+        .set({ state: 'granted', usedAt: null })
+        .where(and(eq(egressAllowance.approvalId, approvalId), eq(egressAllowance.state, 'used')))
+        .run()
+    })
+  }
+
   async function hold(input: ScreenInput<EgressPrincipal>, ruleId: RuleId): Promise<Screened> {
     const { service } = input.account
     const tooLarge: Screened = {
@@ -365,14 +375,16 @@ export function createEgressApproval(deps: {
       ).digest(),
     }
     const admission = transaction(deps.db, (tx) => admit(tx, held))
-    if (admission.kind === 'pass') return { kind: 'forward', body }
+    if (admission.kind === 'pass') {
+      return { kind: 'forward', body, undelivered: handBack(admission.approvalId) }
+    }
     if (admission.kind === 'refuse') return admission
     const { approvalId } = admission
     input.held()
     const end = await wait(approvalId, input.signal)
     switch (end) {
       case 'approved':
-        return { kind: 'forward', body }
+        return { kind: 'forward', body, undelivered: handBack(approvalId) }
       case 'denied':
         return { kind: 'refuse', refusal: { code: 'approval_denied', service, approvalId } }
       case 'timeout':
