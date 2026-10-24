@@ -416,6 +416,32 @@ test('a container spawned before its oauth-token key reaches the upstream as an 
   expect(upstream.requests[0]?.headers['x-api-key']).toBeUndefined()
 })
 
+test('a container spawned for an oauth-token key reaches a later api-key default without the OAuth beta', async () => {
+  const { upstream, tunnel, addKey, setDefault, containerEnv } = await setupCredentials()
+  addKey('subscription', secrets.second, 'oauth-token')
+  const env = containerEnv()
+  expect(Object.keys(env)).toEqual(['CLAUDE_CODE_OAUTH_TOKEN'])
+  addKey('main', secrets.main)
+  setDefault('anthropic/main')
+
+  const response = await sendTestRequest(tunnel, {
+    method: 'POST',
+    path: '/v1/messages',
+    headers: {
+      authorization: `Bearer ${env.CLAUDE_CODE_OAUTH_TOKEN ?? ''}`,
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'oauth-2025-04-20',
+    },
+    body: '{}',
+  })
+
+  expect(response.status).toBe(200)
+  expect(response.headers['x-kurumi-account']).toBe('anthropic/main')
+  expect(upstream.requests[0]?.headers['x-api-key']).toBe(secrets.main)
+  expect(upstream.requests[0]?.headers.authorization).toBeUndefined()
+  expect(upstream.requests[0]?.headers['anthropic-beta']).toBeUndefined()
+})
+
 test('an intercepted host on a port other than 443 is refused before any account is chosen', async () => {
   const { upstream, tunnel, addKey } = await setupCredentials({
     target: { host: 'api.anthropic.com', port: 8443 },
