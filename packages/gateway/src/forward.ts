@@ -343,6 +343,7 @@ async function prepareRequest<Principal>(
   if (
     !path.startsWith('/') ||
     path.startsWith('//') ||
+    path.includes('#') ||
     !host ||
     (host !== authority(target) && !(target.port === 443 && host === `${authority(target)}:443`))
   ) {
