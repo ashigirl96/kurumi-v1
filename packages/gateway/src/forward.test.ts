@@ -9,6 +9,7 @@ import {
 } from 'node:http'
 import { createServer as createHttpsServer, request } from 'node:https'
 import { createServer } from 'node:net'
+import { Readable } from 'node:stream'
 import type { TLSSocket } from 'node:tls'
 
 import {
@@ -1038,7 +1039,7 @@ type RuleInput = Parameters<EgressApproval['rules']['add']>[0]
 
 async function setupHeld({
   holdMs,
-  bodyReadMs,
+  bodyDeadlineMs,
   now,
   deps,
   rule: ruleInput = {
@@ -1050,7 +1051,7 @@ async function setupHeld({
   },
 }: {
   holdMs?: number
-  bodyReadMs?: number
+  bodyDeadlineMs?: number
   now?: () => number
   deps?: Pick<ForwardDeps<EgressPrincipal>, 'upstream' | 'resolve'>
   rule?: RuleInput
@@ -1086,7 +1087,6 @@ async function setupHeld({
       return 'queued'
     },
     holdMs,
-    bodyReadMs,
     now,
   })
   const rule = gate.rules.add(ruleInput)
@@ -1103,6 +1103,7 @@ async function setupHeld({
       inject: credentialInject(ledger),
       log: (event) => events.push(event),
       gate,
+      bodyDeadlineMs,
       ...deps,
     },
   })
@@ -1201,6 +1202,17 @@ const sendScoped = (
     body: prompt('scoped'),
   })
 const granted = 1_800_000_000_000
+
+const stalledMessage =
+  'POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Length: 1000\r\n\r\n{'
+
+const withinTwoSeconds = <T>(answer: Promise<T>) =>
+  Promise.race([
+    answer,
+    Bun.sleep(2_000).then((): never => {
+      throw new Error('the gateway kept the exchange open for 2 s')
+    }),
+  ])
 
 describe('held requests', () => {
   test('hold then approve: the upstream receives the exact body once and the client its 200', async () => {
@@ -1926,21 +1938,21 @@ describe('held requests', () => {
     expect(allowance(approvalId(0))).toMatchObject({ state: 'granted' })
   })
 
-  test('a raw fragment mark in the target is held by an approve rule on the path it can hide', async () => {
-    const { gate, upstream, tunnel, requested, approvalId } = await setupHeld()
+  test('a raw fragment mark in the target is refused before an account, a rule, or the upstream sees it', async () => {
+    const { upstream, tunnel, requested, events } = await setupHeld()
     const body = prompt('fragment')
-    const exchanged = exchangeRaw(
-      tunnel.socket,
-      `POST /v1/models#/../messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
-    )
-    await until(() => requested.length === 1)
 
-    expect(requested[0]?.title).toBe(
-      'POST https://api.anthropic.com/v1/models#/../messages as anthropic/main',
+    const answer = await withinTwoSeconds(
+      exchangeRaw(
+        tunnel.socket,
+        `POST /v1/models#/../messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+      ),
     )
-    await gate.decided({ id: approvalId(0) }, 'deny')
-    expect((await exchanged).status).toBe(403)
+
+    expect(answer.status).toBe(400)
+    expect(requested).toEqual([])
     expect(upstream.requests).toEqual([])
+    expect(events).toEqual([])
   })
 
   test('a GET approve rule holds a HEAD request to the same path', async () => {
@@ -1963,20 +1975,9 @@ describe('held requests', () => {
   })
 })
 
-const stalledMessage =
-  'POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Length: 1000\r\n\r\n{'
-
-const withinTwoSeconds = <T>(answer: Promise<T>) =>
-  Promise.race([
-    answer,
-    Bun.sleep(2_000).then((): never => {
-      throw new Error('the gateway kept the exchange open for 2 s')
-    }),
-  ])
-
-describe('a held body that stops short', () => {
-  test('is answered 408 body_timeout at the deadline, asks no one, and logs a refused row', async () => {
-    const { upstream, tunnel, requested, events } = await setupHeld({ bodyReadMs: 100 })
+describe('a request body that stops short', () => {
+  test('is answered 408 body_timeout at the deadline when a rule holds it, asks no one, and logs a refused row', async () => {
+    const { upstream, tunnel, requested, events } = await setupHeld({ bodyDeadlineMs: 100 })
 
     const answer = await withinTwoSeconds(exchangeRaw(tunnel.socket, stalledMessage))
 
@@ -1993,8 +1994,8 @@ describe('a held body that stops short', () => {
     expect(decisions(events)).toEqual([['refused', 'body_timeout', 408]])
   })
 
-  test('gives back its in-flight slot, so a full agent group can hold again', async () => {
-    const { gate, openTunnel, requested, approvalId } = await setupHeld({ bodyReadMs: 100 })
+  test('gives back the in-flight slot of its hold, so a full agent group can hold again', async () => {
+    const { gate, openTunnel, requested, approvalId } = await setupHeld({ bodyDeadlineMs: 100 })
     const stalled = await Promise.all(
       Array.from({ length: MAX_IN_FLIGHT_PER_GROUP }, (_, index) =>
         openTunnel({ agentGroupId: 'g1', sessionId: `stalled ${index}` }),
@@ -2015,7 +2016,7 @@ describe('a held body that stops short', () => {
   })
 
   test('is cut off at the deadline even while bytes still trickle in', async () => {
-    const { tunnel, requested } = await setupHeld({ bodyReadMs: 150 })
+    const { tunnel, requested } = await setupHeld({ bodyDeadlineMs: 150 })
     const trickle = setInterval(() => tunnel.socket.write('a'), 30)
     stops.push(() => clearInterval(trickle))
 
@@ -2024,6 +2025,33 @@ describe('a held body that stops short', () => {
     expect(answer.status).toBe(408)
     expect(requested).toEqual([])
   })
+
+  test.each([
+    [
+      'a body declared over 10 MiB',
+      'POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Length: 20000000\r\n\r\n{',
+      413,
+      'body_too_large',
+    ],
+    [
+      'an account the agent group is not granted',
+      'POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nx-api-key: kurumi:anthropic/nobody-granted\r\nContent-Length: 1000\r\n\r\n{',
+      403,
+      'account_not_granted',
+    ],
+  ])(
+    'is answered with Connection: close at the deadline when %s is refused before the body is read',
+    async (_name, request, status, refusal) => {
+      const { tunnel, events } = await setupHeld({ bodyDeadlineMs: 100 })
+
+      const answer = await withinTwoSeconds(exchangeRaw(tunnel.socket, request))
+
+      expect(answer).toMatchObject({ status, headers: { connection: 'close' } })
+      expect(JSON.parse(answer.body)).toMatchObject({ error: refusal })
+      await until(() => events.length === 1)
+      expect(decisions(events)).toEqual([['refused', refusal, status]])
+    },
+  )
 })
 
 async function restartableUpstream() {
@@ -2154,6 +2182,39 @@ describe('an approved request the upstream never received', () => {
       approvalId: approvalId(1),
     })
     expect(requested).toHaveLength(2)
+  })
+
+  test('a second hand-back after the allowance passed another request gives nothing back', async () => {
+    const { gate, tunnel, approvalId, allowance } = await setupHeld({ holdMs: 50 })
+    const body = prompt('hand back once')
+    expect((await sendMessage(tunnel, body)).status).toBe(403)
+    await gate.decided({ id: approvalId(0) }, 'approve')
+    const resend = async () => {
+      const screened = await gate.screen({
+        principal: { agentGroupId: 'g1', sessionId: 's1' },
+        account: { handle: accountHandle('anthropic', 'main'), service: 'anthropic-api' },
+        host: 'api.anthropic.com',
+        method: 'POST',
+        methodOverrides: [],
+        contentType: [],
+        contentEncoding: [],
+        path: '/v1/messages',
+        body: Readable.from([Buffer.from(body)]),
+        declaredLength: Buffer.byteLength(body),
+        signal: new AbortController().signal,
+        held: () => {},
+        bodyDeadlineMs: 1_000,
+      })
+      if (screened?.kind !== 'forward') throw new Error(`resend was not passed: ${screened?.kind}`)
+      return screened
+    }
+
+    const first = await resend()
+    first.undelivered()
+    await resend()
+    first.undelivered()
+
+    expect(allowance(approvalId(0))).toMatchObject({ state: 'used' })
   })
 
   test.each(['request', 'upgrade'] as const)(
