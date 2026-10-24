@@ -443,3 +443,98 @@ test('a throwing driver preserves its accepted receipt and revokes the starting 
   if (!token) throw new Error('missing attempted runtime')
   expect(ledger.authenticate(token)).toBeNull()
 })
+
+test('a notice is queued once per key as a triggering system message', async () => {
+  const receipt = await ledger.routeInbound(event('hello'))
+  const notice = { key: 'apr-once', sessionId: receipt.sessionId, text: 'kurumi: approved' }
+
+  expect(ledger.notify(notice)).toBe('queued')
+  expect(ledger.notify(notice)).toBe('duplicate')
+
+  expect(db.select().from(inboundMessage).where(eq(inboundMessage.kind, 'system')).all()).toEqual([
+    expect.objectContaining({
+      sessionId: receipt.sessionId,
+      seq: 2,
+      trigger: true,
+      status: 'pending',
+      content: 'kurumi: approved',
+    }),
+  ])
+})
+
+test('a notice to a missing or closed session is refused and writes nothing', async () => {
+  const receipt = await ledger.routeInbound(event('hello'))
+  transaction(db, (tx) => {
+    tx.update(session).set({ status: 'closed' }).where(eq(session.id, receipt.sessionId)).run()
+  })
+
+  expect(ledger.notify({ key: 'apr-missing', sessionId: 'ses-missing', text: 'x' })).toBe(
+    'no_session',
+  )
+  expect(ledger.notify({ key: 'apr-closed', sessionId: receipt.sessionId, text: 'x' })).toBe(
+    'no_session',
+  )
+  expect(db.select().from(inboundMessage).all()).toHaveLength(1)
+})
+
+test('a parked pull wakes with the notice', async () => {
+  const driver = createFakeDriver()
+  ledger = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: runtime(driver),
+  })
+  const first = await ledger.routeInbound(event('first'))
+  const principal = ledger.authenticate(driver.runs[0]?.env.KURUMI_TOKEN ?? '')
+  if (!principal) throw new Error('missing live container')
+  await ledger.channel.pull(principal, { waitMs: 0 })
+  await ledger.channel.complete(principal, { ids: [first.inboundId] })
+  const parked = ledger.channel.pull(principal, { waitMs: 2_000 })
+  await Bun.sleep(10)
+  const sent = performance.now()
+
+  ledger.notify({ key: 'apr-wake', sessionId: first.sessionId, text: 'kurumi: resend now' })
+
+  const { messages } = await parked
+  expect(performance.now() - sent).toBeLessThan(500)
+  expect(messages).toMatchObject([{ kind: 'system', trigger: true, content: 'kurumi: resend now' }])
+})
+
+test('a notice queued before start is served once the ledger starts', async () => {
+  const receipt = await ledger.routeInbound(event('hello'))
+  transaction(db, (tx) => {
+    tx.update(inboundMessage).set({ status: 'completed' }).run()
+  })
+  await ledger.stop()
+  const driver = createFakeDriver()
+  ledger = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: runtime(driver),
+  })
+
+  expect(
+    ledger.notify({ key: 'apr-boot', sessionId: receipt.sessionId, text: 'approved while down' }),
+  ).toBe('queued')
+  expect(driver.runs).toEqual([])
+
+  await ledger.start()
+  const principal = ledger.authenticate(driver.runs[0]?.env.KURUMI_TOKEN ?? '')
+  if (!principal) throw new Error('start did not spawn a container for the notice')
+  const { messages } = await ledger.channel.pull(principal, { waitMs: 0 })
+  expect(messages).toMatchObject([{ kind: 'system', content: 'approved while down' }])
+})
+
+test('a notice is shown in the bound terminal chat', async () => {
+  const stream = chat.terminal({ agentGroupId: agentId, text: 'hello', follow: true })
+  const queued = (await stream.next()).value
+  if (!queued || queued.kind !== 'queued') throw new Error('missing queued receipt')
+  const text = 'kurumi: approval apr-chat was approved'
+
+  expect(ledger.notify({ key: 'apr-chat', sessionId: queued.sessionId, text })).toBe('queued')
+
+  expect((await stream.next()).value).toEqual({ kind: 'reply', outboundId: 'ntf-apr-chat', text })
+  await stream.return()
+})

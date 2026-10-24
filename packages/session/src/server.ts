@@ -109,12 +109,16 @@ export type RuntimeLog =
     }
   | SupervisionLog
 type OutboundInput = { id: string; sessionId: string; text: string; inReplyTo?: string }
+export type SessionNotice = { key: string; sessionId: string; text: string }
+export type NoticeReceipt = 'queued' | 'duplicate' | 'no_session'
 export type SessionLedger = {
   start(): Promise<void>
   adopted(): Promise<void>
   stop(): Promise<void>
   routeInbound(event: InboundEvent): Promise<InboundReceipt>
   postOutbound(input: OutboundInput): Promise<void>
+  /** Starts a turn with `text` as a system message, once per key, and shows the same text in the chat. */
+  notify(notice: SessionNotice): NoticeReceipt
   authenticate(token: string): AgentPrincipal | null
   channel: {
     pull(
@@ -702,6 +706,49 @@ export function createSessionLedger({
       } catch (error) {
         if (!(error instanceof ORPCError) || error.code !== 'SERVICE_UNAVAILABLE') throw error
       }
+    },
+    notify({ key, sessionId: id, text }) {
+      const noticeId = `ntf-${key}`
+      const receipt = transaction(db, (tx): NoticeReceipt => {
+        const current = tx
+          .select({ id: session.id })
+          .from(session)
+          .where(and(eq(session.id, id), eq(session.status, 'active')))
+          .get()
+        if (!current) return 'no_session'
+        const existing = tx
+          .select({ id: inboundMessage.id })
+          .from(inboundMessage)
+          .where(eq(inboundMessage.id, noticeId))
+          .get()
+        if (existing) return 'duplicate'
+        const seq =
+          (tx
+            .select({ seq: sql<number>`coalesce(max(${inboundMessage.seq}), 0)` })
+            .from(inboundMessage)
+            .where(eq(inboundMessage.sessionId, id))
+            .get()?.seq ?? 0) + 1
+        const now = new Date()
+        tx.insert(inboundMessage)
+          .values({
+            id: noticeId,
+            sessionId: id,
+            seq,
+            kind: 'system',
+            trigger: true,
+            status: 'pending',
+            content: text,
+            createdAt: now,
+          })
+          .run()
+        tx.update(session).set({ lastActiveAt: now }).where(eq(session.id, id)).run()
+        return 'queued'
+      })
+      if (receipt !== 'queued' || stopped) return receipt
+      wake(id)
+      if (enabled) void reconcile(id).catch(() => {})
+      void deliver({ id: noticeId, sessionId: id, text }).catch(() => {})
+      return receipt
     },
     channel: {
       pull(principal, input, signal) {
