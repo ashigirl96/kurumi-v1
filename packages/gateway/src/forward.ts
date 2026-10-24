@@ -68,7 +68,11 @@ export type ScreenInput<Principal> = {
   account: { handle: AccountHandle; service: ServiceId }
   host: string
   method: string
+  /** Values of X-HTTP-Method-Override, X-HTTP-Method, and X-Method-Override, as sent. */
   methodOverrides: readonly string[]
+  /** One value per header line, as sent; empty when the header is absent. */
+  contentType: readonly string[]
+  contentEncoding: readonly string[]
   /** As sent, query included. */
   path: string
   /** null for a WebSocket upgrade, which carries no body. */
@@ -273,12 +277,10 @@ function egressRecorder<Principal>(
 
 const methodOverrideHeaders = ['x-http-method-override', 'x-http-method', 'x-method-override']
 
-function methodOverridesOf(rawHeaders: readonly string[]): string[] {
+function valuesAsRead(rawHeaders: readonly string[], names: readonly string[]): string[] {
   return rawHeaders.flatMap((name, index) => {
     const value = rawHeaders[index + 1]
-    return index % 2 === 0 &&
-      value !== undefined &&
-      methodOverrideHeaders.includes(headerNameAsRead(name))
+    return index % 2 === 0 && value !== undefined && names.includes(headerNameAsRead(name))
       ? [value]
       : []
   })
@@ -303,7 +305,9 @@ function screening<Principal>(
     account,
     host: context.target.host,
     method: req.method ?? 'GET',
-    methodOverrides: methodOverridesOf(req.rawHeaders),
+    methodOverrides: valuesAsRead(req.rawHeaders, methodOverrideHeaders),
+    contentType: valuesAsRead(req.rawHeaders, ['content-type']),
+    contentEncoding: valuesAsRead(req.rawHeaders, ['content-encoding']),
     path: req.url ?? '/',
     body: exchange.body,
     declaredLength: declaredLengthOf(req),

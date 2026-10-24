@@ -8,7 +8,14 @@ import { and, asc, count, eq, gt } from 'drizzle-orm'
 import type { EgressPrincipal } from './egress-log.ts'
 import { pathWithoutQuery, type EgressGate, type ScreenInput, type Screened } from './forward.ts'
 import type { HoldRefusal } from './refusal.ts'
-import { createRuleStore, evaluate, normalizeHost, type RuleId, type RuleStore } from './rules.ts'
+import {
+  createRuleStore,
+  evaluate,
+  normalizeHost,
+  normalizeMethodOverrides,
+  type RuleId,
+  type RuleStore,
+} from './rules.ts'
 import { egressAllowance } from './schema.ts'
 
 export type GatewayApprovals = {
@@ -53,13 +60,18 @@ type HeldRequest = {
   input: ScreenInput<EgressPrincipal>
   ruleId: RuleId
   method: string
+  methodOverrides: readonly string[]
   host: string
+  contentType: readonly string[]
+  contentEncoding: readonly string[]
   body: Buffer
   bodySha256: string
   fingerprint: Buffer
 }
 
 const sha256 = (data: string | Buffer) => createHash('sha256').update(data)
+
+const normalizeFraming = (value: string) => value.trim().toLowerCase()
 
 type InFlightLimit = Pick<Extract<HoldRefusal, { waiting: 'in_flight' }>, 'scope' | 'limit'>
 
@@ -128,12 +140,26 @@ function preview(body: Buffer): string {
   }
 }
 
-function cardOf({ input, ruleId, method, host, body, bodySha256 }: HeldRequest) {
+function framingLine({ contentType, contentEncoding }: HeldRequest): string[] {
+  const present = Object.entries({
+    'content-type': contentType,
+    'content-encoding': contentEncoding,
+  })
+    .filter(([, values]) => values.length > 0)
+    .map(([name, values]) => `${name} ${values.map((value) => value || '(empty)').join(' and ')}`)
+  return present.length > 0 ? [present.join(', ')] : []
+}
+
+function cardOf(held: HeldRequest) {
+  const { input, ruleId, method, methodOverrides, host, body, bodySha256 } = held
+  const override =
+    methodOverrides.length > 0 ? `, method override ${methodOverrides.join(', ')}` : ''
   return {
-    title: `${method} https://${host}${input.path} as ${input.account.handle}`,
+    title: `${method} https://${host}${input.path} as ${input.account.handle}${override}`,
     body: [
       `agent group ${input.principal.agentGroupId}, session ${input.principal.sessionId}`,
       `rule ${ruleId}, service ${input.account.service}`,
+      ...framingLine(held),
       `body ${body.length} bytes, sha256 ${bodySha256}`,
       preview(body),
     ],
@@ -292,22 +318,31 @@ export function createEgressApproval(deps: {
     if (body === 'too_large') return tooLarge
     if (body === 'gone') return { kind: 'abandoned' }
     const method = input.method.toUpperCase()
+    const methodOverrides = normalizeMethodOverrides(input.methodOverrides)
     const host = normalizeHost(input.host)
+    const contentType = input.contentType.map(normalizeFraming)
+    const contentEncoding = input.contentEncoding.map(normalizeFraming)
     const bodySha256 = sha256(body).digest('hex')
     const held: HeldRequest = {
       input,
       ruleId,
       method,
+      methodOverrides,
       host,
+      contentType,
+      contentEncoding,
       body,
       bodySha256,
       fingerprint: sha256(
         JSON.stringify([
           'kurumi.egress.v1',
           method,
+          methodOverrides,
           host,
           input.path,
           input.account.handle,
+          contentType,
+          contentEncoding,
           bodySha256,
         ]),
       ).digest(),

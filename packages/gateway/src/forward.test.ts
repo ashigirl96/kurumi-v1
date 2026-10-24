@@ -1241,6 +1241,64 @@ describe('held requests', () => {
     expect(JSON.stringify([requested, events])).not.toContain(secrets.main)
   })
 
+  test('the card names the method override and the body framing a person approves', async () => {
+    const { gate, rule, tunnel, requested, approvalId } = await setupHeld()
+    const body = prompt('framed card')
+    const response = sendTestRequest(tunnel, {
+      method: 'PUT',
+      path: '/v1/messages',
+      headers: {
+        'X-HTTP-Method-Override': 'post',
+        'content-type': 'Application/JSON',
+        'content-encoding': 'identity',
+      },
+      body,
+    })
+    await until(() => requested.length === 1)
+
+    expect(requested[0]).toMatchObject({
+      title: 'PUT https://api.anthropic.com/v1/messages as anthropic/main, method override POST',
+      body: [
+        'agent group g1, session s1',
+        `rule ${rule.id}, service anthropic-api`,
+        'content-type application/json, content-encoding identity',
+        `body ${Buffer.byteLength(body)} bytes, sha256 ${sha256Hex(body)}`,
+        body,
+      ],
+    })
+    await gate.decided({ id: approvalId(0) }, 'deny')
+    await response
+  })
+
+  test.each([
+    ['a method override header', {}, { 'X-HTTP-Method-Override': 'DELETE' }],
+    [
+      'a changed content-type',
+      { 'content-type': 'application/json' },
+      { 'content-type': 'text/plain' },
+    ],
+    ['an empty content-type', {}, { 'content-type': '' }],
+    ['a content-encoding', {}, { 'content-encoding': 'gzip' }],
+  ] satisfies [string, Record<string, string>, Record<string, string>][])(
+    'an approved request resent with %s holds again and sends nothing upstream',
+    async (_name, approvedHeaders, changedHeaders) => {
+      const { gate, upstream, tunnel, approvalId, allowance } = await setupHeld({ holdMs: 50 })
+      const body = prompt('framed')
+      await sendMessage(tunnel, body, approvedHeaders)
+      await gate.decided({ id: approvalId(0) }, 'approve')
+
+      const resent = await sendMessage(tunnel, body, { ...approvedHeaders, ...changedHeaders })
+
+      expect(resent.status).toBe(403)
+      expect(JSON.parse(resent.body)).toMatchObject({
+        error: 'approval_pending',
+        approvalId: approvalId(1),
+      })
+      expect(upstream.requests).toEqual([])
+      expect(allowance(approvalId(0))).toMatchObject({ state: 'granted' })
+    },
+  )
+
   test('timeout then allowance: a later approval notifies the session once and leaves a granted row', async () => {
     const at = 1_800_000_000_000
     const { gate, upstream, tunnel, approvalId, notices, allowance, events } = await setupHeld({

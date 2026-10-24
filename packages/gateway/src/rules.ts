@@ -84,6 +84,17 @@ export function canonicalPath(raw: string): CanonicalPath {
 
 export const normalizeHost = (host: string) => host.toLowerCase().replace(/\.$/, '')
 
+/** Every method an upstream may read from override headers, sorted and without repeats. */
+export function normalizeMethodOverrides(values: readonly string[]): string[] {
+  const methods = values.flatMap((value) =>
+    value
+      .split(',')
+      .map((part) => part.trim().toUpperCase())
+      .filter((part) => part !== ''),
+  )
+  return [...new Set(methods)].toSorted()
+}
+
 function foldPath(path: string): string {
   const lower = path.toLowerCase()
   return lower.length > 1 && lower.endsWith('/') ? lower.slice(0, -1) : lower
@@ -144,12 +155,7 @@ export function evaluate(rules: readonly EgressRule[], request: RuleRequest): Ve
   const path = canonicalPath(request.pathAsSent)
   const host = normalizeHost(request.host)
   const method = request.method.toUpperCase()
-  const overrides = request.methodOverrides.flatMap((value) =>
-    value
-      .split(',')
-      .map((part) => part.trim().toUpperCase())
-      .filter((part) => part !== ''),
-  )
+  const overrides = normalizeMethodOverrides(request.methodOverrides)
   let best: EgressRule | undefined
   for (const rule of rules) {
     if (
