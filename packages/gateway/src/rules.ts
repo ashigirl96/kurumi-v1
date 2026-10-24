@@ -54,7 +54,6 @@ export type RuleStore = {
   /** Throws ORPCError BAD_REQUEST with a message that names the fix. The table CHECKs are the backstop. */
   add(input: RuleInput): RuleView
   remove(id: string): { removed: boolean }
-  /** The rules whose account handle or service is the request's. */
   read(key: { handle: AccountHandle; service: ServiceId }): EgressRule[]
 }
 
@@ -137,7 +136,6 @@ function targets(rule: EgressRule, request: RuleRequest): boolean {
   }
 }
 
-/** Higher priority first; at equal priority approve before allow; then the older id. */
 function outranks(a: EgressRule, b: EgressRule): boolean {
   if (a.priority !== b.priority) return a.priority > b.priority
   if (a.effect !== b.effect) return a.effect === 'approve'

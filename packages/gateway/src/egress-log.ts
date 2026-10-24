@@ -42,6 +42,8 @@ function rowOf(event: EgressEvent<EgressPrincipal>): typeof egressLog.$inferInse
       return { ...row, decision: 'passed' }
     case 'refused':
       return { ...row, decision: 'refused', refusal: event.refusal, service: event.service }
+    case 'held':
+      return { ...row, decision: 'held', service: event.service }
     default: {
       const unknown: never = event
       return unknown

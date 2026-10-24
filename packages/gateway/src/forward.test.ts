@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash, randomBytes } from 'node:crypto'
 import type { LookupAddress } from 'node:dns'
 import { once } from 'node:events'
@@ -15,7 +15,10 @@ import {
   type CredentialPrincipal,
 } from '@kurumi/account/server'
 import { inMemoryDb, insertAgentGroup } from '@kurumi/account/testing'
+import { eq } from 'drizzle-orm'
+import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 
+import type { EgressPrincipal } from './egress-log.ts'
 import {
   credentialInject,
   pinnedLookup,
@@ -23,7 +26,17 @@ import {
   type EgressEvent,
   type ForwardDeps,
 } from './forward.ts'
+import {
+  ALLOWANCE_MS,
+  createEgressApproval,
+  MAX_HELD,
+  MAX_HELD_BODY_BYTES,
+  type GatewayApprovals,
+  type SessionNotice,
+} from './hold.ts'
 import { startAgentPort } from './port.ts'
+import { egressAllowance } from './schema.ts'
+import { migrations } from './server.ts'
 import { openTestTunnel, sendTestRequest, startFakeUpstream, startTestGateway } from './testing.ts'
 
 const stops: (() => void | Promise<void>)[] = []
@@ -1002,4 +1015,527 @@ test('an injected request names the service of the injection the ledger chose', 
       rawHeaders: [],
     }),
   ).toMatchObject({ account: { handle, service: 'anthropic-api' } })
+})
+
+type Requested = Parameters<GatewayApprovals['request']>[1] & { approvalId: string }
+
+async function setupHeld({ holdMs, now }: { holdMs?: number; now?: () => number } = {}) {
+  const db = inMemoryDb()
+  migrate(db, { migrationsFolder: migrations.folder, migrationsTable: migrations.table })
+  insertAgentGroup(db, 'g1')
+  const ledger = createAccountLedger({ db, vaultKey: randomBytes(32) })
+  db.transaction((tx) =>
+    ledger.addKey(tx, {
+      vendor: 'anthropic',
+      label: 'main',
+      value: secrets.main,
+      authMode: 'api-key',
+      autoGrant: true,
+    }),
+  )
+  const requested: Requested[] = []
+  const notices: SessionNotice[] = []
+  const gate = createEgressApproval({
+    db,
+    accounts: ledger,
+    approvals: {
+      request: (_tx, input) => {
+        const approvalId = `apr-${requested.length + 1}`
+        requested.push({ ...input, approvalId })
+        return { approvalId }
+      },
+    },
+    notify: (notice) => {
+      if (notices.some(({ key }) => key === notice.key)) return 'duplicate'
+      notices.push(notice)
+      return 'queued'
+    },
+    holdMs,
+    now,
+  })
+  const rule = gate.rules.add({
+    account: 'anthropic/main',
+    method: 'POST',
+    path: '/v1/messages',
+    priority: 0,
+    effect: 'approve',
+  })
+  const events: EgressEvent<EgressPrincipal>[] = []
+  const upstream = await startFakeUpstream({ host: 'api.anthropic.com' })
+  stops.push(upstream.stop)
+  const port = await startAgentPort<EgressPrincipal>({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: (token) =>
+      token === 'test-token' ? { agentGroupId: 'g1', sessionId: 's1' } : null,
+    intercepts: isInterceptedHost,
+    forward: {
+      upstream: upstream.destination,
+      inject: credentialInject(ledger),
+      log: (event) => events.push(event),
+      gate,
+    },
+  })
+  stops.push(port.stop)
+  const openTunnel = async () => {
+    const tunnel = await openTestTunnel({
+      proxyPort: port.port,
+      token: 'test-token',
+      caPem: port.caPem,
+      target: { host: 'api.anthropic.com', port: 443 },
+    })
+    stops.push(tunnel.close)
+    return tunnel
+  }
+  const allowance = (approvalId: string) =>
+    db.select().from(egressAllowance).where(eq(egressAllowance.approvalId, approvalId)).get()
+  const approvalId = (index: number) => {
+    const found = requested[index]?.approvalId
+    if (found === undefined) throw new Error(`no approval #${index + 1} was requested`)
+    return found
+  }
+  return {
+    gate,
+    rule,
+    upstream,
+    port,
+    tunnel: await openTunnel(),
+    openTunnel,
+    requested,
+    approvalId,
+    notices,
+    events,
+    allowance,
+  }
+}
+
+const prompt = (text = 'hello') =>
+  JSON.stringify({ model: 'claude', messages: [{ role: 'user', content: text }] })
+
+const sendMessage = (
+  tunnel: Awaited<ReturnType<typeof openTestTunnel>>,
+  body = prompt(),
+  headers: Record<string, string> = {},
+) => sendTestRequest(tunnel, { method: 'POST', path: '/v1/messages', headers, body })
+
+const sha256Hex = (text: string) => createHash('sha256').update(text).digest('hex')
+
+const decisions = (events: readonly EgressEvent<EgressPrincipal>[]) =>
+  events.map((event) => [
+    event.decision,
+    event.decision === 'refused' ? event.refusal : null,
+    event.status,
+  ])
+
+describe('held requests', () => {
+  test('hold then approve: the upstream receives the exact body once and the client its 200', async () => {
+    const { gate, upstream, tunnel, requested, approvalId, events, notices } = await setupHeld()
+    const body = prompt('approve me')
+    const response = sendMessage(tunnel, body, { 'transfer-encoding': 'chunked' })
+    await until(() => requested.length === 1)
+    await Bun.sleep(20)
+    expect(upstream.requests).toEqual([])
+
+    await gate.decided({ id: approvalId(0) }, 'approve')
+
+    expect((await response).status).toBe(200)
+    expect(upstream.requests).toHaveLength(1)
+    expect(upstream.requests[0]?.body).toEqual({
+      kind: 'complete',
+      bytes: Buffer.byteLength(body),
+      sha256: sha256Hex(body),
+    })
+    expect(upstream.requests[0]?.headers).toMatchObject({
+      'content-length': String(Buffer.byteLength(body)),
+      'x-api-key': secrets.main,
+    })
+    expect(upstream.requests[0]?.headers['transfer-encoding']).toBeUndefined()
+    await until(() => events.length === 2)
+    expect(decisions(events)).toEqual([
+      ['held', null, null],
+      ['injected', null, 200],
+    ])
+    expect(events[0]?.at).toBe(events[1]?.at ?? 0)
+    expect(notices).toEqual([])
+  })
+
+  test('hold then deny: the client reads 403 approval_denied and nothing goes upstream', async () => {
+    const { gate, upstream, tunnel, requested, approvalId, events, notices } = await setupHeld()
+    const response = sendMessage(tunnel)
+    await until(() => requested.length === 1)
+    const id = approvalId(0)
+
+    await gate.decided({ id }, 'deny')
+
+    const answer = await response
+    expect(answer.status).toBe(403)
+    expect(JSON.parse(answer.body)).toEqual({
+      error: 'approval_denied',
+      service: 'anthropic-api',
+      approvalId: id,
+      next: `a person denied ${id}; do not send this request again unless the user asks for it`,
+    })
+    expect(upstream.requests).toEqual([])
+    await until(() => events.length === 2)
+    expect(decisions(events)).toEqual([
+      ['held', null, null],
+      ['refused', 'approval_denied', 403],
+    ])
+    expect(notices).toEqual([])
+  })
+
+  test('the card names the request, the rule, and the body, and never the credential', async () => {
+    const { gate, rule, tunnel, requested, approvalId, events } = await setupHeld()
+    const body = prompt('card')
+    const response = sendTestRequest(tunnel, {
+      method: 'POST',
+      path: '/v1/messages?beta=true',
+      headers: { 'x-api-key': groupSelector },
+      body,
+    })
+    await until(() => requested.length === 1)
+
+    expect(requested).toEqual([
+      {
+        kind: 'gateway.request',
+        agentGroupId: 'g1',
+        sessionId: 's1',
+        title: 'POST https://api.anthropic.com/v1/messages?beta=true as anthropic/main',
+        body: [
+          'agent group g1, session s1',
+          `rule ${rule.id}, service anthropic-api`,
+          `body ${Buffer.byteLength(body)} bytes, sha256 ${sha256Hex(body)}`,
+          body,
+        ],
+        payload: {},
+        approvalId: approvalId(0),
+      },
+    ])
+    await gate.decided({ id: approvalId(0) }, 'deny')
+    await response
+    await until(() => events.length === 2)
+    expect(JSON.stringify([requested, events])).not.toContain(secrets.main)
+  })
+
+  test('timeout then allowance: a later approval notifies the session once and leaves a granted row', async () => {
+    const at = 1_800_000_000_000
+    const { gate, upstream, tunnel, approvalId, notices, allowance, events } = await setupHeld({
+      holdMs: 50,
+      now: () => at,
+    })
+
+    const answer = await sendMessage(tunnel)
+
+    const id = approvalId(0)
+    expect(answer.status).toBe(403)
+    expect(JSON.parse(answer.body)).toMatchObject({ error: 'approval_pending', approvalId: id })
+    await until(() => events.length === 2)
+    expect(decisions(events)).toEqual([
+      ['held', null, null],
+      ['refused', 'approval_pending', 403],
+    ])
+    expect(allowance(id)).toMatchObject({ state: 'pending' })
+
+    await gate.decided({ id }, 'approve')
+
+    expect(notices).toEqual([
+      {
+        key: id,
+        sessionId: 's1',
+        text: `kurumi: approval ${id} was approved: POST https://api.anthropic.com/v1/messages as anthropic/main. The first attempt ended before the decision. Send exactly the same request with the same body within 10 minutes; it passes once. A changed body needs a new approval.`,
+      },
+    ])
+    expect(allowance(id)).toMatchObject({
+      state: 'granted',
+      expiresAt: new Date(at + ALLOWANCE_MS),
+    })
+    expect(upstream.requests).toEqual([])
+  })
+
+  test('a deny after the hold ended tells the session not to send the request again', async () => {
+    const { gate, tunnel, approvalId, notices } = await setupHeld({ holdMs: 50 })
+    await sendMessage(tunnel)
+    const id = approvalId(0)
+
+    await gate.decided({ id }, 'deny')
+
+    expect(notices).toEqual([
+      {
+        key: id,
+        sessionId: 's1',
+        text: `kurumi: approval ${id} was denied: POST https://api.anthropic.com/v1/messages as anthropic/main. Do not send this request again unless the user asks for it.`,
+      },
+    ])
+  })
+
+  test('identical resend passes once without a new hold, and a second resend holds again', async () => {
+    const { gate, upstream, tunnel, requested, approvalId, allowance, events } = await setupHeld({
+      holdMs: 50,
+    })
+    const body = prompt('resend me')
+    await sendMessage(tunnel, body)
+    await gate.decided({ id: approvalId(0) }, 'approve')
+
+    const resend = await sendMessage(tunnel, body)
+
+    expect(resend.status).toBe(200)
+    expect(upstream.requests).toHaveLength(1)
+    expect(upstream.requests[0]?.body).toMatchObject({ sha256: sha256Hex(body) })
+    expect(requested).toHaveLength(1)
+    expect(allowance(approvalId(0))).toMatchObject({ state: 'used' })
+
+    const again = await sendMessage(tunnel, body)
+
+    expect(again.status).toBe(403)
+    expect(JSON.parse(again.body)).toMatchObject({
+      error: 'approval_pending',
+      approvalId: approvalId(1),
+    })
+    expect(upstream.requests).toHaveLength(1)
+    await until(() => events.length === 5)
+    expect(decisions(events)).toEqual([
+      ['held', null, null],
+      ['refused', 'approval_pending', 403],
+      ['injected', null, 200],
+      ['held', null, null],
+      ['refused', 'approval_pending', 403],
+    ])
+  })
+
+  test('an edited body holds again under a new approval', async () => {
+    const { gate, upstream, tunnel, requested, approvalId, allowance } = await setupHeld({
+      holdMs: 50,
+    })
+    await sendMessage(tunnel, prompt('the body a person read'))
+    await gate.decided({ id: approvalId(0) }, 'approve')
+
+    const edited = await sendMessage(tunnel, prompt('a body nobody read'))
+
+    expect(edited.status).toBe(403)
+    expect(requested).toHaveLength(2)
+    expect(JSON.parse(edited.body)).toMatchObject({
+      error: 'approval_pending',
+      approvalId: approvalId(1),
+    })
+    expect(approvalId(1)).not.toBe(approvalId(0))
+    expect(upstream.requests).toEqual([])
+    expect(allowance(approvalId(0))).toMatchObject({ state: 'granted' })
+  })
+
+  test('a replayed decision notifies once and never passes a request twice', async () => {
+    const { gate, upstream, tunnel, requested, approvalId, notices } = await setupHeld({
+      holdMs: 50,
+    })
+    await sendMessage(tunnel)
+    const id = approvalId(0)
+    for (let replay = 0; replay < 3; replay++) await gate.decided({ id }, 'approve')
+    expect(notices.map(({ key }) => key)).toEqual([id])
+
+    expect((await sendMessage(tunnel)).status).toBe(200)
+    await gate.decided({ id }, 'approve')
+    const again = await sendMessage(tunnel)
+
+    expect(again.status).toBe(403)
+    expect(upstream.requests).toHaveLength(1)
+    expect(requested).toHaveLength(2)
+    expect(notices.map(({ key }) => key)).toEqual([id])
+  })
+
+  test('a decision for an approval the gateway never held is an error', async () => {
+    const { gate } = await setupHeld()
+    const failed = await gate.decided({ id: 'apr-unknown' }, 'approve').then(
+      () => null,
+      (error: unknown) => error,
+    )
+    expect(failed).toEqual(new Error('gateway approval apr-unknown has no egress allowance row'))
+  })
+
+  test('an identical request while the first waits is pending on the same approval', async () => {
+    const { gate, tunnel, openTunnel, requested, approvalId } = await setupHeld()
+    const first = sendMessage(tunnel)
+    await until(() => requested.length === 1)
+
+    const second = await sendMessage(await openTunnel())
+
+    expect(second.status).toBe(403)
+    expect(JSON.parse(second.body)).toMatchObject({
+      error: 'approval_pending',
+      approvalId: approvalId(0),
+    })
+    expect(requested).toHaveLength(1)
+    await gate.decided({ id: approvalId(0) }, 'approve')
+    expect((await first).status).toBe(200)
+  })
+
+  test('an identical request after the first one hung up waits on the same approval', async () => {
+    const { gate, tunnel, openTunnel, requested, approvalId, events } = await setupHeld()
+    const first = sendMessage(tunnel).catch(() => 'hung up')
+    await until(() => requested.length === 1)
+    tunnel.close()
+    expect(await first).toBe('hung up')
+    await until(() => events.length === 2)
+    expect(decisions(events)).toEqual([
+      ['held', null, null],
+      ['refused', 'approval_pending', null],
+    ])
+
+    const retried = sendMessage(await openTunnel())
+    await until(() => events.length === 3)
+    await gate.decided({ id: approvalId(0) }, 'approve')
+
+    expect((await retried).status).toBe(200)
+    expect(requested).toHaveLength(1)
+  })
+
+  test('a request with a method override header is held by a rule on the overriding method', async () => {
+    const { gate, upstream, tunnel, requested, approvalId } = await setupHeld()
+    const response = sendTestRequest(tunnel, {
+      method: 'PUT',
+      path: '/v1/messages',
+      headers: { 'X-HTTP-Method-Override': 'POST' },
+      body: prompt(),
+    })
+    await until(() => requested.length === 1)
+    expect(upstream.requests).toEqual([])
+    await gate.decided({ id: approvalId(0) }, 'deny')
+    expect((await response).status).toBe(403)
+  })
+
+  test.each([
+    ['a declared length', {}],
+    ['a chunked body', { 'transfer-encoding': 'chunked' }],
+  ])(
+    'a held request with %s above 10 MiB reads 413 body_too_large and asks for no approval',
+    async (_name, headers) => {
+      const body = 'a'.repeat(MAX_HELD_BODY_BYTES + 1)
+      for (let upload = 0; upload < 3; upload++) {
+        const { upstream, tunnel, requested } = await setupHeld()
+
+        const answer = await sendMessage(tunnel, body, headers)
+
+        expect(answer.status).toBe(413)
+        expect(JSON.parse(answer.body)).toEqual({
+          error: 'body_too_large',
+          service: 'anthropic-api',
+          limit: MAX_HELD_BODY_BYTES,
+          next: `a rule holds this request for a person to read, and kurumi holds at most ${MAX_HELD_BODY_BYTES} bytes; send a smaller body`,
+        })
+        expect(requested).toEqual([])
+        expect(upstream.requests).toEqual([])
+      }
+    },
+  )
+
+  test('a held body of exactly 10 MiB waits for a person', async () => {
+    const { gate, upstream, tunnel, requested, approvalId } = await setupHeld()
+    const body = 'a'.repeat(MAX_HELD_BODY_BYTES)
+    const response = sendMessage(tunnel, body)
+    await until(() => requested.length === 1)
+
+    await gate.decided({ id: approvalId(0) }, 'approve')
+
+    expect((await response).status).toBe(200)
+    expect(upstream.requests[0]?.body).toMatchObject({ bytes: MAX_HELD_BODY_BYTES })
+  })
+
+  test('a request no rule holds returns on another tunnel while a hold waits', async () => {
+    const { gate, upstream, tunnel, openTunnel, requested, approvalId } = await setupHeld()
+    let settled = false
+    const held = sendMessage(tunnel).finally(() => {
+      settled = true
+    })
+    await until(() => requested.length === 1)
+
+    const models = await sendTestRequest(await openTunnel(), { path: '/v1/models' })
+
+    expect(models.status).toBe(200)
+    expect(settled).toBe(false)
+    expect(upstream.requests.map(({ path }) => path)).toEqual(['/v1/models'])
+    await gate.decided({ id: approvalId(0) }, 'deny')
+    await held
+  })
+
+  test('requests past the undecided cap of an agent group read 429 approval_limit', async () => {
+    const { gate, tunnel, requested, approvalId } = await setupHeld({ holdMs: 1 })
+    for (let index = 0; index < MAX_HELD; index++) {
+      expect((await sendMessage(tunnel, prompt(`undecided ${index}`))).status).toBe(403)
+    }
+
+    const over = await sendMessage(tunnel, prompt('one too many'))
+
+    expect(over.status).toBe(429)
+    expect(JSON.parse(over.body)).toEqual({
+      error: 'approval_limit',
+      service: 'anthropic-api',
+      waiting: 'undecided',
+      limit: MAX_HELD,
+      next: `${MAX_HELD} requests of this agent group already wait for a person; ask the user to decide them with kurumi approval list`,
+    })
+    expect(requested).toHaveLength(MAX_HELD)
+
+    await gate.decided({ id: approvalId(0) }, 'deny')
+
+    expect((await sendMessage(tunnel, prompt('room again'))).status).toBe(403)
+    expect(requested).toHaveLength(MAX_HELD + 1)
+  })
+
+  test('requests past the in-flight cap of the host read 429 approval_limit at once', async () => {
+    const { gate, tunnel, openTunnel, requested } = await setupHeld()
+    const tunnels = await Promise.all(Array.from({ length: MAX_HELD }, openTunnel))
+    const waiting = tunnels.map((each, index) => sendMessage(each, prompt(`in flight ${index}`)))
+    await until(() => requested.length === MAX_HELD)
+
+    const over = await sendMessage(tunnel, prompt('one too many'))
+
+    expect(over.status).toBe(429)
+    expect(JSON.parse(over.body)).toMatchObject({ waiting: 'in_flight', limit: MAX_HELD })
+    expect(requested).toHaveLength(MAX_HELD)
+    for (const { approvalId } of requested) await gate.decided({ id: approvalId }, 'deny')
+    expect((await Promise.all(waiting)).map(({ status }) => status)).toEqual(
+      Array.from({ length: MAX_HELD }, () => 403),
+    )
+  })
+
+  test('a port stop during a hold returns promptly and records the exchange as pending with no status', async () => {
+    const { port, tunnel, requested, approvalId, events, allowance } = await setupHeld()
+    const response = sendMessage(tunnel).then(
+      () => 'answered',
+      () => 'connection closed',
+    )
+    await until(() => requested.length === 1)
+    const started = performance.now()
+
+    await port.stop()
+
+    expect(performance.now() - started).toBeLessThan(1_000)
+    expect(await response).toBe('connection closed')
+    expect(decisions(events)).toEqual([
+      ['held', null, null],
+      ['refused', 'approval_pending', null],
+    ])
+    expect(allowance(approvalId(0))).toMatchObject({ state: 'pending' })
+  })
+
+  test('a WebSocket upgrade an approve rule covers waits and is refused when denied', async () => {
+    const { gate, tunnel, requested, approvalId } = await setupHeld()
+    gate.rules.add({
+      account: 'anthropic/main',
+      path: '/v1/stream',
+      priority: 0,
+      effect: 'approve',
+    })
+    const exchanged = exchangeRaw(
+      tunnel.socket,
+      `GET /v1/stream HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\n\r\n`,
+    )
+    await until(() => requested.length === 1)
+
+    await gate.decided({ id: approvalId(0) }, 'deny')
+
+    const response = await exchanged
+    expect(response.status).toBe(403)
+    expect(JSON.parse(response.body)).toMatchObject({
+      error: 'approval_denied',
+      approvalId: approvalId(0),
+    })
+  })
 })

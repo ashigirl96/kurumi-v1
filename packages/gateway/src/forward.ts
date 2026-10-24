@@ -3,7 +3,7 @@ import { lookup } from 'node:dns/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request, type RequestOptions } from 'node:https'
 import { isIP, type LookupFunction } from 'node:net'
-import { PassThrough, pipeline, type Duplex } from 'node:stream'
+import { PassThrough, pipeline, type Duplex, type Readable } from 'node:stream'
 
 import {
   headerNameAsRead,
@@ -14,7 +14,13 @@ import {
 } from '@kurumi/account/server'
 
 import { addressRefusal, hostAddresses } from './address.ts'
-import { REFUSAL_STATUS, refusalHttp, refusalResponse, type GatewayRefusal } from './refusal.ts'
+import {
+  REFUSAL_STATUS,
+  refusalHttp,
+  refusalResponse,
+  type GatewayRefusal,
+  type HoldRefusal,
+} from './refusal.ts'
 
 export type ConnectTarget = { host: string; port: number }
 
@@ -38,6 +44,7 @@ export type EgressDecision =
   | { decision: 'injected'; account: AccountHandle; service: ServiceId }
   | { decision: 'passed' }
   | { decision: 'refused'; refusal: GatewayRefusal['code']; service: ServiceId | null }
+  | { decision: 'held'; service: ServiceId }
 
 export type EgressEvent<Principal> = EgressDecision & {
   principal: Principal
@@ -56,8 +63,36 @@ export type UpstreamDestination = {
   caPem: string
 }
 
+export type ScreenInput<Principal> = {
+  principal: Principal
+  account: { handle: AccountHandle; service: ServiceId }
+  host: string
+  method: string
+  methodOverrides: readonly string[]
+  /** As sent, query included. */
+  path: string
+  /** null for a WebSocket upgrade, which carries no body. */
+  body: Readable | null
+  declaredLength: number | null
+  /** Aborts when the tunnel closes or the client hangs up. */
+  signal: AbortSignal
+  /** Called once per wait, when the request starts waiting on a person. */
+  held(): void
+}
+
+export type Screened =
+  | { kind: 'forward'; body: Buffer }
+  | { kind: 'refuse'; refusal: HoldRefusal }
+  | { kind: 'abandoned' }
+
+export type EgressGate<Principal> = {
+  /** null, synchronously, unless an approve rule matches. Otherwise settles once. */
+  screen(input: ScreenInput<Principal>): Promise<Screened> | null
+}
+
 export type ForwardDeps<Principal> = {
   inject(input: InjectionInput<Principal>): Injected | Promise<Injected>
+  gate?: EgressGate<Principal>
   upstream?: UpstreamDestination
   resolve?: (host: string) => Promise<LookupAddress[]>
   addressRefusal?: (address: string, host: readonly string[]) => string | null
@@ -184,10 +219,19 @@ type Prepared =
       options: Omit<RequestOptions, 'headers'> & { headers: Record<string, string> }
       account?: AccountHandle
       decision: EgressDecision
+      /** The body a person approved, read in full; absent when the request body streams. */
+      body?: Buffer
     }
   | { kind: 'bad_request' }
   | { kind: 'refused'; refusal: GatewayRefusal; decision: EgressDecision }
   | { kind: 'unreachable'; decision: EgressDecision }
+  | { kind: 'abandoned' }
+
+type Exchange = {
+  body: Readable | null
+  closes: NodeJS.EventEmitter & { readonly destroyed: boolean }
+  held(service: ServiceId): void
+}
 
 function refusedDecision(refusal: GatewayRefusal): EgressDecision {
   return {
@@ -228,10 +272,66 @@ function egressRecorder<Principal>(
     })
 }
 
+const methodOverrideHeaders = ['x-http-method-override', 'x-http-method', 'x-method-override']
+
+function methodOverridesOf(rawHeaders: readonly string[]): string[] {
+  return rawHeaders.flatMap((name, index) => {
+    const value = rawHeaders[index + 1]
+    return index % 2 === 0 &&
+      value !== undefined &&
+      methodOverrideHeaders.includes(headerNameAsRead(name))
+      ? [value]
+      : []
+  })
+}
+
+function declaredLengthOf(req: IncomingMessage): number | null {
+  const declared = req.headers['content-length']
+  return declared !== undefined && /^\d+$/.test(declared) ? Number(declared) : null
+}
+
+/** Drops its listeners once screening settles, so a keep-alive tunnel does not gather one per request. */
+function screening<Principal>(
+  context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
+  req: IncomingMessage,
+  gate: EgressGate<Principal> | undefined,
+  account: Forwarded['account'],
+  exchange: Exchange,
+): Promise<Screened> | null {
+  if (!gate || !account) return null
+  const ended = new AbortController()
+  const end = () => ended.abort()
+  context.signal.addEventListener('abort', end, { once: true })
+  exchange.closes.once('close', end)
+  if (context.signal.aborted || exchange.closes.destroyed) end()
+  const release = () => {
+    context.signal.removeEventListener('abort', end)
+    exchange.closes.off('close', end)
+  }
+  const screened = gate.screen({
+    principal: context.principal,
+    account,
+    host: context.target.host,
+    method: req.method ?? 'GET',
+    methodOverrides: methodOverridesOf(req.rawHeaders),
+    path: req.url ?? '/',
+    body: exchange.body,
+    declaredLength: declaredLengthOf(req),
+    signal: ended.signal,
+    held: () => exchange.held(account.service),
+  })
+  if (!screened) {
+    release()
+    return null
+  }
+  return screened.finally(release)
+}
+
 async function prepareRequest<Principal>(
   context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
   req: IncomingMessage,
   deps: ForwardDeps<Principal>,
+  exchange: Exchange,
 ): Promise<Prepared> {
   const { target } = context
   const path = req.url ?? '/'
@@ -259,6 +359,17 @@ async function prepareRequest<Principal>(
       decision: refusedDecision(injected.refusal),
     }
   }
+  const held = screening(context, req, deps.gate, injected.account, exchange)
+  const screened = held && (await held)
+  if (screened?.kind === 'refuse') {
+    return {
+      kind: 'refused',
+      refusal: screened.refusal,
+      decision: refusedDecision(screened.refusal),
+    }
+  }
+  if (screened?.kind === 'abandoned') return screened
+  const body = screened?.kind === 'forward' && exchange.body ? screened.body : undefined
   const decision = forwardedDecision(injected)
   const destination = deps.upstream?.host === target.host ? deps.upstream : undefined
   const pinned = destination ? undefined : await pinPublicUpstream(target.host, deps)
@@ -269,7 +380,10 @@ async function prepareRequest<Principal>(
   const headers = withoutHopHeaders(injected.headers)
   headers.set('host', authority(target))
   headers.delete('content-length')
-  if (req.headers['transfer-encoding'] !== undefined) {
+  if (body) {
+    headers.delete('expect')
+    headers.set('content-length', String(body.length))
+  } else if (req.headers['transfer-encoding'] !== undefined) {
     headers.set('transfer-encoding', req.headers['transfer-encoding'])
   } else if (req.headers['content-length'] !== undefined) {
     headers.set('content-length', req.headers['content-length'])
@@ -289,6 +403,7 @@ async function prepareRequest<Principal>(
     },
     account: injected.account?.handle,
     decision,
+    body,
   }
 }
 
@@ -312,8 +427,13 @@ export async function forward<Principal>(
   deps: ForwardDeps<Principal>,
 ): Promise<void> {
   const record = egressRecorder(context, req, deps)
-  const prepared = await prepareRequest(context, req, deps)
+  const prepared = await prepareRequest(context, req, deps, {
+    body: req,
+    closes: res,
+    held: (service) => record({ decision: 'held', service }, null),
+  })
   const gone = context.signal.aborted || res.destroyed
+  if (prepared.kind === 'abandoned') return
   if (prepared.kind === 'bad_request') {
     if (!gone) res.writeHead(400, { connection: 'close' }).end()
     return
@@ -334,12 +454,12 @@ export async function forward<Principal>(
     return
   }
   const { options, account } = prepared
-  const body = new PassThrough()
+  const body = prepared.body ? undefined : new PassThrough()
   const upstream = request(options)
 
   const cancel = () => {
     upstream.destroy()
-    body.destroy()
+    body?.destroy()
   }
   const responseClosed = () => {
     if (!res.writableFinished) cancel()
@@ -353,8 +473,10 @@ export async function forward<Principal>(
     req.off('aborted', cancel)
     req.off('error', cancel)
     res.off('close', responseClosed)
-    req.unpipe(body)
-    body.destroy()
+    if (body) {
+      req.unpipe(body)
+      body.destroy()
+    }
   })
   upstream.once('error', () => {
     if (res.destroyed) return
@@ -377,6 +499,10 @@ export async function forward<Principal>(
       if (error) cancel()
     })
   })
+  if (!body) {
+    upstream.end(prepared.body)
+    return
+  }
   req.pipe(body)
   pipeline(body, upstream, (error) => {
     if (error) body.destroy()
@@ -400,8 +526,13 @@ export async function forwardUpgrade<Principal>(
     return
   }
   const record = egressRecorder(context, req, deps)
-  const prepared = await prepareRequest(context, req, deps)
+  const prepared = await prepareRequest(context, req, deps, {
+    body: null,
+    closes: client,
+    held: (service) => record({ decision: 'held', service }, null),
+  })
   const gone = context.signal.aborted || client.destroyed
+  if (prepared.kind === 'abandoned') return
   if (prepared.kind === 'bad_request') {
     if (!gone) {
       client.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')

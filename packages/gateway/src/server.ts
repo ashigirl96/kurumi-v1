@@ -24,16 +24,29 @@ export { migrations } from '../migrations/index.ts'
 export { startAdmission } from './admission.ts'
 export { createEgressLog, type EgressLog, type EgressPrincipal } from './egress-log.ts'
 export { credentialInject } from './forward.ts'
+export {
+  ALLOWANCE_MS,
+  createEgressApproval,
+  HOLD_MS,
+  MAX_HELD,
+  MAX_HELD_BODY_BYTES,
+  type EgressApproval,
+  type GatewayApprovals,
+  type SessionNotice,
+} from './hold.ts'
 export type {
   EgressDecision,
   EgressEvent,
+  EgressGate,
   ForwardDeps,
   Forwarded,
   InjectionInput,
+  ScreenInput,
+  Screened,
   UpstreamDestination,
 } from './forward.ts'
 export { startAgentPort, type AgentPort } from './port.ts'
-export { REFUSAL_STATUS, type GatewayRefusal } from './refusal.ts'
+export { REFUSAL_STATUS, type GatewayRefusal, type HoldRefusal } from './refusal.ts'
 export { createRuleStore, type RuleStore } from './rules.ts'
 export type { CertificateAuthority } from './ca.ts'
 
