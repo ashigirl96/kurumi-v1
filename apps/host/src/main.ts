@@ -13,11 +13,12 @@ import { join } from 'node:path'
 import {
   createAccountLedger,
   isInterceptedHost,
+  type AccountLedger,
   router as accountRouter,
   storedAccounts,
   VaultError,
 } from '@kurumi/account/server'
-import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
+import { createAgentLedger, router as agentRouter, type AgentLedger } from '@kurumi/agent/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import {
   credentialInject,
@@ -53,6 +54,27 @@ export const initialGuard: Guard = ({ caller, meta }) =>
   caller.kind !== 'agent' || meta.agent === 'channel'
     ? { kind: 'allow' }
     : { kind: 'deny', reason: 'This procedure is not available to agents' }
+
+/** A container keeps the env it was created with, so the env names each group's grants choose belong in its revision. */
+export function withAccountEnv(
+  revision: string,
+  {
+    agentLedger,
+    accountLedger,
+  }: {
+    agentLedger: Pick<AgentLedger, 'list'>
+    accountLedger: Pick<AccountLedger, 'containerEnv'>
+  },
+): string {
+  const names = agentLedger
+    .list()
+    .map(({ id }) => [id, Object.keys(accountLedger.containerEnv(id)).toSorted()])
+  return createHash('sha256')
+    .update(revision)
+    .update(JSON.stringify(names))
+    .digest('hex')
+    .slice(0, 16)
+}
 
 export async function startHost(config: HostConfig) {
   process.stdout.write(
@@ -147,23 +169,26 @@ export async function startHost(config: HostConfig) {
       ...egress,
       env: { ...egress.env, ...proxyEnv({ port: config.agentPort.port, sessionToken }) },
     })
-    const docker = createDockerDriver({
-      install,
-      revision: containerRevision({
-        image: environment.KURUMI_AGENT_IMAGE,
-        contribution,
-        runner: existsSync(runner) ? readFileSync(runner) : new Uint8Array(),
-      }),
-      image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
-      network: environment.KURUMI_DOCKER_NETWORK,
-    })
-    driver = docker
     const accountLedger = createAccountLedger({ db, vaultKey })
     const agentLedger = createAgentLedger({
       db,
       home: config.home,
       onCreate: (tx, agentGroupId) => accountLedger.grantAutoGrants(tx, agentGroupId),
     })
+    const docker = createDockerDriver({
+      install,
+      revision: withAccountEnv(
+        containerRevision({
+          image: environment.KURUMI_AGENT_IMAGE,
+          contribution,
+          runner: existsSync(runner) ? readFileSync(runner) : new Uint8Array(),
+        }),
+        { agentLedger, accountLedger },
+      ),
+      image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
+      network: environment.KURUMI_DOCKER_NETWORK,
+    })
+    driver = docker
     const chatLedger = createChatLedger({
       db,
       agentLedger,

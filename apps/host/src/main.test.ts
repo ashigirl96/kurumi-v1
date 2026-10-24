@@ -5,12 +5,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { seal } from '@kurumi/account/server'
+import { createAccountLedger, seal, type AuthMode } from '@kurumi/account/server'
 import { createAgentLedger } from '@kurumi/agent/server'
 
 import { openKurumiDb, migrateAll } from './db.ts'
 import { queryReadOnly } from './fronts.ts'
-import { initialGuard } from './main.ts'
+import { initialGuard, withAccountEnv } from './main.ts'
 import { migrations } from './migrations.ts'
 
 const homes: string[] = []
@@ -336,6 +336,46 @@ test('with accounts stored, a gateway CA the vault.key cannot open stops the hos
   expect(storedCa(home)).not.toBe(before)
   expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(true)
 }, 5000)
+
+test('the container revision changes when a group moves from an api-key to an oauth-token account', () => {
+  const home = homeForTest()
+  const db = openKurumiDb(join(home, 'kurumi.db'))
+  try {
+    migrateAll(db, migrations)
+    const accountLedger = createAccountLedger({ db, vaultKey: randomBytes(32) })
+    const agentLedger = createAgentLedger({
+      db,
+      home,
+      onCreate: (tx, agentGroupId) => accountLedger.grantAutoGrants(tx, agentGroupId),
+    })
+    agentLedger.create({ name: 'work' })
+    const revision = () => withAccountEnv('base', { agentLedger, accountLedger })
+    const addKey = (label: string, authMode: AuthMode) =>
+      db.transaction((tx) =>
+        accountLedger.addKey(tx, {
+          vendor: 'anthropic',
+          label,
+          authMode,
+          value: 'test-key',
+          autoGrant: true,
+        }),
+      )
+
+    addKey('main', 'api-key')
+    const apiKey = revision()
+    addKey('second', 'api-key')
+    expect(revision()).toBe(apiKey)
+
+    db.transaction((tx) => {
+      accountLedger.remove(tx, 'anthropic/main')
+      accountLedger.remove(tx, 'anthropic/second')
+    })
+    addKey('subscription', 'oauth-token')
+    expect(revision()).not.toBe(apiKey)
+  } finally {
+    db.$client.close()
+  }
+})
 
 test('diagnostic SQL reads a WAL snapshot without writing rows or changing the host connection', () => {
   const home = homeForTest()
