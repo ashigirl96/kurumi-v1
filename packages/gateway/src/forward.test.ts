@@ -375,6 +375,12 @@ test.each([
     { x_api_key: groupSelector },
     ['authorization', `Bearer ${secrets.main}`],
   ],
+  [
+    'x-api-key',
+    'oauth-token',
+    { 'x-api-key': 'sk-ant-api03-client-own' },
+    ['authorization', `Bearer ${secrets.main}`],
+  ],
 ] as const)(
   'the container own %s never reaches the upstream beside an %s account',
   async (_header, authMode, headers, injected) => {
