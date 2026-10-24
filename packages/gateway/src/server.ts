@@ -17,8 +17,10 @@ import { gatewayCa } from './schema.ts'
 
 export { migrations } from '../migrations/index.ts'
 export { startAdmission } from './admission.ts'
-export type { ForwardDeps, Injection, InjectionInput, UpstreamDestination } from './forward.ts'
+export { credentialInject } from './forward.ts'
+export type { ForwardDeps, Forwarded, InjectionInput, UpstreamDestination } from './forward.ts'
 export { startAgentPort, type AgentPort } from './port.ts'
+export { REFUSAL_STATUS, type GatewayRefusal } from './refusal.ts'
 export type { CertificateAuthority } from './ca.ts'
 
 const CA_ROW = 1

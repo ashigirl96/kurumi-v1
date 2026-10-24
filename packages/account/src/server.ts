@@ -3,11 +3,18 @@ import type { Caller } from '@kurumi/rpc/contract'
 import { transaction, type Db, type KurumiContext, type Tx } from '@kurumi/rpc/server'
 import { implement, ORPCError } from '@orpc/server'
 import { and, eq, sql } from 'drizzle-orm'
+import { z } from 'zod'
 
 import {
   authModesOf,
   defaultAuthModeOf,
+  placementOf,
+  selectorShapeOf,
+  serviceFor,
+  serviceIds,
   servicesOf,
+  serviceSpec,
+  vendorOf,
   type AuthMode,
   type KeyVendorId,
   type ServiceId,
@@ -17,9 +24,14 @@ import { contract } from './contract.ts'
 import { account, accountGrant, defaultAccount } from './schema.ts'
 import {
   accountHandle,
+  groupSelector,
   parseAccountHandle,
+  readSelector,
+  selectAccount,
+  unnamedIfGroupSelector,
   type AccountHandle,
   type GrantedCandidate,
+  type SelectionRefusal,
 } from './select.ts'
 import { open, seal, VaultError } from './vault.ts'
 
@@ -46,7 +58,9 @@ export type GrantResult = { ok: true } | { ok: false; refusal: GrantRefusal }
 
 export type SetDefaultResult = { ok: true } | { ok: false; refusal: 'grant_not_found' }
 
-export type AccountMaterial = { kind: 'key'; key: string }
+const accountMaterial = z.object({ kind: z.literal('key'), key: z.string() })
+
+export type AccountMaterial = z.infer<typeof accountMaterial>
 
 export type AddKeyInput = {
   vendor: KeyVendorId
@@ -76,6 +90,35 @@ export type AccountView = {
   autoGrant: boolean
 }
 
+export type EgressRequest = {
+  host: string
+  method: string
+  path: string
+  headers: Headers
+  rawHeaders: readonly string[]
+}
+
+export type CredentialRefusal =
+  | SelectionRefusal
+  | { code: 'duplicate_slot'; service: ServiceId; header: string }
+  | { code: 'method_not_allowed'; service: ServiceId; method: string; allowed: readonly string[] }
+
+export type Injection = {
+  readonly service: ServiceId
+  readonly handle: AccountHandle
+  readonly accountId: string
+  /** Rewrites the request this decision was made for: every slot header of the service removed, the account's one slot set. */
+  apply(): { path: string; headers: Headers }
+  toJSON(): never
+}
+
+export type CredentialDecision =
+  | { kind: 'inject'; injection: Injection }
+  | { kind: 'refuse'; refusal: CredentialRefusal }
+  | { kind: 'pass' }
+
+export type CredentialPrincipal = { agentGroupId: string }
+
 export type AccountLedger = {
   addKey(tx: Tx, input: AddKeyInput): AddKeyResult
   remove(tx: Tx, handle: string): RemoveResult
@@ -87,6 +130,150 @@ export type AccountLedger = {
   setDefault(tx: Tx, input: GrantKey): SetDefaultResult
   clearDefault(tx: Tx, input: { agentGroupId: string; service: ServiceId }): void
   candidates(agentGroupId: string, service: ServiceId): GrantedCandidate[]
+  credentialFor(principal: CredentialPrincipal, request: EgressRequest): CredentialDecision
+  containerEnv(agentGroupId: string): Record<string, string>
+}
+
+type GrantRow = GrantedCandidate & Pick<typeof account.$inferSelect, 'authMode' | 'material'>
+
+function slotHeadersOf(service: ServiceId): string[] {
+  const slots = [
+    serviceSpec(service).slot,
+    ...authModesOf(vendorOf(service)).map((mode) => placementOf(service, mode).slot),
+  ]
+  const named = slots.flatMap((slot) => (slot.kind === 'header' ? [slot.header.toLowerCase()] : []))
+  return [...new Set(['authorization', ...named])]
+}
+
+/** Some servers read `_` as `-` in a header name, so `x_api_key` is the `x-api-key` slot. */
+export const headerNameAsRead = (name: string): string => name.toLowerCase().replaceAll('_', '-')
+
+function withSlotNames(headers: Headers, slotHeaders: readonly string[]): Headers {
+  return new Headers(
+    [...headers].map(([name, value]) => {
+      const read = headerNameAsRead(name)
+      return [slotHeaders.includes(read) ? read : name, value]
+    }),
+  )
+}
+
+function duplicatedHeader(
+  headers: readonly string[],
+  rawHeaders: readonly string[],
+): string | undefined {
+  const lines = new Map<string, number>()
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    const name = rawHeaders[index]
+    if (name === undefined) continue
+    const read = headerNameAsRead(name)
+    lines.set(read, (lines.get(read) ?? 0) + 1)
+  }
+  return headers.find((header) => (lines.get(header) ?? 0) > 1)
+}
+
+/** TRACE and its kin echo the request back, credential included. */
+const credentialedMethods: readonly string[] = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']
+
+type ModeBeta = { header: string; token: string; mode: AuthMode }
+
+/** Anthropic answers an OAuth bearer only when the request lists this beta. */
+const modeBetaOf: Partial<Record<ServiceId, ModeBeta>> = {
+  'anthropic-api': { header: 'anthropic-beta', token: 'oauth-2025-04-20', mode: 'oauth-token' },
+}
+
+function setBetaForAccountMode(
+  headers: Headers,
+  { header, token, mode }: ModeBeta,
+  authMode: AuthMode | null,
+) {
+  const names = [...headers.keys()].filter((name) => headerNameAsRead(name) === header)
+  const betas = new Set(
+    names
+      .flatMap((name) => (headers.get(name) ?? '').split(','))
+      .map((beta) => beta.trim())
+      .filter((beta) => beta !== '')
+      .map((beta) => (beta.toLowerCase() === token ? token : beta)),
+  )
+  for (const name of names) headers.delete(name)
+  if (authMode === mode) betas.add(token)
+  else betas.delete(token)
+  if (betas.size > 0) headers.set(header, [...betas].join(','))
+}
+
+function keyOf(vaultKey: Uint8Array, row: GrantRow): string | null {
+  let plaintext: unknown
+  try {
+    plaintext = JSON.parse(open(vaultKey, row.accountId, row.material))
+  } catch (error) {
+    if (error instanceof VaultError || error instanceof SyntaxError) return null
+    throw error
+  }
+  const material = accountMaterial.safeParse(plaintext)
+  return material.success ? material.data.key : null
+}
+
+const pathWithoutQuery = (path: string): string => {
+  const end = path.search(/[?#]/)
+  return end === -1 ? path : path.slice(0, end)
+}
+
+function injectionFor({
+  service,
+  slotHeaders,
+  row,
+  secret,
+  stripped,
+  requested,
+}: {
+  service: ServiceId
+  slotHeaders: readonly string[]
+  row: GrantRow
+  secret: string
+  stripped: { headers: Headers; url: URL }
+  requested: { path: string; url: URL }
+}): Injection {
+  const { slot } = placementOf(service, row.authMode)
+  const modeBeta = modeBetaOf[service]
+  return Object.freeze({
+    service,
+    handle: row.handle,
+    accountId: row.accountId,
+    apply() {
+      const headers = new Headers(stripped.headers)
+      const url = new URL(stripped.url)
+      for (const header of slotHeaders) headers.delete(header)
+      if (modeBeta) setBetaForAccountMode(headers, modeBeta, row.authMode)
+      switch (slot.kind) {
+        case 'bearer':
+          headers.set('authorization', `Bearer ${secret}`)
+          break
+        case 'header':
+          headers.set(slot.header, secret)
+          break
+        case 'basic':
+          headers.set(
+            'authorization',
+            `Basic ${Buffer.from(`x-access-token:${secret}`).toString('base64')}`,
+          )
+          break
+        case 'query':
+          url.searchParams.set(slot.param, secret)
+          break
+        default: {
+          const unknown: never = slot
+          return unknown
+        }
+      }
+      const path =
+        url.search === requested.url.search
+          ? requested.path
+          : `${pathWithoutQuery(requested.path)}${url.search}`
+      return { path, headers }
+    },
+    toJSON(): never {
+      throw new Error('an Injection holds a credential and cannot be serialized')
+    },
+  })
 }
 
 const AUTO_GRANT = 'auto-grant'
@@ -151,13 +338,32 @@ function opens(vaultKey: Uint8Array, accountId: string, material: Uint8Array): b
   }
 }
 
+const containerEnvServices = serviceIds.filter((service) =>
+  authModesOf(vendorOf(service)).some(
+    (mode) => placementOf(service, mode).containerEnv !== undefined,
+  ),
+)
+
+function unnamedRequestAuthMode(service: ServiceId, rows: readonly GrantRow[]): AuthMode | null {
+  const selection = selectAccount(service, rows, { kind: 'none' })
+  const chosen = selection.ok
+    ? rows.find((row) => row.accountId === selection.accountId)
+    : undefined
+  if (chosen) return chosen.authMode
+  const [first, ...others] = rows
+  if (first && others.every((row) => row.authMode === first.authMode)) return first.authMode
+  return defaultAuthModeOf(vendorOf(service))
+}
+
 export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): AccountLedger {
-  const candidatesQuery = deps.db
+  const grantRowsQuery = deps.db
     .select({
       accountId: account.id,
       vendor: account.vendor,
       label: account.label,
       status: account.status,
+      authMode: account.authMode,
+      material: account.material,
       defaultAccountId: defaultAccount.accountId,
     })
     .from(accountGrant)
@@ -181,6 +387,16 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
     )
     .orderBy(account.label)
     .prepare()
+
+  const grantRows = (agentGroupId: string, service: ServiceId): GrantRow[] =>
+    grantRowsQuery.all({ agentGroupId, service }).map((row) => ({
+      accountId: row.accountId,
+      handle: accountHandle(row.vendor, row.label),
+      isDefault: row.defaultAccountId !== null,
+      status: row.status,
+      authMode: row.authMode,
+      material: row.material,
+    }))
 
   return {
     addKey(tx, { vendor, label, authMode, value, autoGrant }) {
@@ -306,12 +522,74 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
     },
 
     candidates(agentGroupId, service) {
-      return candidatesQuery.all({ agentGroupId, service }).map((row) => ({
-        accountId: row.accountId,
-        handle: accountHandle(row.vendor, row.label),
-        isDefault: row.defaultAccountId !== null,
-        status: row.status,
+      return grantRows(agentGroupId, service).map(({ accountId, handle, isDefault, status }) => ({
+        accountId,
+        handle,
+        isDefault,
+        status,
       }))
+    },
+
+    credentialFor({ agentGroupId }, request) {
+      const located = serviceFor(request.host, request.path)
+      if (!located) return { kind: 'pass' }
+      const { vendor, service } = located
+      if (!credentialedMethods.includes(request.method)) {
+        return {
+          kind: 'refuse',
+          refusal: {
+            code: 'method_not_allowed',
+            service,
+            method: request.method,
+            allowed: credentialedMethods,
+          },
+        }
+      }
+      const slotHeaders = slotHeadersOf(service)
+      const header = duplicatedHeader(slotHeaders, request.rawHeaders)
+      if (header !== undefined) {
+        return { kind: 'refuse', refusal: { code: 'duplicate_slot', service, header } }
+      }
+      // A base URL would read a path such as `/\other.example` as another host.
+      const url = new URL(`https://${request.host}${request.path}`)
+      const { selector, stripped } = readSelector(
+        selectorShapeOf(vendor),
+        serviceSpec(service).slot,
+        { headers: withSlotNames(request.headers, slotHeaders), url },
+      )
+      const rows = grantRows(agentGroupId, service)
+      const selection = selectAccount(service, rows, unnamedIfGroupSelector(vendor, selector))
+      if (!selection.ok) return { kind: 'refuse', refusal: selection.refusal }
+      const row = rows.find(({ accountId }) => accountId === selection.accountId)
+      if (!row) throw new Error(`${selection.handle} was chosen from outside the grant rows`)
+      const secret = keyOf(deps.vaultKey, row)
+      if (secret === null) {
+        return {
+          kind: 'refuse',
+          refusal: { code: 'account_needs_reauth', service, handle: row.handle },
+        }
+      }
+      return {
+        kind: 'inject',
+        injection: injectionFor({
+          service,
+          slotHeaders,
+          row,
+          secret,
+          stripped,
+          requested: { path: request.path, url },
+        }),
+      }
+    },
+
+    containerEnv(agentGroupId) {
+      return Object.fromEntries(
+        containerEnvServices.flatMap((service) => {
+          const mode = unnamedRequestAuthMode(service, grantRows(agentGroupId, service))
+          const env = placementOf(service, mode).containerEnv?.(groupSelector(vendorOf(service)))
+          return Object.entries(env ?? {})
+        }),
+      )
     },
   }
 }

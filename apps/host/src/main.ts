@@ -20,6 +20,7 @@ import {
 import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import {
+  credentialInject,
   gatewayContribution,
   loadCertificateAuthority,
   proxyEnv,
@@ -142,7 +143,7 @@ export async function startHost(config: HostConfig) {
       ],
       network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
     }
-    const contribution = ({ sessionToken }: { sessionToken: string }): ContainerEgress => ({
+    const revisionedEgress = ({ sessionToken }: { sessionToken: string }): ContainerEgress => ({
       ...egress,
       env: { ...egress.env, ...proxyEnv({ port: config.agentPort.port, sessionToken }) },
     })
@@ -150,7 +151,7 @@ export async function startHost(config: HostConfig) {
       install,
       revision: containerRevision({
         image: environment.KURUMI_AGENT_IMAGE,
-        contribution,
+        contribution: revisionedEgress,
         runner: existsSync(runner) ? readFileSync(runner) : new Uint8Array(),
       }),
       image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
@@ -189,7 +190,13 @@ export async function startHost(config: HostConfig) {
               since: new Date(),
             }
           },
-          contribution,
+          contribution: ({ agentGroupId, sessionToken }) => {
+            const container = revisionedEgress({ sessionToken })
+            return {
+              ...container,
+              env: { ...accountLedger.containerEnv(agentGroupId), ...container.env },
+            }
+          },
         },
         supervision: { staleAfterMs, intervalMs },
       },
@@ -236,13 +243,13 @@ export async function startHost(config: HostConfig) {
     admission = startAdmission({
       bind: async (probeNonce) => {
         await sessionLedger.adopted()
-        return startAgentPort({
+        return startAgentPort<AgentPrincipal>({
           bind: config.agentPort,
           probeNonce,
           authenticate: (token) => sessionLedger.authenticate(token),
           ca,
           intercepts: isInterceptedHost,
-          forward: { inject: ({ path, headers }) => ({ path, headers }) },
+          forward: { inject: credentialInject(accountLedger) },
           async rpc(request, response, principal, signal) {
             const result = await agentHandler.handle(request, response, {
               prefix: '/rpc',

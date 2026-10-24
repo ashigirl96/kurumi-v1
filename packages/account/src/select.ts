@@ -1,5 +1,8 @@
 import {
   catalog,
+  defaultSelectorShape,
+  selectorShapeOf,
+  vendorOf,
   type CredentialSlot,
   type SelectorShape,
   type ServiceId,
@@ -47,6 +50,7 @@ export type SelectionRefusal =
   | { code: 'account_ambiguous'; service: ServiceId; granted: AccountHandle[] }
   | { code: 'account_not_granted'; service: ServiceId; named: string; granted: AccountHandle[] }
   | { code: 'account_needs_reauth'; service: ServiceId; handle: AccountHandle }
+  | { code: 'selector_unreadable'; service: ServiceId; written: string; accepted: string[] }
 
 function use(
   service: ServiceId,
@@ -60,6 +64,12 @@ function use(
     }
   }
   return { ok: true, accountId: candidate.accountId, handle: candidate.handle, how }
+}
+
+function selectorsFor(service: ServiceId, handle: AccountHandle): string[] {
+  const shape = selectorShapeOf(vendorOf(service))
+  const forms = new Set([shape.format(handle), defaultSelectorShape.format(handle)])
+  return [...forms].filter((form) => shape.parse(form) === handle)
 }
 
 /**
@@ -77,7 +87,13 @@ export function selectAccount(
     refusal: { code: 'account_not_granted', service, named, granted: granted() },
   })
 
-  if (selector.kind === 'unreadable') return notGranted(selector.written)
+  if (selector.kind === 'unreadable') {
+    const accepted = candidates.flatMap(({ handle }) => selectorsFor(service, handle))
+    return {
+      ok: false,
+      refusal: { code: 'selector_unreadable', service, written: selector.written, accepted },
+    }
+  }
 
   if (selector.kind === 'handle') {
     const match = candidates.find(({ handle }) => handle === selector.handle)
@@ -92,6 +108,14 @@ export function selectAccount(
   const [preferred] = defaults
   if (preferred && defaults.length === 1) return use(service, preferred, 'default')
   return { ok: false, refusal: { code: 'account_ambiguous', service, granted: granted() } }
+}
+
+export function groupSelector(vendor: VendorId): string {
+  return selectorShapeOf(vendor).format(vendor)
+}
+
+export function unnamedIfGroupSelector(vendor: VendorId, selector: Selector): Selector {
+  return selector.kind === 'handle' && selector.handle === vendor ? { kind: 'none' } : selector
 }
 
 const decodedOnce = (text: string): string | null => {
@@ -151,15 +175,15 @@ type Written = { mentions: boolean; written: string; credential: string | null }
 
 function writtenInAuthorization(header: string): Written {
   const match = /^(\w+)\s+/.exec(header)
-  const credential = match === null ? '' : header.slice(match[0].length)
+  const credential = match === null ? header : header.slice(match[0].length)
   switch (match?.[1]?.toLowerCase()) {
     case 'bearer':
     case 'token':
-      return { mentions: mentions(header), written: header, credential }
+      return { mentions: mentions(header), written: credential, credential }
     case 'basic':
       return writtenInBasic(header, credential)
   }
-  return { mentions: mentions(header), written: header, credential: null }
+  return { mentions: mentions(header), written: credential, credential: null }
 }
 
 function writtenInBasic(header: string, credential: string): Written {
@@ -174,7 +198,7 @@ function writtenInBasic(header: string, credential: string): Written {
   return {
     mentions:
       seen !== undefined || pieces.length > 16 || mentions(userAndPassword) || mentions(header),
-    written: seen ?? header,
+    written: seen ?? credential,
     credential:
       oneBlob && colon !== -1 && !mentions(userAndPassword.slice(0, colon))
         ? userAndPassword.slice(colon + 1)
