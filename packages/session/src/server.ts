@@ -150,6 +150,16 @@ function parse<S extends z.ZodType>(schema: S, input: unknown): z.output<S> {
   return result.data
 }
 
+function nextInboundSeq(tx: Tx, id: string): number {
+  return (
+    (tx
+      .select({ seq: sql<number>`coalesce(max(${inboundMessage.seq}), 0)` })
+      .from(inboundMessage)
+      .where(eq(inboundMessage.sessionId, id))
+      .get()?.seq ?? 0) + 1
+  )
+}
+
 export function createSessionLedger({
   db,
   agentLedger,
@@ -649,13 +659,7 @@ export function createSessionLedger({
             message: 'inbound id already has different content or session',
           })
         }
-        const seq =
-          existing?.seq ??
-          (tx
-            .select({ seq: sql<number>`coalesce(max(${inboundMessage.seq}), 0)` })
-            .from(inboundMessage)
-            .where(eq(inboundMessage.sessionId, current.id))
-            .get()?.seq ?? 0) + 1
+        const seq = existing?.seq ?? nextInboundSeq(tx, current.id)
         if (!existing) {
           tx.insert(inboundMessage)
             .values({
@@ -722,18 +726,12 @@ export function createSessionLedger({
           .where(eq(inboundMessage.id, noticeId))
           .get()
         if (existing) return 'duplicate'
-        const seq =
-          (tx
-            .select({ seq: sql<number>`coalesce(max(${inboundMessage.seq}), 0)` })
-            .from(inboundMessage)
-            .where(eq(inboundMessage.sessionId, id))
-            .get()?.seq ?? 0) + 1
         const now = new Date()
         tx.insert(inboundMessage)
           .values({
             id: noticeId,
             sessionId: id,
-            seq,
+            seq: nextInboundSeq(tx, id),
             kind: 'system',
             trigger: true,
             status: 'pending',
