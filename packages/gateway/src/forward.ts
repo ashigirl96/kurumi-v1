@@ -10,10 +10,12 @@ import {
   type AccountHandle,
   type AccountLedger,
   type CredentialPrincipal,
+  type EgressRequest,
+  type ServiceId,
 } from '@kurumi/account/server'
 
 import { addressRefusal, hostAddresses } from './address.ts'
-import { refusalHttp, refusalResponse, type GatewayRefusal } from './refusal.ts'
+import { REFUSAL_STATUS, refusalHttp, refusalResponse, type GatewayRefusal } from './refusal.ts'
 
 export type ConnectTarget = { host: string; port: number }
 
@@ -25,9 +27,28 @@ export type InjectionInput<Principal> = ConnectTarget & {
   rawHeaders: readonly string[]
 }
 
-export type Forwarded = { path: string; headers: Headers; account?: AccountHandle }
+export type Forwarded = {
+  path: string
+  headers: Headers
+  account?: { handle: AccountHandle; service: ServiceId }
+}
 
 type Injected = Forwarded | { refusal: GatewayRefusal }
+
+export type EgressDecision =
+  | { decision: 'injected'; account: AccountHandle; service: ServiceId }
+  | { decision: 'passed' }
+  | { decision: 'refused'; refusal: GatewayRefusal['code']; service: ServiceId | null }
+
+export type EgressEvent<Principal> = EgressDecision & {
+  principal: Principal
+  at: number
+  host: string
+  method: string
+  path: string
+  status: number | null
+  durationMs: number
+}
 
 export type UpstreamDestination = {
   host: string
@@ -42,6 +63,7 @@ export type ForwardDeps<Principal> = {
   resolve?: (host: string) => Promise<LookupAddress[]>
   addressRefusal?: (address: string, host: readonly string[]) => string | null
   hostAddresses?: () => readonly string[]
+  log?(event: EgressEvent<Principal>): void
 }
 
 const resolveAll = (host: string) => lookup(host, { all: true })
@@ -83,15 +105,35 @@ async function pinPublicUpstream(
   return { kind: 'pinned', lookup: pinnedLookup(addresses) }
 }
 
+/** `Injection` names no service, and `credentialFor` names it in the refusal of a method it never credentials, before it selects an account. */
+function injectedService(
+  ledger: Pick<AccountLedger, 'credentialFor'>,
+  principal: CredentialPrincipal,
+  egress: EgressRequest,
+): ServiceId {
+  const probe = ledger.credentialFor(principal, { ...egress, method: 'TRACE' })
+  if (probe.kind === 'refuse' && probe.refusal.code === 'method_not_allowed') {
+    return probe.refusal.service
+  }
+  throw new Error(`credentialFor injected into ${egress.host} but names no service for it`)
+}
+
 export function credentialInject(
   ledger: Pick<AccountLedger, 'credentialFor'>,
 ): ForwardDeps<CredentialPrincipal>['inject'] {
   return ({ principal, host, port, method, path, headers, rawHeaders }) => {
     if (port !== 443) return { refusal: { code: 'port_not_allowed', host, port } }
-    const decision = ledger.credentialFor(principal, { host, method, path, headers, rawHeaders })
+    const egress = { host, method, path, headers, rawHeaders }
+    const decision = ledger.credentialFor(principal, egress)
     switch (decision.kind) {
       case 'inject':
-        return { ...decision.injection.apply(), account: decision.injection.handle }
+        return {
+          ...decision.injection.apply(),
+          account: {
+            handle: decision.injection.handle,
+            service: injectedService(ledger, principal, egress),
+          },
+        }
       case 'refuse':
         return { refusal: decision.refusal }
       case 'pass':
@@ -156,10 +198,51 @@ type Prepared =
       kind: 'forward'
       options: Omit<RequestOptions, 'headers'> & { headers: Record<string, string> }
       account?: AccountHandle
+      decision: EgressDecision
     }
   | { kind: 'bad_request' }
-  | { kind: 'refused'; refusal: GatewayRefusal }
-  | { kind: 'unreachable' }
+  | { kind: 'refused'; refusal: GatewayRefusal; decision: EgressDecision }
+  | { kind: 'unreachable'; decision: EgressDecision }
+
+function refusedDecision(refusal: GatewayRefusal): EgressDecision {
+  return {
+    decision: 'refused',
+    refusal: refusal.code,
+    service: 'service' in refusal ? refusal.service : null,
+  }
+}
+
+function forwardedDecision({ account }: Forwarded): EgressDecision {
+  return account
+    ? { decision: 'injected', account: account.handle, service: account.service }
+    : { decision: 'passed' }
+}
+
+/** The query is cut because a selector, or a key in a query slot, travels there. */
+function loggedPath(path: string): string {
+  const end = path.search(/[?#]/)
+  return end === -1 ? path : path.slice(0, end)
+}
+
+function egressRecorder<Principal>(
+  context: { principal: Principal; target: ConnectTarget },
+  req: IncomingMessage,
+  deps: ForwardDeps<Principal>,
+): (decision: EgressDecision, status: number | null) => void {
+  const at = Date.now()
+  const started = performance.now()
+  return (decision, status) =>
+    deps.log?.({
+      ...decision,
+      principal: context.principal,
+      at,
+      host: context.target.host,
+      method: req.method ?? 'GET',
+      path: loggedPath(req.url ?? '/'),
+      status,
+      durationMs: Math.round(performance.now() - started),
+    })
+}
 
 async function prepareRequest<Principal>(
   context: { principal: Principal; target: ConnectTarget; signal: AbortSignal },
@@ -185,10 +268,20 @@ async function prepareRequest<Principal>(
     headers: withoutHopHeaders(requestHeaders(req)),
     rawHeaders: [...req.rawHeaders],
   })
-  if ('refusal' in injected) return { kind: 'refused', refusal: injected.refusal }
+  if ('refusal' in injected) {
+    return {
+      kind: 'refused',
+      refusal: injected.refusal,
+      decision: refusedDecision(injected.refusal),
+    }
+  }
+  const decision = forwardedDecision(injected)
   const destination = deps.upstream?.host === target.host ? deps.upstream : undefined
   const pinned = destination ? undefined : await pinPublicUpstream(target.host, deps)
-  if (pinned && pinned.kind !== 'pinned') return pinned
+  if (pinned?.kind === 'refused') {
+    return { ...pinned, decision: refusedDecision(pinned.refusal) }
+  }
+  if (pinned?.kind === 'unreachable') return { kind: 'unreachable', decision }
   const headers = withoutHopHeaders(injected.headers)
   headers.set('host', authority(target))
   headers.delete('content-length')
@@ -210,7 +303,8 @@ async function prepareRequest<Principal>(
       headers: Object.fromEntries(headers),
       agent: false,
     },
-    account: injected.account,
+    account: injected.account?.handle,
+    decision,
   }
 }
 
@@ -233,12 +327,19 @@ export async function forward<Principal>(
   res: ServerResponse,
   deps: ForwardDeps<Principal>,
 ): Promise<void> {
+  const record = egressRecorder(context, req, deps)
   const prepared = await prepareRequest(context, req, deps)
-  if (context.signal.aborted || res.destroyed) return
+  const gone = context.signal.aborted || res.destroyed
   if (prepared.kind === 'bad_request') {
-    res.writeHead(400, { connection: 'close' }).end()
+    if (!gone) res.writeHead(400, { connection: 'close' }).end()
     return
   }
+  const { decision } = prepared
+  if (gone) {
+    record(decision, null)
+    return
+  }
+  res.once('close', () => record(decision, res.headersSent ? res.statusCode : null))
   if (prepared.kind === 'refused') {
     const { status, headers, body } = refusalResponse(prepared.refusal)
     respondAfterBodyDrains(req, () => res.writeHead(status, headers).end(body))
@@ -314,17 +415,29 @@ export async function forwardUpgrade<Principal>(
     client.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
     return
   }
+  const record = egressRecorder(context, req, deps)
   const prepared = await prepareRequest(context, req, deps)
-  if (context.signal.aborted || client.destroyed) return
+  const gone = context.signal.aborted || client.destroyed
   if (prepared.kind === 'bad_request') {
-    client.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+    if (!gone) {
+      client.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+    }
     return
   }
+  const { decision } = prepared
+  if (gone) {
+    record(decision, null)
+    return
+  }
+  let status: number | null = null
+  client.once('close', () => record(decision, status))
   if (prepared.kind === 'refused') {
+    status = REFUSAL_STATUS[prepared.refusal.code]
     client.end(refusalHttp(prepared.refusal))
     return
   }
   if (prepared.kind === 'unreachable') {
+    status = 502
     client.end(badGateway)
     return
   }
@@ -349,12 +462,16 @@ export async function forwardUpgrade<Principal>(
   upstream.once('error', () => {
     if (client.destroyed) return
     if (upgraded) client.destroy()
-    else client.end(badGateway)
+    else {
+      status = 502
+      client.end(badGateway)
+    }
   })
   upstream.once('response', (response) => {
     const headers = replaceAccountHeader(withoutHopHeaders(requestHeaders(response)), account)
     headers.set('connection', 'close')
-    client.write(upgradeResponse(response.statusCode ?? 502, headers))
+    status = response.statusCode ?? 502
+    client.write(upgradeResponse(status, headers))
     pipeline(response, client, () => cancel())
   })
   upstream.once('upgrade', (response, socket, upstreamHead) => {
@@ -365,13 +482,15 @@ export async function forwardUpgrade<Principal>(
     }
     if (response.headers.upgrade?.toLowerCase() !== 'websocket') {
       cleanup()
+      status = 502
       client.end(badGateway)
       return
     }
     const headers = replaceAccountHeader(withoutHopHeaders(requestHeaders(response)), account)
     headers.set('connection', 'Upgrade')
     headers.set('upgrade', 'websocket')
-    client.write(upgradeResponse(101, headers))
+    status = 101
+    client.write(upgradeResponse(status, headers))
     if (upstreamHead.length) client.write(upstreamHead)
     if (head.length) socket.write(head)
     const done = () => {

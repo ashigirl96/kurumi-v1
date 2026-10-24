@@ -229,8 +229,11 @@ export async function startAgentPort<Principal extends object>(deps: {
     client.pause()
     const aborted = new AbortController()
     sockets.set(client, () => aborted.abort())
+    const at = Date.now()
+    const started = performance.now()
     const token = password(req)
-    if (token === null || (await deps.authenticate(token)) === null) {
+    const principal = token === null ? null : await deps.authenticate(token)
+    if (token === null || principal === null) {
       rejectConnect(client, 407)
       return
     }
@@ -253,6 +256,18 @@ export async function startAgentPort<Principal extends object>(deps: {
         403,
         `kurumi refuses to tunnel to ${target.host}: it resolves to a ${reason} address\n`,
       )
+      deps.forward.log?.({
+        decision: 'refused',
+        refusal: 'upstream_not_public',
+        service: null,
+        principal,
+        at,
+        host: target.host,
+        method: 'CONNECT',
+        path: req.url ?? '',
+        status: 403,
+        durationMs: Math.round(performance.now() - started),
+      })
       return
     }
     if (stopping || client.destroyed) return

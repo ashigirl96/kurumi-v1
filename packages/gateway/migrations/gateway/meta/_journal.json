@@ -8,6 +8,13 @@
       "when": 1792791221823,
       "tag": "0000_stale_fantastic_four",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1792801934837,
+      "tag": "0001_flashy_morlun",
+      "breakpoints": true
     }
   ]
 }

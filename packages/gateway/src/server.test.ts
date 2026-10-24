@@ -6,17 +6,23 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { rootCertificates } from 'node:tls'
 
-import { VaultError } from '@kurumi/account/server'
+import { accountHandle, VaultError } from '@kurumi/account/server'
 import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 
 import { createCertificateAuthority } from './ca.ts'
 import {
+  createEgressLog,
   gatewayContribution,
+  gatewayStatus,
   loadCertificateAuthority,
   migrations,
   proxyEnv,
   stageCaBundle,
+  type EgressDecision,
+  type EgressEvent,
+  type EgressLog,
+  type EgressPrincipal,
 } from './server.ts'
 
 const dirs: string[] = []
@@ -298,4 +304,170 @@ test('the proxy env carries the session token as the proxy password', () => {
     HTTP_PROXY: proxy,
     http_proxy: proxy,
   })
+})
+
+const injected: EgressDecision = {
+  decision: 'injected',
+  account: accountHandle('anthropic', 'main'),
+  service: 'anthropic-api',
+}
+
+function egressEvent(
+  overrides: Partial<Omit<EgressEvent<EgressPrincipal>, keyof EgressDecision>> = {},
+  decision: EgressDecision = injected,
+): EgressEvent<EgressPrincipal> {
+  return {
+    ...decision,
+    principal: { agentGroupId: 'g1', sessionId: 's1' },
+    at: Date.now(),
+    host: 'api.anthropic.com',
+    method: 'POST',
+    path: '/v1/messages',
+    status: 200,
+    durationMs: 12,
+    ...overrides,
+  }
+}
+
+const egressLogs: EgressLog[] = []
+afterAll(() => {
+  for (const log of egressLogs.splice(0)) log.stop()
+})
+
+function startEgressLog(
+  db: ReturnType<typeof openDb>['db'],
+  options: Partial<Parameters<typeof createEgressLog>[0]> = {},
+) {
+  const log = createEgressLog({ db, log: ignore, ...options })
+  egressLogs.push(log)
+  return log
+}
+
+const countRows = (sqlite: Database) =>
+  sqlite.query<{ n: number }, []>('SELECT count(*) AS n FROM egress_log').get()?.n
+
+test('recorded requests reach egress_log together after the flush interval, not one by one', async () => {
+  const { db, sqlite } = openDb()
+  const log = startEgressLog(db, { flushMs: 50 })
+  for (let index = 0; index < 3; index++) log.record(egressEvent())
+  expect(countRows(sqlite)).toBe(0)
+  await Bun.sleep(25)
+  log.record(egressEvent())
+  expect(countRows(sqlite)).toBe(0)
+  await Bun.sleep(60)
+  expect(countRows(sqlite)).toBe(4)
+})
+
+test('stopping the log writes what is still buffered, and later records are dropped', async () => {
+  const { db, sqlite } = openDb()
+  const log = startEgressLog(db, { flushMs: 20 })
+  log.record(egressEvent())
+  log.record(egressEvent({ status: 204 }, { decision: 'passed' }))
+  expect(countRows(sqlite)).toBe(0)
+  log.stop()
+  expect(countRows(sqlite)).toBe(2)
+  log.record(egressEvent())
+  await Bun.sleep(40)
+  expect(countRows(sqlite)).toBe(2)
+})
+
+test('rows older than 30 days are pruned at start and on each prune tick', async () => {
+  const { db, sqlite } = openDb()
+  let now = Date.now()
+  const seed = startEgressLog(db, { now: () => now })
+  seed.record(egressEvent({ at: now - 31 * day, path: '/old' }))
+  seed.record(egressEvent({ at: now - 29 * day, path: '/recent' }))
+  seed.stop()
+  expect(countRows(sqlite)).toBe(2)
+
+  const log = startEgressLog(db, { now: () => now, pruneEveryMs: 20 })
+  const paths = () => log.rows({ limit: 10 }).map((row) => row.path)
+  expect(paths()).toEqual(['/recent'])
+  now += 2 * day
+  await Bun.sleep(50)
+  expect(paths()).toEqual([])
+})
+
+test('log rows filter by agent group, account, and decision, newest kept and printed oldest first', () => {
+  const { db } = openDb()
+  const log = startEgressLog(db, { flushMs: 60_000 })
+  const at = Date.now()
+  log.record(egressEvent({ at, path: '/1' }))
+  log.record(
+    egressEvent(
+      { at: at + 1, path: '/2' },
+      { ...injected, account: accountHandle('anthropic', 'second') },
+    ),
+  )
+  log.record(
+    egressEvent(
+      { at: at + 2, path: '/3', status: 403 },
+      { decision: 'refused', refusal: 'account_not_connected', service: 'anthropic-api' },
+    ),
+  )
+  log.record(
+    egressEvent({ at: at + 3, path: '/4', principal: { agentGroupId: 'g2', sessionId: 's2' } }),
+  )
+  const paths = (filter: Parameters<EgressLog['rows']>[0]) =>
+    log.rows(filter).map((row) => row.path)
+
+  expect(paths({ limit: 100 })).toEqual(['/1', '/2', '/3', '/4'])
+  expect(paths({ limit: 2 })).toEqual(['/3', '/4'])
+  expect(paths({ agentGroupId: 'g2', limit: 100 })).toEqual(['/4'])
+  expect(paths({ account: 'anthropic/second', limit: 100 })).toEqual(['/2'])
+  expect(paths({ decision: 'refused', limit: 100 })).toEqual(['/3'])
+  expect(log.rows({ decision: 'refused', limit: 1 })[0]).toEqual({
+    at: new Date(at + 2),
+    agentGroupId: 'g1',
+    sessionId: 's1',
+    host: 'api.anthropic.com',
+    method: 'POST',
+    path: '/3',
+    account: null,
+    service: 'anthropic-api',
+    decision: 'refused',
+    refusal: 'account_not_connected',
+    status: 403,
+    durationMs: 12,
+  })
+})
+
+test('a flush that fails is reported and the log keeps accepting records', () => {
+  const { db, sqlite } = openDb()
+  const events: unknown[] = []
+  const log = startEgressLog(db, { flushMs: 60_000, log: (event) => events.push(event) })
+  sqlite.run('DROP TABLE egress_log')
+  log.record(egressEvent())
+  expect(() => log.rows({ limit: 1 })).toThrow()
+  expect(events).toEqual([
+    expect.objectContaining({
+      kind: 'gateway.egress_log.write_failed',
+      operation: 'flush',
+      rows: 1,
+    }),
+  ])
+})
+
+test('status reports admission, the Agent Port address, and the SHA-256 fingerprint of the CA', async () => {
+  const ca = await createCertificateAuthority()
+  const port = { host: '127.0.0.1', port: 4000 }
+  expect(
+    gatewayStatus({
+      admission: { kind: 'open', port: 4000, openedAt: 0, bindToOpenMs: 1 },
+      agentPort: port,
+      caPem: ca.certPem,
+    }),
+  ).toEqual({
+    admission: 'open',
+    detail: null,
+    agentPort: port,
+    caFingerprint: new X509Certificate(ca.certPem).fingerprint256,
+  })
+  expect(
+    gatewayStatus({
+      admission: { kind: 'bind_failed', reason: { message: 'port in use', code: 'EADDRINUSE' } },
+      agentPort: port,
+      caPem: ca.certPem,
+    }),
+  ).toMatchObject({ admission: 'bind_failed', detail: 'port in use' })
 })

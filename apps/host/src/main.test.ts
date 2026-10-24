@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite'
 import { afterEach, expect, test } from 'bun:test'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, X509Certificate } from 'node:crypto'
 import {
   existsSync,
   mkdirSync,
@@ -266,6 +266,44 @@ function storeAccount(home: string, material: Uint8Array): void {
     .run(material)
   sqlite.close()
 }
+
+test('a host started over egress_log rows from 31 days ago prunes them and keeps newer ones', async () => {
+  const home = homeForTest()
+  await startAndStop(home)
+  const sqlite = new Database(join(home, 'kurumi.db'))
+  const insert = sqlite.query(
+    `INSERT INTO egress_log (at, agent_group_id, session_id, host, method, path, decision, status, duration_ms)
+     VALUES (?, 'g1', 's1', 'api.anthropic.com', 'GET', ?, 'passed', 200, 1)`,
+  )
+  insert.run(Date.now() - 31 * 24 * 60 * 60 * 1000, '/old')
+  insert.run(Date.now() - 29 * 24 * 60 * 60 * 1000, '/recent')
+  sqlite.close()
+
+  await startAndStop(home)
+
+  const after = new Database(join(home, 'kurumi.db'), { readonly: true })
+  expect(after.query('SELECT path FROM egress_log').all()).toEqual([{ path: '/recent' }])
+  after.close()
+}, 5000)
+
+test('kurumi gateway status prints the Agent Port address and the fingerprint of the stored CA', async () => {
+  const home = homeForTest()
+  const host = spawnHost(home, undefined, { KURUMI_AGENT_PORT: '40059' })
+  await waitForHost(home, host)
+  const command = Bun.spawn(
+    [process.execPath, join(import.meta.dir, '../../cli/src/main.ts'), 'gateway', 'status'],
+    { env: { ...process.env, KURUMI_HOME: home }, stdout: 'pipe', stderr: 'pipe' },
+  )
+  expect(await command.exited).toBe(0)
+  const printed = await new Response(command.stdout).text()
+  host.kill('SIGTERM')
+  expect(await host.exited).toBe(0)
+  const pem = storedCa(home)
+  if (pem === undefined) throw new Error('no stored CA')
+
+  expect(printed).toContain('agent port  127.0.0.1:40059')
+  expect(printed).toContain(`ca sha256   ${new X509Certificate(pem).fingerprint256}`)
+}, 5000)
 
 test('with no accounts stored, a host whose vault.key was deleted starts with a new key and a new gateway CA', async () => {
   const home = homeForTest()

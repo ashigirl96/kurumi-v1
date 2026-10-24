@@ -20,13 +20,17 @@ import {
 import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import {
+  createEgressLog,
   credentialInject,
   gatewayContribution,
+  gatewayStatus,
   loadCertificateAuthority,
   proxyEnv,
+  router as gatewayRouter,
   stageCaBundle,
   startAdmission,
   startAgentPort,
+  type EgressLog,
 } from '@kurumi/gateway/server'
 import { hostContract, type Caller } from '@kurumi/rpc/contract'
 import { guardRouter, type Guard, type KurumiContext } from '@kurumi/rpc/server'
@@ -67,6 +71,7 @@ export async function startHost(config: HostConfig) {
   let sessions: ReturnType<typeof createSessionLedger> | undefined
   let driver: ReturnType<typeof createDockerDriver> | undefined
   let admission: ReturnType<typeof startAdmission> | undefined
+  let egressLog: EgressLog | undefined
   let socketOwned = false
   let stopped: Promise<void> | undefined
   const socket = join(config.home, 'kurumi.sock')
@@ -80,6 +85,7 @@ export async function startHost(config: HostConfig) {
         listener?.stop(true),
       ])
       try {
+        egressLog?.stop()
         if (socketOwned) rmSync(socket, { force: true })
         database?.$client.close()
       } finally {
@@ -118,6 +124,11 @@ export async function startHost(config: HostConfig) {
     const db = openKurumiDb(join(config.home, 'kurumi.db'))
     database = db
     migrateAll(db, migrations)
+    const requestLog = createEgressLog({
+      db,
+      log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
+    })
+    egressLog = requestLog
     const vaultKey = loadVaultKey(config.home, storedAccounts(db))
     const ca = await loadCertificateAuthority({
       db,
@@ -207,6 +218,15 @@ export async function startHost(config: HostConfig) {
       chatLedger,
       sessionLedger,
       accountLedger,
+      gateway: {
+        status: () =>
+          gatewayStatus({
+            admission: admission?.status().state ?? { kind: 'binding' },
+            agentPort: config.agentPort,
+            caPem: ca.certPem,
+          }),
+        egressLog: requestLog,
+      },
     }
     type HostContext = KurumiContext &
       typeof ledgers & {
@@ -219,6 +239,7 @@ export async function startHost(config: HostConfig) {
       account: accountRouter,
       chat: chatRouter,
       session: sessionRouter,
+      gateway: gatewayRouter,
       status: admin.status.handler(() => ({ ready: true })),
       db: {
         query: admin.db.query.handler(({ context, input }) => {
@@ -249,7 +270,7 @@ export async function startHost(config: HostConfig) {
           authenticate: (token) => sessionLedger.authenticate(token),
           ca,
           intercepts: isInterceptedHost,
-          forward: { inject: credentialInject(accountLedger) },
+          forward: { inject: credentialInject(accountLedger), log: requestLog.record },
           async rpc(request, response, principal, signal) {
             const result = await agentHandler.handle(request, response, {
               prefix: '/rpc',
