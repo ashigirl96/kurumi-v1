@@ -120,11 +120,16 @@ function pathMatches(effect: RuleEffect, pattern: PathPattern, path: CanonicalPa
   }
 }
 
+/** HEAD runs the GET handler and drops the response body, so a GET approve rule covers it. */
+const methodsCovered = (method: string) => (method === 'GET' ? ['GET', 'HEAD'] : [method])
+
 function methodMatches(rule: EgressRule, method: string, overrides: readonly string[]): boolean {
   if (rule.method === null) return true
   switch (rule.effect) {
-    case 'approve':
-      return method === rule.method || overrides.includes(rule.method)
+    case 'approve': {
+      const covered = methodsCovered(rule.method)
+      return [method, ...overrides].some((each) => covered.includes(each))
+    }
     case 'allow':
       return overrides.length === 0 && method === rule.method
     default: {
