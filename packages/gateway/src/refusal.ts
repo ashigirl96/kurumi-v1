@@ -6,10 +6,12 @@ export type HoldRefusal =
   | { code: 'approval_pending'; service: ServiceId; approvalId: string }
   | { code: 'approval_denied'; service: ServiceId; approvalId: string }
   | { code: 'body_too_large'; service: ServiceId; limit: number }
+  | { code: 'approval_limit'; service: ServiceId; waiting: 'undecided'; limit: number }
   | {
       code: 'approval_limit'
       service: ServiceId
-      waiting: 'undecided' | 'in_flight'
+      waiting: 'in_flight'
+      scope: 'agent_group' | 'host'
       limit: number
     }
 
@@ -68,9 +70,16 @@ export function nextStep(refusal: GatewayRefusal): string {
     case 'body_too_large':
       return `a rule holds this request for a person to read, and kurumi holds at most ${refusal.limit} bytes; send a smaller body`
     case 'approval_limit':
-      return refusal.waiting === 'undecided'
-        ? `${refusal.limit} requests of this agent group already wait for a person; ask the user to decide them with kurumi approval list`
-        : `${refusal.limit} held requests already wait on this host; send this one again when one of them ends`
+      switch (refusal.waiting) {
+        case 'undecided':
+          return `${refusal.limit} requests of this agent group already wait for a person; ask the user to decide them with kurumi approval list`
+        case 'in_flight':
+          return `${refusal.limit} held requests ${refusal.scope === 'host' ? 'already wait on this host' : 'of this agent group already wait'}; send this one again when one of them ends`
+        default: {
+          const unknown: never = refusal
+          return unknown
+        }
+      }
     default: {
       const unknown: never = refusal
       return unknown

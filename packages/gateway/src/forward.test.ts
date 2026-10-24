@@ -34,8 +34,10 @@ import {
 import {
   ALLOWANCE_MS,
   createEgressApproval,
-  MAX_HELD,
   MAX_HELD_BODY_BYTES,
+  MAX_IN_FLIGHT,
+  MAX_IN_FLIGHT_PER_GROUP,
+  MAX_UNDECIDED_PER_GROUP,
   type GatewayApprovals,
   type SessionNotice,
 } from './hold.ts'
@@ -1076,10 +1078,10 @@ async function setupHeld({
   const events: EgressEvent<EgressPrincipal>[] = []
   const upstream = await startFakeUpstream({ host: 'api.anthropic.com' })
   stops.push(upstream.stop)
+  const principals = new Map<string, EgressPrincipal>()
   const port = await startAgentPort<EgressPrincipal>({
     bind: { host: '127.0.0.1', port: 0 },
-    authenticate: (token) =>
-      token === 'test-token' ? { agentGroupId: 'g1', sessionId: 's1' } : null,
+    authenticate: (token) => principals.get(token) ?? null,
     intercepts: isInterceptedHost,
     forward: {
       upstream: upstream.destination,
@@ -1090,15 +1092,23 @@ async function setupHeld({
     },
   })
   stops.push(port.stop)
-  const openTunnel = async () => {
+  const openTunnel = async (
+    principal: EgressPrincipal = { agentGroupId: 'g1', sessionId: 's1' },
+  ) => {
+    const token = `token-${principal.agentGroupId}-${principal.sessionId}`
+    principals.set(token, principal)
     const tunnel = await openTestTunnel({
       proxyPort: port.port,
-      token: 'test-token',
+      token,
       caPem: port.caPem,
       target: { host: 'api.anthropic.com', port: 443 },
     })
     stops.push(tunnel.close)
     return tunnel
+  }
+  const addAgentGroup = (id: string) => {
+    insertAgentGroup(db, id)
+    db.transaction((tx) => ledger.grantAutoGrants(tx, id))
   }
   const allowance = (approvalId: string) =>
     db.select().from(egressAllowance).where(eq(egressAllowance.approvalId, approvalId)).get()
@@ -1114,6 +1124,7 @@ async function setupHeld({
     port,
     tunnel: await openTunnel(),
     openTunnel,
+    addAgentGroup,
     requested,
     approvalId,
     notices,
@@ -1470,7 +1481,7 @@ describe('held requests', () => {
 
   test('requests past the undecided cap of an agent group read 429 approval_limit', async () => {
     const { gate, tunnel, requested, approvalId } = await setupHeld({ holdMs: 1 })
-    for (let index = 0; index < MAX_HELD; index++) {
+    for (let index = 0; index < MAX_UNDECIDED_PER_GROUP; index++) {
       expect((await sendMessage(tunnel, prompt(`undecided ${index}`))).status).toBe(403)
     }
 
@@ -1481,31 +1492,88 @@ describe('held requests', () => {
       error: 'approval_limit',
       service: 'anthropic-api',
       waiting: 'undecided',
-      limit: MAX_HELD,
-      next: `${MAX_HELD} requests of this agent group already wait for a person; ask the user to decide them with kurumi approval list`,
+      limit: MAX_UNDECIDED_PER_GROUP,
+      next: `${MAX_UNDECIDED_PER_GROUP} requests of this agent group already wait for a person; ask the user to decide them with kurumi approval list`,
     })
-    expect(requested).toHaveLength(MAX_HELD)
+    expect(requested).toHaveLength(MAX_UNDECIDED_PER_GROUP)
 
     await gate.decided({ id: approvalId(0) }, 'deny')
 
     expect((await sendMessage(tunnel, prompt('room again'))).status).toBe(403)
-    expect(requested).toHaveLength(MAX_HELD + 1)
+    expect(requested).toHaveLength(MAX_UNDECIDED_PER_GROUP + 1)
   })
 
   test('requests past the in-flight cap of the host read 429 approval_limit at once', async () => {
-    const { gate, tunnel, openTunnel, requested } = await setupHeld()
-    const tunnels = await Promise.all(Array.from({ length: MAX_HELD }, openTunnel))
+    const { gate, openTunnel, addAgentGroup, requested } = await setupHeld()
+    const fullGroups = MAX_IN_FLIGHT / MAX_IN_FLIGHT_PER_GROUP
+    for (let group = 2; group <= fullGroups + 1; group++) addAgentGroup(`g${group}`)
+    const tunnels = await Promise.all(
+      Array.from({ length: MAX_IN_FLIGHT }, (_, index) =>
+        openTunnel({ agentGroupId: `g${1 + (index % fullGroups)}`, sessionId: `s${index}` }),
+      ),
+    )
     const waiting = tunnels.map((each, index) => sendMessage(each, prompt(`in flight ${index}`)))
-    await until(() => requested.length === MAX_HELD)
+    await until(() => requested.length === MAX_IN_FLIGHT)
 
-    const over = await sendMessage(tunnel, prompt('one too many'))
+    const over = await sendMessage(
+      await openTunnel({ agentGroupId: `g${fullGroups + 1}`, sessionId: 's-over' }),
+      prompt('one too many'),
+    )
 
     expect(over.status).toBe(429)
-    expect(JSON.parse(over.body)).toMatchObject({ waiting: 'in_flight', limit: MAX_HELD })
-    expect(requested).toHaveLength(MAX_HELD)
+    expect(JSON.parse(over.body)).toEqual({
+      error: 'approval_limit',
+      service: 'anthropic-api',
+      waiting: 'in_flight',
+      scope: 'host',
+      limit: MAX_IN_FLIGHT,
+      next: `${MAX_IN_FLIGHT} held requests already wait on this host; send this one again when one of them ends`,
+    })
+    expect(requested).toHaveLength(MAX_IN_FLIGHT)
     for (const { approvalId } of requested) await gate.decided({ id: approvalId }, 'deny')
     expect((await Promise.all(waiting)).map(({ status }) => status)).toEqual(
-      Array.from({ length: MAX_HELD }, () => 403),
+      Array.from({ length: MAX_IN_FLIGHT }, () => 403),
+    )
+  })
+
+  test('an agent group at its in-flight cap leaves room for another group and reads 429 at once', async () => {
+    const { gate, openTunnel, addAgentGroup, requested } = await setupHeld()
+    addAgentGroup('g2')
+    const tunnels = await Promise.all(
+      Array.from({ length: MAX_IN_FLIGHT_PER_GROUP }, () => openTunnel()),
+    )
+    const waiting = tunnels.map((each, index) => sendMessage(each, prompt(`g1 in flight ${index}`)))
+    await until(() => requested.length === MAX_IN_FLIGHT_PER_GROUP)
+
+    waiting.push(
+      sendMessage(await openTunnel({ agentGroupId: 'g2', sessionId: 's2' }), prompt('g2 waits')),
+    )
+    await until(() => requested.length === MAX_IN_FLIGHT_PER_GROUP + 1)
+    expect(requested.at(-1)).toMatchObject({ agentGroupId: 'g2', sessionId: 's2' })
+
+    const over = await Promise.race([
+      sendMessage(await openTunnel(), prompt('one too many')).then(({ status, body }) => ({
+        status,
+        body: JSON.parse(body),
+      })),
+      Bun.sleep(1_000).then(() => ({ status: 'still held after 1 s', body: null })),
+    ])
+
+    expect(over).toEqual({
+      status: 429,
+      body: {
+        error: 'approval_limit',
+        service: 'anthropic-api',
+        waiting: 'in_flight',
+        scope: 'agent_group',
+        limit: MAX_IN_FLIGHT_PER_GROUP,
+        next: `${MAX_IN_FLIGHT_PER_GROUP} held requests of this agent group already wait; send this one again when one of them ends`,
+      },
+    })
+    expect(requested).toHaveLength(MAX_IN_FLIGHT_PER_GROUP + 1)
+    for (const { approvalId } of requested) await gate.decided({ id: approvalId }, 'deny')
+    expect((await Promise.all(waiting)).map(({ status }) => status)).toEqual(
+      Array.from({ length: MAX_IN_FLIGHT_PER_GROUP + 1 }, () => 403),
     )
   })
 

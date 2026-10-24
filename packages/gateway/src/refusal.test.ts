@@ -28,6 +28,16 @@ test.each([
   [{ code: 'approval_denied', service: 'anthropic-api', approvalId: 'apr-1' }, 403],
   [{ code: 'body_too_large', service: 'anthropic-api', limit: 10 }, 413],
   [{ code: 'approval_limit', service: 'anthropic-api', waiting: 'undecided', limit: 32 }, 429],
+  [
+    {
+      code: 'approval_limit',
+      service: 'anthropic-api',
+      waiting: 'in_flight',
+      scope: 'agent_group',
+      limit: 8,
+    },
+    429,
+  ],
 ] satisfies [GatewayRefusal, number][])('%o answers %d', (refusal, status) => {
   expect(refusalResponse(refusal).status).toBe(status)
 })

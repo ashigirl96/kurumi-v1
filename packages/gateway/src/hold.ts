@@ -36,7 +36,10 @@ export type EgressApproval = EgressGate<EgressPrincipal> & {
 export const HOLD_MS = 180_000
 export const ALLOWANCE_MS = 10 * 60_000
 export const MAX_HELD_BODY_BYTES = 10 * 1024 * 1024
-export const MAX_HELD = 32
+/** In flight: buffering a body or waiting on a person. */
+export const MAX_IN_FLIGHT = 32
+export const MAX_IN_FLIGHT_PER_GROUP = 8
+export const MAX_UNDECIDED_PER_GROUP = 32
 const PREVIEW_BYTES = 1024
 
 type HoldEnd = 'approved' | 'denied' | 'timeout' | 'gone'
@@ -57,6 +60,32 @@ type HeldRequest = {
 }
 
 const sha256 = (data: string | Buffer) => createHash('sha256').update(data)
+
+type InFlightLimit = Pick<Extract<HoldRefusal, { waiting: 'in_flight' }>, 'scope' | 'limit'>
+
+function inFlightSlots() {
+  let host = 0
+  const byGroup = new Map<string, number>()
+  return {
+    /** Takes a slot for the group, or returns the limit that is full. */
+    take(group: string): InFlightLimit | null {
+      const held = byGroup.get(group) ?? 0
+      if (held >= MAX_IN_FLIGHT_PER_GROUP) {
+        return { scope: 'agent_group', limit: MAX_IN_FLIGHT_PER_GROUP }
+      }
+      if (host >= MAX_IN_FLIGHT) return { scope: 'host', limit: MAX_IN_FLIGHT }
+      host++
+      byGroup.set(group, held + 1)
+      return null
+    },
+    release(group: string): void {
+      host--
+      const held = (byGroup.get(group) ?? 1) - 1
+      if (held === 0) byGroup.delete(group)
+      else byGroup.set(group, held)
+    },
+  }
+}
 
 function readBody(
   body: Readable | null,
@@ -144,7 +173,7 @@ export function createEgressApproval(deps: {
   const now = deps.now ?? Date.now
   const rules = createRuleStore({ db: deps.db, accounts: deps.accounts, now })
   const waiters = new Map<string, (end: HoldEnd) => void>()
-  let inFlight = 0
+  const inFlight = inFlightSlots()
 
   function admit(tx: Tx, held: HeldRequest): Admission {
     const { input, ruleId, fingerprint } = held
@@ -199,14 +228,14 @@ export function createEgressApproval(deps: {
           ),
         )
         .get()?.rows ?? 0
-    if (undecided >= MAX_HELD) {
+    if (undecided >= MAX_UNDECIDED_PER_GROUP) {
       return {
         kind: 'refuse',
         refusal: {
           code: 'approval_limit',
           service: account.service,
           waiting: 'undecided',
-          limit: MAX_HELD,
+          limit: MAX_UNDECIDED_PER_GROUP,
         },
       }
     }
@@ -337,21 +366,20 @@ export function createEgressApproval(deps: {
         pathAsSent: input.path,
       })
       if (verdict?.effect !== 'approve') return null
-      if (inFlight >= MAX_HELD) {
+      const group = input.principal.agentGroupId
+      const full = inFlight.take(group)
+      if (full) {
         return Promise.resolve({
           kind: 'refuse',
           refusal: {
             code: 'approval_limit',
             service: input.account.service,
             waiting: 'in_flight',
-            limit: MAX_HELD,
+            ...full,
           },
         })
       }
-      inFlight++
-      return hold(input, verdict.ruleId).finally(() => {
-        inFlight--
-      })
+      return hold(input, verdict.ruleId).finally(() => inFlight.release(group))
     },
     async decided(approval, decision) {
       const row = allowanceOf(approval.id)
