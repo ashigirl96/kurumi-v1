@@ -9,6 +9,7 @@
     "@kurumi/account": "workspace:*",
     "@kurumi/agent": "workspace:*",
     "@kurumi/chat": "workspace:*",
+    "@kurumi/gateway": "workspace:*",
     "@kurumi/rpc": "workspace:*",
     "@orpc/client": "catalog:",
     "@orpc/contract": "catalog:",

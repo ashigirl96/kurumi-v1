@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite'
 import { afterEach, expect, test } from 'bun:test'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, X509Certificate } from 'node:crypto'
 import {
   existsSync,
   mkdirSync,
@@ -15,11 +15,12 @@ import { join } from 'node:path'
 
 import { seal } from '@kurumi/account/server'
 import { createAgentLedger } from '@kurumi/agent/server'
+import { createRouterClient } from '@orpc/server'
 import { z } from 'zod'
 
 import { openKurumiDb, migrateAll } from './db.ts'
 import { queryReadOnly } from './fronts.ts'
-import { initialGuard } from './main.ts'
+import { hostRouter, initialGuard, type HostContext } from './main.ts'
 import { migrations } from './migrations.ts'
 
 const homes: string[] = []
@@ -266,6 +267,44 @@ function storeAccount(home: string, material: Uint8Array): void {
     .run(material)
   sqlite.close()
 }
+
+test('a host started over egress_log rows from 31 days ago prunes them and keeps newer ones', async () => {
+  const home = homeForTest()
+  await startAndStop(home)
+  const sqlite = new Database(join(home, 'kurumi.db'))
+  const insert = sqlite.query(
+    `INSERT INTO egress_log (at, agent_group_id, session_id, host, method, path, decision, status, duration_ms)
+     VALUES (?, 'g1', 's1', 'api.anthropic.com', 'GET', ?, 'passed', 200, 1)`,
+  )
+  insert.run(Date.now() - 31 * 24 * 60 * 60 * 1000, '/old')
+  insert.run(Date.now() - 29 * 24 * 60 * 60 * 1000, '/recent')
+  sqlite.close()
+
+  await startAndStop(home)
+
+  const after = new Database(join(home, 'kurumi.db'), { readonly: true })
+  expect(after.query('SELECT path FROM egress_log').all()).toEqual([{ path: '/recent' }])
+  after.close()
+}, 5000)
+
+test('kurumi gateway status prints the Agent Port address and the fingerprint of the stored CA', async () => {
+  const home = homeForTest()
+  const host = spawnHost(home, undefined, { KURUMI_AGENT_PORT: '40059' })
+  await waitForHost(home, host)
+  const command = Bun.spawn(
+    [process.execPath, join(import.meta.dir, '../../cli/src/main.ts'), 'gateway', 'status'],
+    { env: { ...process.env, KURUMI_HOME: home }, stdout: 'pipe', stderr: 'pipe' },
+  )
+  expect(await command.exited).toBe(0)
+  const printed = await new Response(command.stdout).text()
+  host.kill('SIGTERM')
+  expect(await host.exited).toBe(0)
+  const pem = storedCa(home)
+  if (pem === undefined) throw new Error('no stored CA')
+
+  expect(printed).toContain('agent port  127.0.0.1:40059')
+  expect(printed).toContain(`ca sha256   ${new X509Certificate(pem).fingerprint256}`)
+}, 5000)
 
 test('with no accounts stored, a host whose vault.key was deleted starts with a new key and a new gateway CA', async () => {
   const home = homeForTest()
@@ -526,6 +565,48 @@ test('the temporary host guard allows host and human callers and only agent chan
     { agent: 'hold' },
   ] as const) {
     expect(initialGuard({ ...common, caller, meta }).kind).toBe('deny')
+  }
+})
+
+const outcome = (call: Promise<unknown>) =>
+  call.then(
+    () => 'answered',
+    (error: unknown) => error,
+  )
+
+test('the host router answers gateway status and log for the host and refuses them to an agent', async () => {
+  const db = openKurumiDb(join(homeForTest(), 'kurumi.db'))
+  const status = {
+    admission: 'open',
+    detail: null,
+    agentPort: { host: '127.0.0.1', port: 4000 },
+    caFingerprint: 'AB:CD',
+  } as const
+  const unused = {} as never
+  const contextFor = (caller: HostContext['caller']): HostContext => ({
+    db,
+    caller,
+    guard: initialGuard,
+    grant: null,
+    agentLedger: unused,
+    chatLedger: unused,
+    sessionLedger: unused,
+    accountLedger: unused,
+    gateway: { status: () => status, egressLog: { rows: () => [] } },
+    agentPrincipal: null,
+  })
+  try {
+    const host = createRouterClient(hostRouter, { context: contextFor({ kind: 'host' }) })
+    expect(await host.gateway.status()).toEqual(status)
+    expect(await host.gateway.log({})).toEqual([])
+
+    const agent = createRouterClient(hostRouter, {
+      context: contextFor({ kind: 'agent', agentGroupId: 'ag-test', sessionId: 's' }),
+    })
+    expect(await outcome(agent.gateway.status())).toMatchObject({ code: 'FORBIDDEN' })
+    expect(await outcome(agent.gateway.log({}))).toMatchObject({ code: 'FORBIDDEN' })
+  } finally {
+    db.$client.close()
   }
 })
 

@@ -82,6 +82,9 @@ function pinnedLookup(addresses: LookupAddress[]): LookupFunction {
   }
 }
 
+// A lookup or injection that ignores the abort could otherwise hold stop, and the host's flush and lock release behind it, forever.
+const STOP_GRACE_MS = 2_000
+
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve) => {
     server.close(() => resolve())
@@ -99,6 +102,7 @@ export async function startAgentPort<Principal extends object>(deps: {
   ca?: CertificateAuthority
   onConnect?(target: ConnectTarget): void
   probeNonce?(): string | null
+  stopGraceMs?: number
   rpc?(
     request: IncomingMessage,
     response: ServerResponse,
@@ -112,8 +116,18 @@ export async function startAgentPort<Principal extends object>(deps: {
   const resolve = deps.resolve ?? ((host: string) => lookup(host, { all: true }))
   const listeners = new Map<string, Promise<HostListener<Principal>>>()
   const sockets = new Map<Duplex, (() => void) | undefined>()
+  const inFlight = new Set<Promise<unknown>>()
   let stopping = false
   let stopped: Promise<void> | undefined
+
+  // stop() waits, up to STOP_GRACE_MS, for every exchange so its egress row is recorded before the caller stops the log.
+  function hold(work: Promise<unknown>, closed?: Duplex | ServerResponse): void {
+    const done: Promise<unknown> = Promise.allSettled([
+      work,
+      closed && new Promise((settle) => closed.once('close', settle)),
+    ]).then(() => inFlight.delete(done))
+    inFlight.add(done)
+  }
 
   function track(socket: Duplex): void {
     sockets.set(socket, undefined)
@@ -166,15 +180,16 @@ export async function startAgentPort<Principal extends object>(deps: {
           return
         }
         const inner = createServer((req, res) => {
-          void handleRequest(tunnel, req, res).catch(() => {
+          const handled = handleRequest(tunnel, req, res).catch(() => {
             if (res.destroyed) return
             if (res.headersSent) res.destroy()
             else res.writeHead(500, { connection: 'close' }).end()
           })
+          hold(handled, res)
         })
         inner.on('upgrade', (req, client, head) => {
           client.pause()
-          void (async () => {
+          const upgraded = (async () => {
             const principal = await tunnel.authenticate()
             if (client.destroyed || tunnel.signal.aborted) return
             if (principal === null) {
@@ -191,6 +206,7 @@ export async function startAgentPort<Principal extends object>(deps: {
           })().catch(() => {
             if (!client.destroyed) rejectConnect(client, 502)
           })
+          hold(upgraded, client)
         })
         inner.on('clientError', (_error, client) => client.destroy())
         socket.once('close', () => inner.removeAllListeners())
@@ -229,8 +245,11 @@ export async function startAgentPort<Principal extends object>(deps: {
     client.pause()
     const aborted = new AbortController()
     sockets.set(client, () => aborted.abort())
+    const at = Date.now()
+    const started = performance.now()
     const token = password(req)
-    if (token === null || (await deps.authenticate(token)) === null) {
+    const principal = token === null ? null : await deps.authenticate(token)
+    if (token === null || principal === null) {
       rejectConnect(client, 407)
       return
     }
@@ -253,6 +272,18 @@ export async function startAgentPort<Principal extends object>(deps: {
         403,
         `kurumi refuses to tunnel to ${target.host}: it resolves to a ${reason} address\n`,
       )
+      deps.forward.log?.({
+        decision: 'refused',
+        refusal: 'upstream_not_public',
+        service: null,
+        principal,
+        at,
+        host: target.host,
+        method: 'CONNECT',
+        path: req.url ?? '',
+        status: 403,
+        durationMs: Math.round(performance.now() - started),
+      })
       return
     }
     if (stopping || client.destroyed) return
@@ -337,10 +368,11 @@ export async function startAgentPort<Principal extends object>(deps: {
   outer.on('connection', track)
   outer.on('clientError', (_error, socket) => socket.destroy())
   outer.on('connect', (req, socket, head) => {
-    void handleConnect(req, socket, head).catch((error: unknown) => {
+    const connected = handleConnect(req, socket, head).catch((error: unknown) => {
       if (socket.destroyed) return
       rejectConnect(socket, 502, error instanceof CaExpiredError ? `${error.message}\n` : '')
     })
+    hold(connected)
   })
 
   function stop(): Promise<void> {
@@ -359,6 +391,14 @@ export async function startAgentPort<Principal extends object>(deps: {
       )
       listeners.clear()
       await outerClosed
+      let grace: ReturnType<typeof setTimeout> | undefined
+      await Promise.race([
+        Promise.all(inFlight),
+        new Promise((expire) => {
+          grace = setTimeout(expire, deps.stopGraceMs ?? STOP_GRACE_MS)
+        }),
+      ])
+      clearTimeout(grace)
     })()
     return stopped
   }

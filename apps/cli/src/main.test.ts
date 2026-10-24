@@ -320,3 +320,78 @@ describe('a contract field marked stdin', () => {
     },
   )
 })
+
+function answering(output: unknown) {
+  return {
+    async call(path: readonly string[], input: unknown) {
+      calls.push({ path, input })
+      return output
+    },
+  }
+}
+
+describe('gateway', () => {
+  const row = {
+    at: new Date('2026-10-24T00:00:00.000Z'),
+    agentGroupId: 'g1',
+    sessionId: 's1',
+    host: 'api.anthropic.com',
+    method: 'POST',
+    path: '/v1/messages',
+    account: 'anthropic/main',
+    service: 'anthropic-api',
+    decision: 'injected',
+    refusal: null,
+    status: 200,
+    durationMs: 812,
+  }
+
+  test('log sends the filters and prints account, service, decision, and status in a row', async () => {
+    const refused = {
+      ...row,
+      account: null,
+      decision: 'refused',
+      refusal: 'account_not_connected',
+      status: 403,
+      durationMs: 3,
+    }
+    const argv = ['gateway', 'log', '--agent-group-id', 'g1', '--account', 'anthropic/main']
+    expect(
+      await runCommand(argv, {
+        contract: cliContract,
+        link: answering([row, refused]),
+        stdin: piped(''),
+      }),
+    ).toBe(0)
+
+    expect(calls).toEqual([
+      {
+        path: ['gateway', 'log'],
+        input: { agentGroupId: 'g1', account: 'anthropic/main', limit: 100 },
+      },
+    ])
+    expect(stdout.split('\n')).toEqual([
+      '2026-10-24T00:00:00.000Z  anthropic/main  anthropic-api  injected  200  812ms  POST  api.anthropic.com/v1/messages  g1',
+      '2026-10-24T00:00:00.000Z  -               anthropic-api  refused   403  3ms    POST  api.anthropic.com/v1/messages  g1  account_not_connected',
+      '',
+    ])
+  })
+
+  test('status prints admission, the Agent Port address, and the CA fingerprint', async () => {
+    const status = {
+      admission: 'open',
+      detail: null,
+      agentPort: { host: '127.0.0.1', port: 4000 },
+      caFingerprint: 'AB:CD',
+    }
+    expect(
+      await runCommand(['gateway', 'status'], {
+        contract: cliContract,
+        link: answering(status),
+        stdin: piped(''),
+      }),
+    ).toBe(0)
+
+    expect(stdout).toBe('admission   open\nagent port  127.0.0.1:4000\nca sha256   AB:CD\n')
+  })
+})

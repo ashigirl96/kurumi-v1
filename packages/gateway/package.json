@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./contract": "./src/contract.ts",
     "./schema": "./src/schema.ts",
     "./server": "./src/server.ts",
     "./testing": "./src/testing.ts"
@@ -13,9 +14,11 @@
   "dependencies": {
     "@kurumi/account": "workspace:*",
     "@kurumi/rpc": "workspace:*",
+    "@orpc/server": "catalog:",
     "@peculiar/x509": "catalog:",
     "drizzle-orm": "catalog:",
-    "reflect-metadata": "catalog:"
+    "reflect-metadata": "catalog:",
+    "zod": "catalog:"
   },
   "devDependencies": {
     "drizzle-kit": "catalog:"

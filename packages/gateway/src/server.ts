@@ -1,11 +1,13 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, randomUUID, X509Certificate } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { rootCertificates } from 'node:tls'
 
 import { open, seal, VaultError } from '@kurumi/account/server'
-import type { Db } from '@kurumi/rpc/server'
+import type { Db, KurumiContext } from '@kurumi/rpc/server'
+import { implement } from '@orpc/server'
 
+import type { AdmissionState } from './admission.ts'
 import {
   certificateAuthority,
   certificateNotAfter,
@@ -13,12 +15,22 @@ import {
   type CaExpired,
   type CertificateAuthority,
 } from './ca.ts'
+import { contract, type GatewayStatus } from './contract.ts'
+import type { EgressLog } from './egress-log.ts'
 import { gatewayCa } from './schema.ts'
 
 export { migrations } from '../migrations/index.ts'
 export { startAdmission } from './admission.ts'
+export { createEgressLog, type EgressLog, type EgressPrincipal } from './egress-log.ts'
 export { credentialInject } from './forward.ts'
-export type { ForwardDeps, Forwarded, InjectionInput, UpstreamDestination } from './forward.ts'
+export type {
+  EgressDecision,
+  EgressEvent,
+  ForwardDeps,
+  Forwarded,
+  InjectionInput,
+  UpstreamDestination,
+} from './forward.ts'
 export { startAgentPort, type AgentPort } from './port.ts'
 export { REFUSAL_STATUS, type GatewayRefusal } from './refusal.ts'
 export type { CertificateAuthority } from './ca.ts'
@@ -144,3 +156,29 @@ export function proxyEnv(input: { port: number; sessionToken: string }): Record<
   const proxy = `http://s:${input.sessionToken}@${CONTAINER_HOST}:${input.port}`
   return { HTTPS_PROXY: proxy, https_proxy: proxy, HTTP_PROXY: proxy, http_proxy: proxy }
 }
+
+export function gatewayStatus(input: {
+  admission: AdmissionState
+  agentPort: { host: string; port: number }
+  caPem: string
+}): GatewayStatus {
+  const { admission } = input
+  return {
+    admission: admission.kind,
+    detail:
+      admission.kind === 'unreachable' || admission.kind === 'bind_failed'
+        ? admission.reason.message
+        : null,
+    agentPort: input.agentPort,
+    caFingerprint: new X509Certificate(input.caPem).fingerprint256,
+  }
+}
+
+const os = implement(contract).$context<
+  KurumiContext & { gateway: { status(): GatewayStatus; egressLog: Pick<EgressLog, 'rows'> } }
+>()
+
+export const router = os.router({
+  status: os.status.handler(({ context }) => context.gateway.status()),
+  log: os.log.handler(({ context, input }) => context.gateway.egressLog.rows(input)),
+})

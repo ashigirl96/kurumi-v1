@@ -10,6 +10,11 @@ import {
 } from '@kurumi/account/contract'
 import { contract as agentContract } from '@kurumi/agent/contract'
 import { contract as chatContract, type TerminalEvent } from '@kurumi/chat/contract'
+import {
+  EgressLogRowSchema,
+  contract as gatewayContract,
+  GatewayStatusSchema,
+} from '@kurumi/gateway/contract'
 import { hostContract, type Meta } from '@kurumi/rpc/contract'
 import { createORPCClient, type ClientLink } from '@orpc/client'
 import { RPCLink } from '@orpc/client/fetch'
@@ -24,7 +29,12 @@ import { z } from 'zod'
 
 type ForwardingRouter = { [key: string]: ForwardingRouter | AnyProcedure }
 
-export const cliContract = { agent: agentContract, account: accountContract, ...hostContract }
+export const cliContract = {
+  agent: agentContract,
+  account: accountContract,
+  gateway: gatewayContract,
+  ...hostContract,
+}
 
 export async function main(argv: string[]): Promise<number> {
   const home = process.env.KURUMI_HOME ?? join(homedir(), '.kurumi')
@@ -241,6 +251,32 @@ const renderers: Readonly<Record<string, (output: unknown) => string>> = {
           view.authMode ?? view.kind,
           view.services.join(','),
           view.autoGrant ? 'auto-grant' : '',
+        ]),
+    ),
+  'gateway.status': (output) => {
+    const status = GatewayStatusSchema.parse(output)
+    return alignColumns([
+      ['admission', [status.admission, status.detail ?? ''].join(' ').trim()],
+      ['agent port', `${status.agentPort.host}:${status.agentPort.port}`],
+      ['ca sha256', status.caFingerprint],
+    ])
+  },
+  'gateway.log': (output) =>
+    alignColumns(
+      z
+        .array(EgressLogRowSchema)
+        .parse(output)
+        .map((row) => [
+          row.at.toISOString(),
+          row.account ?? '-',
+          row.service ?? '-',
+          row.decision,
+          String(row.status ?? '-'),
+          `${row.durationMs}ms`,
+          row.method,
+          row.path.startsWith('/') ? `${row.host}${row.path}` : row.path,
+          row.agentGroupId,
+          row.refusal ?? '',
         ]),
     ),
 }

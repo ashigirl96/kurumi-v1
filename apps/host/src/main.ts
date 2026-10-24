@@ -20,13 +20,17 @@ import {
 import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import {
+  createEgressLog,
   credentialInject,
   gatewayContribution,
+  gatewayStatus,
   loadCertificateAuthority,
   proxyEnv,
+  router as gatewayRouter,
   stageCaBundle,
   startAdmission,
   startAgentPort,
+  type EgressLog,
 } from '@kurumi/gateway/server'
 import { hostContract, type Caller } from '@kurumi/rpc/contract'
 import { guardRouter, type Guard, type KurumiContext } from '@kurumi/rpc/server'
@@ -54,6 +58,36 @@ export const initialGuard: Guard = ({ caller, meta }) =>
     ? { kind: 'allow' }
     : { kind: 'deny', reason: 'This procedure is not available to agents' }
 
+export type HostContext = KurumiContext & {
+  db: KurumiDb
+  agentLedger: ReturnType<typeof createAgentLedger>
+  chatLedger: ReturnType<typeof createChatLedger>
+  sessionLedger: ReturnType<typeof createSessionLedger>
+  accountLedger: ReturnType<typeof createAccountLedger>
+  gateway: { status(): ReturnType<typeof gatewayStatus>; egressLog: Pick<EgressLog, 'rows'> }
+  agentPrincipal: AgentPrincipal | null
+  requestSignal?: AbortSignal
+}
+
+const admin = implement(hostContract).$context<HostContext>()
+
+export const hostRouter = guardRouter<HostContext>().router({
+  agent: agentRouter,
+  account: accountRouter,
+  chat: chatRouter,
+  session: sessionRouter,
+  gateway: gatewayRouter,
+  status: admin.status.handler(() => ({ ready: true })),
+  db: {
+    query: admin.db.query.handler(({ context, input }) => {
+      if (context.caller.kind !== 'host') {
+        throw new ORPCError('FORBIDDEN', { message: 'db query requires a host caller' })
+      }
+      return queryReadOnly(context.db.$client, input[0])
+    }),
+  },
+})
+
 export async function startHost(config: HostConfig) {
   process.stdout.write(
     `${JSON.stringify({ kind: 'host.start', pid: process.pid, timeOrigin: performance.timeOrigin, monotonicMs: performance.now() })}\n`,
@@ -67,6 +101,7 @@ export async function startHost(config: HostConfig) {
   let sessions: ReturnType<typeof createSessionLedger> | undefined
   let driver: ReturnType<typeof createDockerDriver> | undefined
   let admission: ReturnType<typeof startAdmission> | undefined
+  let egressLog: EgressLog | undefined
   let socketOwned = false
   let stopped: Promise<void> | undefined
   const socket = join(config.home, 'kurumi.sock')
@@ -80,6 +115,7 @@ export async function startHost(config: HostConfig) {
         listener?.stop(true),
       ])
       try {
+        egressLog?.stop()
         if (socketOwned) rmSync(socket, { force: true })
         database?.$client.close()
       } finally {
@@ -118,6 +154,11 @@ export async function startHost(config: HostConfig) {
     const db = openKurumiDb(join(config.home, 'kurumi.db'))
     database = db
     migrateAll(db, migrations)
+    const requestLog = createEgressLog({
+      db,
+      log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
+    })
+    egressLog = requestLog
     const vaultKey = loadVaultKey(config.home, storedAccounts(db))
     const ca = await loadCertificateAuthority({
       db,
@@ -207,28 +248,16 @@ export async function startHost(config: HostConfig) {
       chatLedger,
       sessionLedger,
       accountLedger,
-    }
-    type HostContext = KurumiContext &
-      typeof ledgers & {
-        agentPrincipal: AgentPrincipal | null
-        requestSignal?: AbortSignal
-      }
-    const admin = implement(hostContract).$context<HostContext>()
-    const router = guardRouter<HostContext>().router({
-      agent: agentRouter,
-      account: accountRouter,
-      chat: chatRouter,
-      session: sessionRouter,
-      status: admin.status.handler(() => ({ ready: true })),
-      db: {
-        query: admin.db.query.handler(({ context, input }) => {
-          if (context.caller.kind !== 'host') {
-            throw new ORPCError('FORBIDDEN', { message: 'db query requires a host caller' })
-          }
-          return queryReadOnly(db.$client, input[0])
-        }),
+      gateway: {
+        status: () =>
+          gatewayStatus({
+            admission: admission?.status().state ?? { kind: 'binding' },
+            agentPort: config.agentPort,
+            caPem: ca.certPem,
+          }),
+        egressLog: requestLog,
       },
-    })
+    }
     const contextFor = (caller: Caller): HostContext => ({
       db,
       caller,
@@ -237,8 +266,8 @@ export async function startHost(config: HostConfig) {
       agentPrincipal: null,
       ...ledgers,
     })
-    const rpc = createRpcFronts(router, contextFor)
-    const agentHandler = new RPCHandler(router)
+    const rpc = createRpcFronts(hostRouter, contextFor)
+    const agentHandler = new RPCHandler(hostRouter)
     const started = sessionLedger.start()
     admission = startAdmission({
       bind: async (probeNonce) => {
@@ -249,7 +278,7 @@ export async function startHost(config: HostConfig) {
           authenticate: (token) => sessionLedger.authenticate(token),
           ca,
           intercepts: isInterceptedHost,
-          forward: { inject: credentialInject(accountLedger) },
+          forward: { inject: credentialInject(accountLedger), log: requestLog.record },
           async rpc(request, response, principal, signal) {
             const result = await agentHandler.handle(request, response, {
               prefix: '/rpc',

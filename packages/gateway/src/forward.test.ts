@@ -2,12 +2,13 @@ import { afterEach, expect, test } from 'bun:test'
 import { createHash, randomBytes } from 'node:crypto'
 import type { LookupAddress } from 'node:dns'
 import { once } from 'node:events'
-import type { IncomingHttpHeaders } from 'node:http'
+import { request as httpRequest, type IncomingHttpHeaders } from 'node:http'
 import { request } from 'node:https'
 import { createServer } from 'node:net'
 import type { TLSSocket } from 'node:tls'
 
 import {
+  accountHandle,
   createAccountLedger,
   isInterceptedHost,
   type AuthMode,
@@ -15,7 +16,13 @@ import {
 } from '@kurumi/account/server'
 import { inMemoryDb, insertAgentGroup } from '@kurumi/account/testing'
 
-import { credentialInject, pinnedLookup, type ConnectTarget, type ForwardDeps } from './forward.ts'
+import {
+  credentialInject,
+  pinnedLookup,
+  type ConnectTarget,
+  type EgressEvent,
+  type ForwardDeps,
+} from './forward.ts'
 import { startAgentPort } from './port.ts'
 import { openTestTunnel, sendTestRequest, startFakeUpstream, startTestGateway } from './testing.ts'
 
@@ -832,4 +839,167 @@ test('a pinned lookup for all addresses answers every checked address', () => {
 
 test('a pinned lookup over no address fails', () => {
   expect(lookupOnce([], false)?.error).toBeInstanceOf(Error)
+})
+
+function connectStatus(port: number, path: string) {
+  return new Promise<number | undefined>((resolve, reject) => {
+    const req = httpRequest({
+      host: '127.0.0.1',
+      port,
+      method: 'CONNECT',
+      path,
+      headers: { 'Proxy-Authorization': `Basic ${Buffer.from('s:test-token').toString('base64')}` },
+    })
+    req.on('error', reject)
+    req.on('connect', (response, socket) => {
+      socket.destroy()
+      resolve(response.statusCode)
+    })
+    req.end()
+  })
+}
+
+async function until(condition: () => boolean) {
+  for (let tries = 0; !condition(); tries++) {
+    if (tries > 200) throw new Error('condition never held')
+    await Bun.sleep(5)
+  }
+}
+
+async function setupLogged(options: { target?: ConnectTarget } = {}) {
+  const events: EgressEvent<CredentialPrincipal>[] = []
+  const credentials = await setupCredentials({ ...options, log: (event) => events.push(event) })
+  return { ...credentials, events }
+}
+
+test('an injected request is logged with its account, service, status, and a path without the query', async () => {
+  const { tunnel, addKey, events } = await setupLogged()
+  addKey('main', secrets.main)
+  const response = await sendTestRequest(tunnel, {
+    path: '/v1/messages?beta=true&key=kurumi:anthropic/main',
+    method: 'POST',
+    headers: { 'x-api-key': groupSelector },
+    body: '{"secret":"request body"}',
+  })
+  expect(response.status).toBe(200)
+  await until(() => events.length === 1)
+  expect(events[0]).toEqual({
+    decision: 'injected',
+    account: accountHandle('anthropic', 'main'),
+    service: 'anthropic-api',
+    principal: { agentGroupId: 'g1' },
+    at: expect.any(Number),
+    host: 'api.anthropic.com',
+    method: 'POST',
+    path: '/v1/messages',
+    status: 200,
+    durationMs: expect.any(Number),
+  })
+})
+
+test('a refused request is logged with its code and service, never the selector it carried', async () => {
+  const { tunnel, addKey, events } = await setupLogged()
+  addKey('main', secrets.main)
+  const written = 'kurumi:anthropic/nobody-granted'
+  const response = await sendTestRequest(tunnel, {
+    path: '/v1/models',
+    headers: { 'x-api-key': written },
+  })
+  expect(response.status).toBe(403)
+  await until(() => events.length === 1)
+  expect(events[0]).toMatchObject({
+    decision: 'refused',
+    refusal: 'account_not_granted',
+    service: 'anthropic-api',
+    status: 403,
+  })
+  expect(JSON.stringify(events)).not.toContain('nobody-granted')
+  expect(JSON.stringify(events)).not.toContain(secrets.main)
+})
+
+test('a request to an intercepted host whose path names no service is logged as passed', async () => {
+  const { tunnel, events } = await setupLogged({
+    target: { host: 'www.googleapis.com', port: 443 },
+  })
+  const response = await sendTestRequest(tunnel, { path: '/drive/v3/files' })
+  expect(response.status).toBe(200)
+  await until(() => events.length === 1)
+  expect(events[0]).toMatchObject({ decision: 'passed', status: 200, path: '/drive/v3/files' })
+  expect(events[0]).not.toHaveProperty('account')
+})
+
+test('an intercepted host on another port is logged as refused with no service', async () => {
+  const { tunnel, events } = await setupLogged({
+    target: { host: 'api.anthropic.com', port: 8443 },
+  })
+  const response = await sendTestRequest(tunnel, { path: '/v1/models' })
+  expect(response.status).toBe(403)
+  await until(() => events.length === 1)
+  expect(events[0]).toMatchObject({
+    decision: 'refused',
+    refusal: 'port_not_allowed',
+    service: null,
+    status: 403,
+  })
+})
+
+test('a passthrough CONNECT to a non-public address is logged as refused', async () => {
+  const events: EgressEvent<{ agentGroupId: string }>[] = []
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: (token) => (token === 'test-token' ? { agentGroupId: 'g1' } : null),
+    intercepts: () => false,
+    resolve: async () => [{ address: '127.0.0.2', family: 4 }],
+    hostAddresses: () => [],
+    forward: {
+      inject: ({ path, headers }) => ({ path, headers }),
+      log: (event) => events.push(event),
+    },
+  })
+  stops.push(gateway.stop)
+  const status = await connectStatus(gateway.port, 'private.test:443')
+  expect(status).toBe(403)
+  expect(events).toEqual([
+    {
+      decision: 'refused',
+      refusal: 'upstream_not_public',
+      service: null,
+      principal: { agentGroupId: 'g1' },
+      at: expect.any(Number),
+      host: 'private.test',
+      method: 'CONNECT',
+      path: 'private.test:443',
+      status: 403,
+      durationMs: expect.any(Number),
+    },
+  ])
+})
+
+test('an injected request names the service of the injection the ledger chose', () => {
+  const handle = accountHandle('anthropic', 'main')
+  const inject = credentialInject({
+    credentialFor: (_principal, egress) => ({
+      kind: 'inject',
+      injection: {
+        service: 'anthropic-api',
+        handle,
+        accountId: 'a1',
+        apply: () => ({ path: egress.path, headers: egress.headers }),
+        toJSON: () => {
+          throw new Error('an injection is never serialized')
+        },
+      },
+    }),
+  })
+  expect(
+    inject({
+      principal: { agentGroupId: 'g1' },
+      host: 'api.anthropic.com',
+      port: 443,
+      method: 'POST',
+      path: '/v1/messages',
+      headers: new Headers(),
+      rawHeaders: [],
+    }),
+  ).toMatchObject({ account: { handle, service: 'anthropic-api' } })
 })
