@@ -1012,6 +1012,14 @@ describe('the slot an Anthropic account is written to', () => {
       [['Anthropic_Beta', sdkOauthBetas]],
       sdkOauthBetas.replace(`,${oauthBeta}`, ''),
     ],
+    [
+      'one beta under both anthropic-beta and anthropic_beta',
+      [
+        ['anthropic-beta', 'claude-code-20250219'],
+        ['anthropic_beta', 'claude-code-20250219'],
+      ],
+      'claude-code-20250219',
+    ],
   ] as const)('an api-key account drops only the OAuth beta after %s', (_client, lines, beta) => {
     addKey({ authMode: 'api-key', autoGrant: true })
 

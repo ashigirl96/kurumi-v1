@@ -186,15 +186,17 @@ function setBetaForAccountMode(
   authMode: AuthMode | null,
 ) {
   const names = [...headers.keys()].filter((name) => headerNameAsRead(name) === header)
-  const listed = names
-    .flatMap((name) => (headers.get(name) ?? '').split(','))
-    .map((beta) => beta.trim())
-    .filter((beta) => beta !== '')
-    .map((beta) => (beta.toLowerCase() === token ? token : beta))
+  const betas = new Set(
+    names
+      .flatMap((name) => (headers.get(name) ?? '').split(','))
+      .map((beta) => beta.trim())
+      .filter((beta) => beta !== '')
+      .map((beta) => (beta.toLowerCase() === token ? token : beta)),
+  )
   for (const name of names) headers.delete(name)
-  const betas =
-    authMode === mode ? [...new Set([...listed, token])] : listed.filter((beta) => beta !== token)
-  if (betas.length > 0) headers.set(header, betas.join(','))
+  if (authMode === mode) betas.add(token)
+  else betas.delete(token)
+  if (betas.size > 0) headers.set(header, [...betas].join(','))
 }
 
 function keyOf(vaultKey: Uint8Array, row: GrantRow): string | null {
