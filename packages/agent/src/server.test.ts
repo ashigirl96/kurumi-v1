@@ -86,6 +86,30 @@ test('a failed insert removes only the newly created empty workspace', () => {
   expect(readdirSync(join(home, 'groups'))).toEqual([])
 })
 
+test('the create hook sees the new group inside the transaction, and its throw rolls the group back', () => {
+  const seen: string[] = []
+  const hooked = createAgentLedger({
+    db,
+    home,
+    onCreate(tx, agentGroupId) {
+      seen.push(
+        ...tx
+          .select()
+          .from(agentGroup)
+          .all()
+          .map(({ id }) => id),
+      )
+      if (agentGroupId === seen[0]) throw new Error('hook refused')
+    },
+  })
+
+  expect(() => hooked.create({ name: 'work' })).toThrow(/hook refused/)
+  expect(seen).toHaveLength(1)
+  expect(seen[0]).toMatch(/^ag-/)
+  expect(ledger.list()).toEqual([])
+  expect(readdirSync(join(home, 'groups'))).toEqual([])
+})
+
 test.each(['../escape', '/absolute', '.', '..', 'nested/folder', 'back\\slash', ''])(
   'folder %j cannot escape the groups directory',
   (folder) => {

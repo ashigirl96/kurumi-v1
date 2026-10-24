@@ -6,6 +6,7 @@
   },
   "type": "module",
   "dependencies": {
+    "@kurumi/account": "workspace:*",
     "@kurumi/agent": "workspace:*",
     "@kurumi/chat": "workspace:*",
     "@kurumi/rpc": "workspace:*",

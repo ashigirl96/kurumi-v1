@@ -1,0 +1,326 @@
+{
+  "version": "6",
+  "dialect": "sqlite",
+  "id": "c3a6ddc5-13e0-4de0-9c2c-c4d0d12548cc",
+  "prevId": "bfdb74e0-f7e7-48bc-a67c-8a1e01d1f855",
+  "tables": {
+    "account": {
+      "name": "account",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "vendor": {
+          "name": "vendor",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "label": {
+          "name": "label",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "subject": {
+          "name": "subject",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "auth_mode": {
+          "name": "auth_mode",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "services": {
+          "name": "services",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "material": {
+          "name": "material",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "access_expires_at": {
+          "name": "access_expires_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "auto_grant": {
+          "name": "auto_grant",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "account_vendor_label": {
+          "name": "account_vendor_label",
+          "columns": [
+            "vendor",
+            "label"
+          ],
+          "isUnique": true
+        },
+        "account_vendor_subject": {
+          "name": "account_vendor_subject",
+          "columns": [
+            "vendor",
+            "subject"
+          ],
+          "isUnique": true
+        },
+        "account_id_vendor": {
+          "name": "account_id_vendor",
+          "columns": [
+            "id",
+            "vendor"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "account_auth_mode_of_vendor": {
+          "name": "account_auth_mode_of_vendor",
+          "value": "((vendor = 'anthropic' AND auth_mode IS NOT NULL AND auth_mode IN ('api-key','oauth-token')) OR (vendor = 'google' AND auth_mode IS NULL) OR (vendor = 'notion' AND auth_mode IS NULL) OR (vendor = 'github' AND auth_mode IS NULL))"
+        }
+      }
+    },
+    "account_grant": {
+      "name": "account_grant",
+      "columns": {
+        "agent_group_id": {
+          "name": "agent_group_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "account_id": {
+          "name": "account_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "vendor": {
+          "name": "vendor",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "service": {
+          "name": "service",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "granted_by": {
+          "name": "granted_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "granted_at": {
+          "name": "granted_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "account_grant_group_service": {
+          "name": "account_grant_group_service",
+          "columns": [
+            "agent_group_id",
+            "service"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "account_grant_agent_group_id_agent_group_id_fk": {
+          "name": "account_grant_agent_group_id_agent_group_id_fk",
+          "tableFrom": "account_grant",
+          "tableTo": "agent_group",
+          "columnsFrom": [
+            "agent_group_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "account_grant_account_id_vendor_account_id_vendor_fk": {
+          "name": "account_grant_account_id_vendor_account_id_vendor_fk",
+          "tableFrom": "account_grant",
+          "tableTo": "account",
+          "columnsFrom": [
+            "account_id",
+            "vendor"
+          ],
+          "columnsTo": [
+            "id",
+            "vendor"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "account_grant_agent_group_id_account_id_service_pk": {
+          "columns": [
+            "agent_group_id",
+            "account_id",
+            "service"
+          ],
+          "name": "account_grant_agent_group_id_account_id_service_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "account_grant_service_of_vendor": {
+          "name": "account_grant_service_of_vendor",
+          "value": "((vendor = 'anthropic' AND service IN ('anthropic-api')) OR (vendor = 'google' AND service IN ('gmail','google-calendar')) OR (vendor = 'notion' AND service IN ('notion')) OR (vendor = 'github' AND service IN ('github')))"
+        }
+      }
+    },
+    "default_account": {
+      "name": "default_account",
+      "columns": {
+        "agent_group_id": {
+          "name": "agent_group_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "service": {
+          "name": "service",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "account_id": {
+          "name": "account_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "vendor": {
+          "name": "vendor",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "default_account_agent_group_id_account_id_service_account_grant_agent_group_id_account_id_service_fk": {
+          "name": "default_account_agent_group_id_account_id_service_account_grant_agent_group_id_account_id_service_fk",
+          "tableFrom": "default_account",
+          "tableTo": "account_grant",
+          "columnsFrom": [
+            "agent_group_id",
+            "account_id",
+            "service"
+          ],
+          "columnsTo": [
+            "agent_group_id",
+            "account_id",
+            "service"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "default_account_account_id_vendor_account_id_vendor_fk": {
+          "name": "default_account_account_id_vendor_account_id_vendor_fk",
+          "tableFrom": "default_account",
+          "tableTo": "account",
+          "columnsFrom": [
+            "account_id",
+            "vendor"
+          ],
+          "columnsTo": [
+            "id",
+            "vendor"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "default_account_agent_group_id_service_pk": {
+          "columns": [
+            "agent_group_id",
+            "service"
+          ],
+          "name": "default_account_agent_group_id_service_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    }
+  },
+  "views": {},
+  "enums": {},
+  "_meta": {
+    "schemas": {},
+    "tables": {},
+    "columns": {}
+  },
+  "internal": {
+    "indexes": {}
+  }
+}

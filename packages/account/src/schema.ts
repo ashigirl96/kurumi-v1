@@ -12,7 +12,13 @@ import {
   uniqueIndex,
 } from 'drizzle-orm/sqlite-core'
 
-import { serviceBelongsToVendorSql, type ServiceId, type VendorId } from './catalog.ts'
+import {
+  authModeOfVendorSql,
+  serviceBelongsToVendorSql,
+  type AuthMode,
+  type ServiceId,
+  type VendorId,
+} from './catalog.ts'
 
 export const account = sqliteTable(
   'account',
@@ -22,6 +28,7 @@ export const account = sqliteTable(
     label: text('label').notNull(),
     subject: text('subject'),
     kind: text('kind', { enum: ['oauth', 'key'] }).notNull(),
+    authMode: text('auth_mode').$type<AuthMode>(),
     services: text('services', { mode: 'json' }).$type<ServiceId[]>().notNull(),
     material: blob('material', { mode: 'buffer' }).notNull(),
     accessExpiresAt: integer('access_expires_at', { mode: 'timestamp_ms' }),
@@ -34,6 +41,7 @@ export const account = sqliteTable(
     uniqueIndex('account_vendor_subject').on(t.vendor, t.subject),
     // SQLite requires a unique index on the parent columns of a composite foreign key.
     uniqueIndex('account_id_vendor').on(t.id, t.vendor),
+    check('account_auth_mode_of_vendor', sql.raw(authModeOfVendorSql('auth_mode', 'vendor'))),
   ],
 )
 

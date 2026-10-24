@@ -19,6 +19,7 @@
         "kurumi": "./src/main.ts",
       },
       "dependencies": {
+        "@kurumi/account": "workspace:*",
         "@kurumi/agent": "workspace:*",
         "@kurumi/chat": "workspace:*",
         "@kurumi/rpc": "workspace:*",
@@ -75,7 +76,9 @@
       "dependencies": {
         "@kurumi/agent": "workspace:*",
         "@kurumi/rpc": "workspace:*",
+        "@orpc/server": "catalog:",
         "drizzle-orm": "catalog:",
+        "zod": "catalog:",
       },
       "devDependencies": {
         "drizzle-kit": "catalog:",

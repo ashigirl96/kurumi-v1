@@ -2,8 +2,14 @@ import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 
 import {
+  authModeIds,
+  authModeOfVendorSql,
+  authModesOf,
+  defaultAuthModeOf,
   catalog,
   createServiceFinder,
+  keyVendorIds,
+  placementOf,
   defaultSelectorShape,
   interceptedHosts,
   isInterceptedHost,
@@ -14,6 +20,7 @@ import {
   serviceIds,
   serviceSpec,
   servicesCovered,
+  servicesOf,
   vendorIds,
   vendorOf,
   type HostRule,
@@ -455,7 +462,8 @@ describe('serviceBelongsToVendorSql', () => {
   })
 
   test('the ids it writes into SQL are plain words', () => {
-    for (const id of [...vendorIds, ...serviceIds]) expect(id).toMatch(/^[a-z][a-z0-9-]*$/)
+    for (const id of [...vendorIds, ...serviceIds, ...authModeIds])
+      expect(id).toMatch(/^[a-z][a-z0-9-]*$/)
   })
 
   test('rejects a service of another vendor and an unknown service', () => {
@@ -471,6 +479,82 @@ describe('serviceBelongsToVendorSql', () => {
       expect(() => db.run('INSERT INTO account_grant VALUES (?, ?)', [vendor, service])).toThrow(
         /CHECK/,
       )
+    }
+  })
+})
+
+describe('auth modes', () => {
+  test('anthropic takes an api key or an oauth token and defaults to the api key; other key vendors take none', () => {
+    expect(authModesOf('anthropic')).toEqual(['api-key', 'oauth-token'])
+    expect(defaultAuthModeOf('anthropic')).toBe('api-key')
+    expect(defaultAuthModeOf('github')).toBeNull()
+    for (const vendor of vendorIds) {
+      expect(defaultAuthModeOf(vendor) === null).toBe(authModesOf(vendor).length === 0)
+    }
+    expect(authModesOf('github')).toEqual([])
+    expect(authModesOf('google')).toEqual([])
+    expect<readonly string[]>(keyVendorIds).toEqual(['anthropic', 'github'])
+    expect<readonly string[]>(authModeIds).toEqual(['api-key', 'oauth-token'])
+  })
+
+  test('both modes stay the one anthropic-api service', () => {
+    expect(servicesOf('anthropic')).toEqual(['anthropic-api'])
+    expect(servicesOf('google')).toEqual(['gmail', 'google-calendar'])
+  })
+
+  test('an oauth token goes in Authorization: Bearer and CLAUDE_CODE_OAUTH_TOKEN', () => {
+    const placement = placementOf('anthropic-api', 'oauth-token')
+
+    expect(placement.slot).toEqual({ kind: 'bearer' })
+    expect(placement.containerEnv?.('sel')).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'sel' })
+  })
+
+  test.each(['api-key', null] as const)(
+    'an api key (auth mode %p) goes in x-api-key and ANTHROPIC_API_KEY',
+    (mode) => {
+      const placement = placementOf('anthropic-api', mode)
+
+      expect(placement.slot).toEqual({ kind: 'header', header: 'x-api-key' })
+      expect(placement.containerEnv?.('sel')).toEqual({ ANTHROPIC_API_KEY: 'sel' })
+    },
+  )
+
+  test('a service of a vendor without modes keeps its own placement', () => {
+    expect(placementOf('github', null).slot).toEqual({ kind: 'basic' })
+    expect(() => placementOf('github', 'api-key')).toThrow('github has no auth mode api-key')
+  })
+})
+
+const accountTable = () => {
+  const db = new Database(':memory:')
+  db.run(
+    `CREATE TABLE account (vendor TEXT NOT NULL, auth_mode TEXT, CHECK (${authModeOfVendorSql('auth_mode', 'vendor')}))`,
+  )
+  return db
+}
+
+describe('authModeOfVendorSql', () => {
+  test('accepts each mode of a vendor with modes and NULL for a vendor without', () => {
+    const db = accountTable()
+
+    for (const vendor of vendorIds) {
+      const modes = authModesOf(vendor)
+      for (const mode of modes.length > 0 ? modes : [null]) {
+        expect(() => db.run('INSERT INTO account VALUES (?, ?)', [vendor, mode])).not.toThrow()
+      }
+    }
+  })
+
+  test('rejects a missing or unknown mode for anthropic and any mode for a vendor without modes', () => {
+    const db = accountTable()
+
+    for (const [vendor, mode] of [
+      ['anthropic', null],
+      ['anthropic', 'password'],
+      ['github', 'api-key'],
+      ['google', 'oauth-token'],
+    ] as const) {
+      expect(() => db.run('INSERT INTO account VALUES (?, ?)', [vendor, mode])).toThrow(/CHECK/)
     }
   })
 })

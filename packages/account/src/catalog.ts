@@ -9,6 +9,11 @@ export type HostRule = {
   pathPrefix?: string
 }
 
+export type CredentialPlacement = Readonly<{
+  slot: CredentialSlot
+  containerEnv?: (selector: string) => Readonly<Record<string, string>>
+}>
+
 export type ServiceSpec = {
   displayName: string
   hosts: readonly HostRule[]
@@ -122,15 +127,36 @@ function googleIdentify(tokens: TokenResponse): Identity {
 
 export type VendorSpec = {
   displayName: string
-  connect: { kind: 'oauth'; oauth: OAuthSpec } | { kind: 'key' }
+  connect:
+    | { kind: 'oauth'; oauth: OAuthSpec }
+    | {
+        kind: 'key'
+        authModes?: Readonly<Record<string, CredentialPlacement>>
+        defaultAuthMode?: string
+      }
   services: Readonly<Record<string, ServiceSpec>>
   selectorShape?: SelectorShape
 }
 
+const anthropicApiKey = {
+  slot: { kind: 'header', header: 'x-api-key' },
+  containerEnv: (selector: string) => ({ ANTHROPIC_API_KEY: selector }),
+} as const satisfies CredentialPlacement
+
 export const catalog = {
   anthropic: {
     displayName: 'Anthropic',
-    connect: { kind: 'key' },
+    connect: {
+      kind: 'key',
+      defaultAuthMode: 'api-key',
+      authModes: {
+        'api-key': anthropicApiKey,
+        'oauth-token': {
+          slot: { kind: 'bearer' },
+          containerEnv: (selector: string) => ({ CLAUDE_CODE_OAUTH_TOKEN: selector }),
+        },
+      },
+    },
     selectorShape: {
       format: (handle) => `${anthropicPrefix}${Buffer.from(handle).toString('base64url')}`,
       parse: (value) => parseAnthropicForm(value) ?? parseDefaultForm(value),
@@ -139,9 +165,8 @@ export const catalog = {
       'anthropic-api': {
         displayName: 'Anthropic API',
         hosts: [{ host: 'api.anthropic.com' }],
-        slot: { kind: 'header', header: 'x-api-key' },
         scopes: [],
-        containerEnv: (selector) => ({ ANTHROPIC_API_KEY: selector }),
+        ...anthropicApiKey,
       },
     },
   },
@@ -250,12 +275,60 @@ const rowOf = Object.fromEntries(serviceRows.map((row) => [row.service, row])) a
 export const vendorIds = Object.keys(catalog) as [VendorId, ...VendorId[]]
 export const serviceIds = serviceRows.map(({ service }) => service) as [ServiceId, ...ServiceId[]]
 
+type ModesOf<C> = C extends { kind: 'key'; authModes: infer M } ? keyof M & string : never
+export type AuthMode = { [V in VendorId]: ModesOf<Catalog[V]['connect']> }[VendorId]
+export type KeyVendorId = {
+  [V in VendorId]: Catalog[V]['connect']['kind'] extends 'key' ? V : never
+}[VendorId]
+
+const isKeyVendor = (vendor: VendorId): vendor is KeyVendorId => {
+  const spec: VendorSpec = catalog[vendor]
+  return spec.connect.kind === 'key'
+}
+
+function nonEmpty<T>(items: readonly T[]): [T, ...T[]] {
+  const [first, ...rest] = items
+  if (first === undefined) throw new Error('the catalog must list at least one')
+  return [first, ...rest]
+}
+
+function placementsOf(vendor: VendorId): Readonly<Partial<Record<AuthMode, CredentialPlacement>>> {
+  const { connect }: VendorSpec = catalog[vendor]
+  return connect.kind === 'key' ? (connect.authModes ?? {}) : {}
+}
+
+export const keyVendorIds = nonEmpty(vendorIds.filter(isKeyVendor))
+export const authModeIds = nonEmpty([...new Set(vendorIds.flatMap(authModesOf))])
+
 export function vendorOf(service: ServiceId): VendorId {
   return rowOf[service].vendor
 }
 
 export function serviceSpec(service: ServiceId): ServiceSpec {
   return rowOf[service].spec
+}
+
+export function authModesOf(vendor: VendorId): readonly AuthMode[] {
+  return Object.keys(placementsOf(vendor)) as AuthMode[]
+}
+
+export function defaultAuthModeOf(vendor: VendorId): AuthMode | null {
+  const { connect }: VendorSpec = catalog[vendor]
+  const mode = connect.kind === 'key' ? connect.defaultAuthMode : undefined
+  return authModesOf(vendor).find((known) => known === mode) ?? null
+}
+
+export function servicesOf(vendor: VendorId): ServiceId[] {
+  return serviceRows.filter((row) => row.vendor === vendor).map(({ service }) => service)
+}
+
+export function placementOf(service: ServiceId, authMode: AuthMode | null): CredentialPlacement {
+  const spec = serviceSpec(service)
+  if (authMode === null) return spec
+  const vendor = vendorOf(service)
+  const placement = placementsOf(vendor)[authMode]
+  if (!placement) throw new Error(`${vendor} has no auth mode ${authMode}`)
+  return placement
 }
 
 export function selectorShapeOf(vendor: VendorId): SelectorShape {
@@ -361,6 +434,20 @@ export function serviceBelongsToVendorSql(serviceColumn: string, vendorColumn: s
       .map((s) => `'${s}'`)
       .join(',')
     return `(${vendorColumn} = '${vendor}' AND ${serviceColumn} IN (${services}))`
+  })
+  return `(${perVendor.join(' OR ')})`
+}
+
+export function authModeOfVendorSql(authModeColumn: string, vendorColumn: string): string {
+  const perVendor = vendorIds.map((vendor) => {
+    const modes = authModesOf(vendor)
+      .map((mode) => `'${mode}'`)
+      .join(',')
+    const allowed =
+      modes === ''
+        ? `${authModeColumn} IS NULL`
+        : `${authModeColumn} IS NOT NULL AND ${authModeColumn} IN (${modes})`
+    return `(${vendorColumn} = '${vendor}' AND ${allowed})`
   })
   return `(${perVendor.join(' OR ')})`
 }

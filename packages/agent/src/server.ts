@@ -1,7 +1,7 @@
 import { mkdirSync, rmdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
-import { transaction, type Db, type KurumiContext } from '@kurumi/rpc/server'
+import { transaction, type Db, type KurumiContext, type Tx } from '@kurumi/rpc/server'
 import { implement, ORPCError } from '@orpc/server'
 import { eq } from 'drizzle-orm'
 import type { z } from 'zod'
@@ -19,7 +19,16 @@ export type AgentLedger = {
   get(agentGroupId: string): AgentGroup | undefined
 }
 
-export function createAgentLedger({ db, home }: { db: Db; home: string }): AgentLedger {
+export function createAgentLedger({
+  db,
+  home,
+  onCreate,
+}: {
+  db: Db
+  home: string
+  /** Runs in the create transaction, so a throw rolls the new group back. */
+  onCreate?: (tx: Tx, agentGroupId: string) => void
+}): AgentLedger {
   const groups = resolve(home, 'groups')
   const workspace = (group: AgentGroup): AgentGroup => ({
     ...group,
@@ -50,6 +59,7 @@ export function createAgentLedger({ db, home }: { db: Db; home: string }): Agent
       try {
         transaction(db, (tx) => {
           tx.insert(agentGroup).values(group).run()
+          onCreate?.(tx, group.id)
         })
       } catch (error) {
         rmdirSync(path)

@@ -1,4 +1,6 @@
+import { Database } from 'bun:sqlite'
 import { afterEach, expect, test } from 'bun:test'
+import { randomBytes } from 'node:crypto'
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,8 +16,8 @@ const homes: string[] = []
 const children: Bun.Subprocess[] = []
 const main = join(import.meta.dir, 'main.ts')
 
-function homeForTest(): string {
-  const home = mkdtempSync(join(tmpdir(), 'kurumi-host-'))
+function homeForTest(prefix = 'kurumi-host-'): string {
+  const home = mkdtempSync(join(tmpdir(), prefix))
   homes.push(home)
   return home
 }
@@ -319,3 +321,96 @@ test('the temporary host guard allows host and human callers and only agent chan
     expect(initialGuard({ ...common, caller, meta }).kind).toBe('deny')
   }
 })
+
+async function cli(home: string, args: string[], stdin = ''): Promise<void> {
+  const child = Bun.spawn(
+    [process.execPath, join(import.meta.dir, '../../cli/src/main.ts'), ...args],
+    {
+      env: { ...process.env, KURUMI_HOME: home },
+      stdin: new Blob([stdin]),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  )
+  expect({
+    args,
+    exit: await child.exited,
+    stderr: await new Response(child.stderr).text(),
+  }).toEqual({ args, exit: 0, stderr: '' })
+}
+
+async function homeWithGrantedAccount(prefix?: string): Promise<{ home: string; key: Buffer }> {
+  const home = homeForTest(prefix)
+  const first = spawnHost(home)
+  await waitForHost(home, first)
+  await cli(home, ['agent', 'create', '--name', 'work'])
+  await cli(
+    home,
+    ['account', 'add-key', 'anthropic', '--label', 'main', '--auto-grant'],
+    'sk-ant-one\n',
+  )
+  first.kill('SIGTERM')
+  expect(await first.exited).toBe(0)
+  const key = readFileSync(join(home, 'vault.key'))
+  return { home, key }
+}
+
+test('a host whose kurumi.db holds accounts refuses to start without vault.key and writes no new key', async () => {
+  const { home } = await homeWithGrantedAccount()
+  rmSync(join(home, 'vault.key'))
+
+  const second = spawnHost(home)
+
+  expect(await second.exited).toBe(1)
+  expect(await new Response(second.stderr).text()).toContain(
+    `${join(home, 'vault.key')} is missing, but ${join(home, 'kurumi.db')} holds 1 account sealed with it`,
+  )
+  expect(existsSync(join(home, 'vault.key'))).toBe(false)
+}, 5000)
+
+test('a host refuses to start with a vault.key that did not seal its accounts', async () => {
+  const { home } = await homeWithGrantedAccount()
+  writeFileSync(join(home, 'vault.key'), randomBytes(32))
+
+  const second = spawnHost(home)
+
+  expect(await second.exited).toBe(1)
+  expect(await new Response(second.stderr).text()).toContain(
+    `${join(home, 'vault.key')} does not match the key that sealed the 1 account in ${join(home, 'kurumi.db')}`,
+  )
+}, 5000)
+
+test('the start-over command a missing vault.key prints, run as printed, lets the host start with a new key', async () => {
+  const { home, key } = await homeWithGrantedAccount("kurumi host's ")
+  rmSync(join(home, 'vault.key'))
+  const refused = spawnHost(home)
+  expect(await refused.exited).toBe(1)
+  const printed = / run (sqlite3 .+;') \(or delete /.exec(
+    await new Response(refused.stderr).text(),
+  )?.[1]
+  if (!printed) throw new Error('the refusal prints no sqlite3 command')
+
+  expect(Bun.spawnSync(['sh', '-c', printed]).exitCode).toBe(0)
+  const host = spawnHost(home)
+  await waitForHost(home, host)
+  host.kill('SIGTERM')
+  expect(await host.exited).toBe(0)
+
+  expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(false)
+  const after = new Database(join(home, 'kurumi.db'), { readonly: true })
+  expect(after.query('SELECT count(*) AS n FROM account').get()).toEqual({ n: 0 })
+  expect(after.query('SELECT count(*) AS n FROM account_grant').get()).toEqual({ n: 0 })
+  after.close()
+}, 10000)
+
+test('a FIFO at vault.key is refused as not a regular file instead of blocking start', async () => {
+  const home = homeForTest()
+  expect(Bun.spawnSync(['mkfifo', '-m', '600', join(home, 'vault.key')]).exitCode).toBe(0)
+
+  const host = spawnHost(home)
+
+  expect(await host.exited).toBe(1)
+  expect(await new Response(host.stderr).text()).toContain(
+    `${join(home, 'vault.key')} is not a regular file`,
+  )
+}, 5000)
