@@ -10,6 +10,8 @@ const result = await Bun.build({
   outdir,
   naming: 'runner.js',
   target: 'bun',
+  // container/Dockerfile installs the SDK with the native Claude Code binary it spawns.
+  external: ['@anthropic-ai/claude-agent-sdk'],
 })
 if (!result.success) throw new AggregateError(result.logs, 'Runner build failed')
 process.stdout.write(`${join(outdir, 'runner.js')}\n`)

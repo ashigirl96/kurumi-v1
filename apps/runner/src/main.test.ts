@@ -1,154 +1,23 @@
-import { Database } from 'bun:sqlite'
-import { expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { afterEach, expect, test } from 'bun:test'
 
-import {
-  createAgentLedger,
-  migrations as agentMigrations,
-  router as agentRouter,
-} from '@kurumi/agent/server'
-import { createChatLedger, migrations as chatMigrations } from '@kurumi/chat/server'
-import { startAgentPort } from '@kurumi/gateway/server'
-import { guardRouter, type KurumiContext } from '@kurumi/rpc/server'
 import { inboundMessage, outboundMessage } from '@kurumi/session/schema'
-import { createSessionLedger, migrations, router } from '@kurumi/session/server'
-import { createFakeDriver } from '@kurumi/session/testing'
-import { RPCHandler } from '@orpc/server/node'
-import { drizzle } from 'drizzle-orm/bun-sqlite'
-import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 
 import { runRunner } from './main.ts'
+import { sdk, startHost } from './testing.ts'
 
-async function fixture() {
-  const home = mkdtempSync(join(tmpdir(), 'kurumi-runner-'))
-  const sqlite = new Database(':memory:')
-  sqlite.run('PRAGMA foreign_keys = ON')
-  const db = drizzle(sqlite)
-  for (const entry of [agentMigrations, chatMigrations, migrations]) {
-    migrate(db, { migrationsFolder: entry.folder, migrationsTable: entry.table })
-  }
-  const agentLedger = createAgentLedger({ db, home })
-  const agent = agentLedger.create({ name: 'work' })
-  const driver = createFakeDriver()
-  const chatLedger = createChatLedger({
-    db,
-    agentLedger,
-    sink: () => ({ onInbound: (event) => sessionLedger.routeInbound(event) }),
-  })
-  const sessionLedger = createSessionLedger({
-    db,
-    agentLedger,
-    chatLedger,
-    runtime: {
-      driver,
-      image: 'test',
-      egress: {
-        admission: () => ({ open: true }),
-        contribution: () => ({ env: {}, mounts: [], network: { kind: 'default' } }),
-      },
-    },
-  })
-  type Context = KurumiContext & {
-    agentLedger: typeof agentLedger
-    sessionLedger: typeof sessionLedger
-    agentPrincipal: ReturnType<typeof sessionLedger.authenticate>
-    requestSignal: AbortSignal
-  }
-  const handler = new RPCHandler(
-    guardRouter<Context>().router({ session: router, agent: agentRouter }),
-  )
-  const port = await startAgentPort({
-    bind: { host: '127.0.0.1', port: 0 },
-    authenticate: (token) => sessionLedger.authenticate(token),
-    intercepts: () => false,
-    forward: { inject: ({ path, headers }) => ({ path, headers }) },
-    async rpc(request, response, principal, signal) {
-      const result = await handler.handle(request, response, {
-        prefix: '/rpc',
-        context: {
-          db,
-          agentLedger,
-          sessionLedger,
-          caller: { kind: 'agent', ...principal },
-          agentPrincipal: principal,
-          requestSignal: signal,
-          grant: null,
-          guard: ({ meta }) =>
-            meta.agent === 'channel' ? { kind: 'allow' } : { kind: 'deny', reason: 'channel only' },
-        },
-      })
-      if (!result.matched) response.writeHead(404).end()
-    },
-  })
-  let unavailable = false
-  let losePostAck = false
-  const server = Bun.serve({
-    port: 0,
-    async fetch(request) {
-      if (unavailable) return new Response('restarting', { status: 503 })
-      const response = await fetch(
-        `http://127.0.0.1:${port.port}${new URL(request.url).pathname}`,
-        {
-          method: request.method,
-          headers: request.headers,
-          body: request.body,
-          signal: request.signal,
-        },
-      )
-      if (losePostAck && new URL(request.url).pathname.endsWith('/post')) {
-        losePostAck = false
-        await response.body?.cancel()
-        return new Response('lost acknowledgment', { status: 503 })
-      }
-      return response
-    },
-  })
-  const input = chatLedger.terminal({ agentGroupId: agent.id, text: 'hello', follow: true })
-  const queued = await input.next()
-  expect(queued.value).toMatchObject({ kind: 'queued' })
-  const token = driver.runs[0]?.env.KURUMI_TOKEN
-  if (!token) throw new Error('missing runner token')
-  return {
-    db,
-    url: server.url.href.replace(/\/$/, ''),
-    token,
-    input,
-    revoke: () => driver.kill(driver.runs[0]?.containerId ?? '', 0),
-    setUnavailable(value: boolean) {
-      unavailable = value
-    },
-    losePostAck() {
-      losePostAck = true
-    },
-    async send(text: string) {
-      const events = chatLedger.terminal({ agentGroupId: agent.id, text, follow: false })
-      await events.next()
-      await events.return()
-    },
-    async stop() {
-      chatLedger.stop()
-      await sessionLedger.stop()
-      await server.stop(true)
-      await port.stop()
-      sqlite.close()
-      rmSync(home, { recursive: true, force: true })
-    },
-  }
-}
+afterEach(() => sdk.reset())
 
-test('runner echoes through an in-process host and completes ten lines in order', async () => {
-  const host = await fixture()
+test('runner answers through an in-process host and completes ten lines in order', async () => {
+  const host = await startHost()
   const controller = new AbortController()
   const running = runRunner({ url: host.url, token: host.token, signal: controller.signal })
   try {
-    expect((await host.input.next()).value).toMatchObject({ kind: 'reply', text: 'echo: hello' })
+    expect(await host.reply()).toBe('model heard: hello')
     for (let i = 0; i < 10; i++) await host.send(`line ${i}`)
     const replies = []
-    for (let i = 0; i < 10; i++) replies.push((await host.input.next()).value)
-    expect(replies.map((reply) => (reply && 'text' in reply ? reply.text : null))).toEqual(
-      Array.from({ length: 10 }, (_, i) => `echo: line ${i}`),
+    for (let i = 0; i < 10; i++) replies.push(await host.reply())
+    expect(replies.map((reply) => reply?.split(' | ').at(-1))).toEqual(
+      Array.from({ length: 10 }, (_, i) => `line ${i}`),
     )
     const deadline = performance.now() + 1000
     while (
@@ -169,7 +38,7 @@ test('runner echoes through an in-process host and completes ten lines in order'
 })
 
 test('Agent Port refuses wrong and revoked tokens, cross-session input, and agent.list', async () => {
-  const host = await fixture()
+  const host = await startHost()
   const request = (path: string, token: string, input: unknown) =>
     fetch(`${host.url}/rpc/${path}`, {
       method: 'POST',
@@ -194,7 +63,7 @@ test('Agent Port refuses wrong and revoked tokens, cross-session input, and agen
 })
 
 test('runner reconnects and retries an unacknowledged post without a second delivery', async () => {
-  const host = await fixture()
+  const host = await startHost()
   const controller = new AbortController()
   host.setUnavailable(true)
   host.losePostAck()
@@ -211,13 +80,10 @@ test('runner reconnects and retries an unacknowledged post without a second deli
     },
   })
   try {
-    expect((await host.input.next()).value).toMatchObject({ kind: 'reply', text: 'echo: hello' })
+    expect(await host.reply()).toBe('model heard: hello')
     await retried.promise
     await host.send('after reconnect')
-    expect((await host.input.next()).value).toMatchObject({
-      kind: 'reply',
-      text: 'echo: after reconnect',
-    })
+    expect(await host.reply()).toBe('model heard: hello | after reconnect')
     expect(host.db.select().from(outboundMessage).all()).toHaveLength(2)
   } finally {
     controller.abort()

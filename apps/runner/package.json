@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "catalog:",
     "@kurumi/session": "workspace:*",
     "@orpc/client": "catalog:",
     "@orpc/contract": "catalog:"
