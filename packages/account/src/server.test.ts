@@ -719,6 +719,9 @@ const sdkApiKeyBetas =
 const sdkOauthBetas =
   'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11'
 
+const betaLines = (headers: Record<string, string>) =>
+  Object.entries(headers).filter(([name]) => name.replaceAll('_', '-') === 'anthropic-beta')
+
 const idOf = (label: string) => accountRow(label)?.id ?? ''
 
 describe('the credential for a Google request', () => {
@@ -965,12 +968,28 @@ describe('the slot an Anthropic account is written to', () => {
       ],
       `claude-code-20250219,${oauthBeta}`,
     ],
+    ['the OAuth beta in upper case', [['anthropic-beta', 'OAUTH-2025-04-20']], oauthBeta],
+    [
+      'betas under anthropic_beta',
+      [['Anthropic_Beta', 'claude-code-20250219']],
+      `claude-code-20250219,${oauthBeta}`,
+    ],
+    [
+      'the OAuth beta under anthropic_beta beside anthropic-beta',
+      [
+        ['anthropic-beta', 'claude-code-20250219'],
+        ['anthropic_beta', oauthBeta],
+      ],
+      `claude-code-20250219,${oauthBeta}`,
+    ],
   ] as const)(
     'an oauth-token account lists the OAuth beta once after %s',
     (_client, lines, beta) => {
       addKey({ authMode: 'oauth-token', autoGrant: true })
 
-      expect(sent(decide('g1', anthropicApi(lines))).headers['anthropic-beta']).toBe(beta)
+      expect(betaLines(sent(decide('g1', anthropicApi(lines))).headers)).toEqual([
+        ['anthropic-beta', beta],
+      ])
     },
   )
 
@@ -982,10 +1001,23 @@ describe('the slot an Anthropic account is written to', () => {
       sdkOauthBetas.replace(`,${oauthBeta}`, ''),
     ],
     ['only the OAuth beta', [['anthropic-beta', oauthBeta]], undefined],
+    [
+      'the OAuth beta in upper case',
+      [['anthropic-beta', 'claude-code-20250219,OAuth-2025-04-20']],
+      'claude-code-20250219',
+    ],
+    ['only the OAuth beta under anthropic_beta', [['anthropic_beta', oauthBeta]], undefined],
+    [
+      'betas under anthropic_beta',
+      [['Anthropic_Beta', sdkOauthBetas]],
+      sdkOauthBetas.replace(`,${oauthBeta}`, ''),
+    ],
   ] as const)('an api-key account drops only the OAuth beta after %s', (_client, lines, beta) => {
     addKey({ authMode: 'api-key', autoGrant: true })
 
-    expect(sent(decide('g1', anthropicApi(lines))).headers['anthropic-beta']).toBe(beta)
+    expect(betaLines(sent(decide('g1', anthropicApi(lines))).headers)).toEqual(
+      beta === undefined ? [] : [['anthropic-beta', beta]],
+    )
   })
 
   test('a selector kurumi cannot read is refused with the selectors the group may write', () => {
