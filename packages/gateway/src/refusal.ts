@@ -6,6 +6,7 @@ export type HoldRefusal =
   | { code: 'approval_pending'; service: ServiceId; approvalId: string }
   | { code: 'approval_denied'; service: ServiceId; approvalId: string }
   | { code: 'body_too_large'; service: ServiceId; limit: number }
+  | { code: 'body_timeout'; service: ServiceId; limitMs: number }
   | { code: 'approval_limit'; service: ServiceId; waiting: 'undecided'; limit: number }
   | {
       code: 'approval_limit'
@@ -34,6 +35,7 @@ export const REFUSAL_STATUS = {
   approval_pending: 403,
   approval_denied: 403,
   body_too_large: 413,
+  body_timeout: 408,
   approval_limit: 429,
 } as const satisfies Record<GatewayRefusal['code'], number>
 
@@ -69,6 +71,8 @@ export function nextStep(refusal: GatewayRefusal): string {
       return `a person denied ${refusal.approvalId}; do not send this request again unless the user asks for it`
     case 'body_too_large':
       return `a rule holds this request for a person to read, and kurumi holds at most ${refusal.limit} bytes; send a smaller body`
+    case 'body_timeout':
+      return `a rule holds this request for a person to read, and kurumi waits at most ${refusal.limitMs / 1000} s for its body; send the whole body at once`
     case 'approval_limit':
       switch (refusal.waiting) {
         case 'undecided':

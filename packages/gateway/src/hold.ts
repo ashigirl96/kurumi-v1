@@ -41,6 +41,11 @@ export type EgressApproval = EgressGate<EgressPrincipal> & {
 }
 
 export const HOLD_MS = 180_000
+/**
+ * Counted to the last body byte, not between bytes, so a body sent one byte at a time ends too. A held body
+ * crosses only the container bridge, so a working client never comes near it.
+ */
+export const BODY_READ_MS = 30_000
 export const ALLOWANCE_MS = 10 * 60_000
 export const MAX_HELD_BODY_BYTES = 10 * 1024 * 1024
 /** In flight: buffering a body or waiting on a person. */
@@ -99,16 +104,20 @@ function inFlightSlots() {
   }
 }
 
+type BodyRead = Buffer | 'too_large' | 'timeout' | 'gone'
+
 function readBody(
   body: Readable | null,
   signal: AbortSignal,
-): Promise<Buffer | 'too_large' | 'gone'> {
+  deadlineMs: number,
+): Promise<BodyRead> {
   if (body === null) return Promise.resolve(Buffer.alloc(0))
   if (signal.aborted) return Promise.resolve('gone')
-  const read = Promise.withResolvers<Buffer | 'too_large' | 'gone'>()
+  const read = Promise.withResolvers<BodyRead>()
   const chunks: Buffer[] = []
   let size = 0
-  const finish = (result: Buffer | 'too_large' | 'gone') => {
+  const finish = (result: BodyRead) => {
+    clearTimeout(deadline)
     body.off('data', onData)
     body.off('end', onEnd)
     body.off('error', onGone)
@@ -122,6 +131,7 @@ function readBody(
   }
   const onEnd = () => finish(Buffer.concat(chunks))
   const onGone = () => finish('gone')
+  const deadline = setTimeout(() => finish('timeout'), deadlineMs)
   body.on('data', onData)
   body.once('end', onEnd)
   body.once('error', onGone)
@@ -194,9 +204,11 @@ export function createEgressApproval(deps: {
   /** Queues `text` for the session once per key. */
   notify(notice: SessionNotice): unknown
   holdMs?: number
+  bodyReadMs?: number
   now?: () => number
 }): EgressApproval {
   const holdMs = deps.holdMs ?? HOLD_MS
+  const bodyReadMs = deps.bodyReadMs ?? BODY_READ_MS
   const now = deps.now ?? Date.now
   const rules = createRuleStore({ db: deps.db, accounts: deps.accounts, now })
   const waiters = new Map<string, (end: HoldEnd) => void>()
@@ -315,8 +327,11 @@ export function createEgressApproval(deps: {
       refusal: { code: 'body_too_large', service, limit: MAX_HELD_BODY_BYTES },
     }
     if (input.declaredLength !== null && input.declaredLength > MAX_HELD_BODY_BYTES) return tooLarge
-    const body = await readBody(input.body, input.signal)
+    const body = await readBody(input.body, input.signal, bodyReadMs)
     if (body === 'too_large') return tooLarge
+    if (body === 'timeout') {
+      return { kind: 'refuse', refusal: { code: 'body_timeout', service, limitMs: bodyReadMs } }
+    }
     if (body === 'gone') return { kind: 'abandoned' }
     const method = input.method.toUpperCase()
     const methodOverrides = normalizeMethodOverrides(input.methodOverrides)

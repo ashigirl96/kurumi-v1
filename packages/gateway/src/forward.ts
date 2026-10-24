@@ -444,6 +444,10 @@ export async function forward<Principal>(
   res.once('close', () => record(decision, res.headersSent ? res.statusCode : null))
   if (prepared.kind === 'refused') {
     const { status, headers, body } = refusalResponse(prepared.refusal)
+    if (prepared.refusal.code === 'body_timeout') {
+      res.writeHead(status, { ...headers, connection: 'close' }).end(body)
+      return
+    }
     respondAfterBodyDrains(req, () => res.writeHead(status, headers).end(body))
     return
   }
