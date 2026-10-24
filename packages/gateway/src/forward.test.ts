@@ -1027,14 +1027,24 @@ test('an injected request names the service of the injection the ledger chose', 
 
 type Requested = Parameters<GatewayApprovals['request']>[1] & { approvalId: string }
 
+type RuleInput = Parameters<EgressApproval['rules']['add']>[0]
+
 async function setupHeld({
   holdMs,
   now,
   deps,
+  rule: ruleInput = {
+    account: 'anthropic/main',
+    method: 'POST',
+    path: '/v1/messages',
+    priority: 0,
+    effect: 'approve',
+  },
 }: {
   holdMs?: number
   now?: () => number
   deps?: Pick<ForwardDeps<EgressPrincipal>, 'upstream' | 'resolve'>
+  rule?: RuleInput
 } = {}) {
   const db = inMemoryDb()
   migrate(db, { migrationsFolder: migrations.folder, migrationsTable: migrations.table })
@@ -1069,13 +1079,7 @@ async function setupHeld({
     holdMs,
     now,
   })
-  const rule = gate.rules.add({
-    account: 'anthropic/main',
-    method: 'POST',
-    path: '/v1/messages',
-    priority: 0,
-    effect: 'approve',
-  })
+  const rule = gate.rules.add(ruleInput)
   const events: EgressEvent<EgressPrincipal>[] = []
   const upstream = await startFakeUpstream({ host: 'api.anthropic.com' })
   stops.push(upstream.stop)
@@ -1107,6 +1111,10 @@ async function setupHeld({
     stops.push(tunnel.close)
     return tunnel
   }
+  const addAccount = (label: string, value: string, authMode: AuthMode) =>
+    db.transaction((tx) =>
+      ledger.addKey(tx, { vendor: 'anthropic', label, value, authMode, autoGrant: true }),
+    )
   const addAgentGroup = (id: string) => {
     insertAgentGroup(db, id)
     db.transaction((tx) => ledger.grantAutoGrants(tx, id))
@@ -1125,6 +1133,7 @@ async function setupHeld({
     port,
     tunnel: await openTunnel(),
     openTunnel,
+    addAccount,
     addAgentGroup,
     requested,
     approvalId,
@@ -1162,6 +1171,26 @@ const addStreamRule = (gate: EgressApproval) =>
     priority: 0,
     effect: 'approve',
   })
+
+const scopedRule: RuleInput = {
+  service: 'anthropic-api',
+  method: 'POST',
+  path: '/v1/messages/*',
+  priority: 0,
+  effect: 'approve',
+}
+const selectorOf = (handle: string) => `sk-ant-kurumi-${Buffer.from(handle).toString('base64url')}`
+const sendScoped = (
+  tunnel: Awaited<ReturnType<typeof openTestTunnel>>,
+  { path = '/v1/messages', handle = 'anthropic/main' } = {},
+) =>
+  sendTestRequest(tunnel, {
+    method: 'POST',
+    path,
+    headers: { 'x-api-key': selectorOf(handle) },
+    body: prompt('scoped'),
+  })
+const granted = 1_800_000_000_000
 
 describe('held requests', () => {
   test('hold then approve: the upstream receives the exact body once and the client its 200', async () => {
@@ -1414,6 +1443,61 @@ describe('held requests', () => {
     expect(approvalId(1)).not.toBe(approvalId(0))
     expect(upstream.requests).toEqual([])
     expect(allowance(approvalId(0))).toMatchObject({ state: 'granted' })
+  })
+
+  test.each([
+    [
+      'the clock past the allowance',
+      ({ tunnel, setClock }) => {
+        setClock(granted + ALLOWANCE_MS + 1)
+        return sendScoped(tunnel)
+      },
+    ],
+    [
+      'another session',
+      async ({ openTunnel }) =>
+        sendScoped(await openTunnel({ agentGroupId: 'g1', sessionId: 's2' })),
+    ],
+    [
+      'another query string',
+      ({ tunnel }) => sendScoped(tunnel, { path: '/v1/messages?beta=true' }),
+    ],
+    ['another account handle', ({ tunnel }) => sendScoped(tunnel, { handle: 'anthropic/second' })],
+    [
+      'another rule',
+      ({ tunnel, gate, rule }) => {
+        gate.rules.remove(rule.id)
+        gate.rules.add(scopedRule)
+        return sendScoped(tunnel)
+      },
+    ],
+    ['another path', ({ tunnel }) => sendScoped(tunnel, { path: '/v1/messages/count_tokens' })],
+  ] satisfies [
+    string,
+    (
+      held: Awaited<ReturnType<typeof setupHeld>> & { setClock: (at: number) => void },
+    ) => ReturnType<typeof sendTestRequest>,
+  ][])('an allowance never passes a resend with %s', async (_name, resend) => {
+    let clock = granted
+    const held = await setupHeld({ holdMs: 50, now: () => clock, rule: scopedRule })
+    held.addAccount('second', secrets.second, 'oauth-token')
+    expect((await sendScoped(held.tunnel)).status).toBe(403)
+    await held.gate.decided({ id: held.approvalId(0) }, 'approve')
+
+    const resent = await resend({
+      ...held,
+      setClock: (at) => {
+        clock = at
+      },
+    })
+
+    expect(resent.status).toBe(403)
+    expect(JSON.parse(resent.body)).toMatchObject({
+      error: 'approval_pending',
+      approvalId: held.approvalId(1),
+    })
+    expect(held.upstream.requests).toEqual([])
+    expect(held.allowance(held.approvalId(0))).toMatchObject({ state: 'granted' })
   })
 
   test('a replayed decision notifies once and never passes a request twice', async () => {
