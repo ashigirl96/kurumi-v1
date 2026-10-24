@@ -15,6 +15,7 @@ import { join } from 'node:path'
 
 import { seal } from '@kurumi/account/server'
 import { createAgentLedger } from '@kurumi/agent/server'
+import { z } from 'zod'
 
 import { openKurumiDb, migrateAll } from './db.ts'
 import { queryReadOnly } from './fronts.ts'
@@ -345,39 +346,70 @@ test('with accounts stored, a gateway CA the vault.key cannot open stops the hos
   expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(true)
 }, 5000)
 
-const revisionRecordingDocker = `#!/bin/sh
+const inventoryDocker = `#!/bin/sh
+containers="$KURUMI_HOME/containers"
 case "$1" in
 create)
   for arg; do
-    case "$arg" in kurumi.revision=*) echo "\${arg#kurumi.revision=}" >> "$KURUMI_HOME/revisions" ;; esac
-    url=$arg
+    case "$arg" in
+    kurumi.session=*) session=\${arg#kurumi.session=} ;;
+    kurumi.container=*) container=\${arg#kurumi.container=} ;;
+    kurumi.revision=*) revision=\${arg#kurumi.revision=} ;;
+    esac
+    if [ "$previous" = --name ]; then name=$arg; fi
+    previous=$arg
   done
-  case "$*" in *kurumi.role=probe*) printf %s "$url" > "$KURUMI_HOME/probe-url" ;; esac ;;
+  case "$name" in
+  kurumi-probe-*) printf %s "$arg" > "$KURUMI_HOME/probe-url" ;;
+  *)
+    id=\${name#kurumi-agent-}
+    printf '["%s%s","%s","running","agent","%s","%s","%s"]\\n' "$id" "$id" "$name" "$session" "$container" "$revision" >> "$containers" ;;
+  esac ;;
+ps)
+  case "$*" in *kurumi.revision*)
+    container=$(printf '%s\\n' "$@" | sed -n 's/^label=kurumi.container=//p')
+    if [ -f "$containers" ]; then grep -F '"'"$container" "$containers"; fi ;;
+  esac ;;
+rm)
+  if [ -f "$containers" ]; then
+    grep -vF '"'"$3"'"' "$containers" > "$containers.next"
+    mv "$containers.next" "$containers"
+  fi
+  echo "$3" ;;
 start)
   if [ "$2" = --attach ]; then
     exec curl -fsS "$(sed s/host.docker.internal/127.0.0.1/ "$KURUMI_HOME/probe-url")"
   fi ;;
 wait) while kill -0 "$PPID" 2>/dev/null; do sleep 0.05; done ;;
 esac
+exit 0
 `
 
-test('creating a second agent group and restarting the host keeps the container revision', async () => {
+test('after a second agent group is created, a restarted host adopts the first group container', async () => {
   const home = homeForTest()
-  writeFileSync(join(home, 'docker'), revisionRecordingDocker, { mode: 0o755 })
+  writeFileSync(join(home, 'docker'), inventoryDocker, { mode: 0o755 })
   mkdirSync(join(home, 'runner'))
   writeFileSync(join(home, 'runner/runner.js'), '')
   const unused = Bun.serve({ port: 0, fetch: () => new Response() })
   const env = { PATH: `${home}:${process.env.PATH}`, KURUMI_AGENT_PORT: String(unused.port) }
   await unused.stop(true)
-  const recorded = () => {
-    const path = join(home, 'revisions')
-    return existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n') : []
+  const containers = (): { name: string; revision: string }[] => {
+    const path = join(home, 'containers')
+    if (!existsSync(path)) return []
+    return readFileSync(path, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => {
+        const [, name = '', , , , , revision = ''] = z.array(z.string()).parse(JSON.parse(line))
+        return { name, revision }
+      })
   }
   const spawnByChat = async (agent: string) => {
-    const count = recorded().length
+    const count = containers().length
     await cli(home, ['chat', agent], 'hello\n')
     for (let attempt = 0; attempt < 250; attempt++) {
-      if (recorded().length > count) return
+      const [created] = containers().slice(count)
+      if (created) return created
       await Bun.sleep(20)
     }
     throw new Error(`no container was created for ${agent}`)
@@ -386,16 +418,22 @@ test('creating a second agent group and restarting the host keeps the container 
   const first = spawnHost(home, undefined, env)
   await waitForHost(home, first)
   await cli(home, ['agent', 'create', '--name', 'work'])
-  await spawnByChat('work')
-  const before = recorded()
+  const work = await spawnByChat('work')
   await cli(home, ['agent', 'create', '--name', 'play'])
   first.kill('SIGTERM')
   expect(await first.exited).toBe(0)
   const second = spawnHost(home, undefined, env)
   await waitForHost(home, second)
-  await spawnByChat('play')
+  const play = await spawnByChat('play')
+  second.kill('SIGTERM')
+  expect(await second.exited).toBe(0)
+  const adopted = (await new Response(second.stdout).text())
+    .split('\n')
+    .filter((line) => line.includes('"kind":"session.container.adopted"'))
+    .map((line) => z.object({ name: z.string() }).parse(JSON.parse(line)).name)
 
-  expect(new Set(recorded())).toEqual(new Set(before))
+  expect(adopted).toEqual([work.name])
+  expect(containers()).toEqual([work, { name: play.name, revision: work.revision }])
 }, 20000)
 
 test('diagnostic SQL reads a WAL snapshot without writing rows or changing the host connection', () => {
