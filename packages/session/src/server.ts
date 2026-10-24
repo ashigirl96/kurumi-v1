@@ -745,7 +745,8 @@ export function createSessionLedger({
       if (receipt !== 'queued' || stopped) return receipt
       wake(id)
       if (enabled) void reconcile(id).catch(() => {})
-      void deliver({ id: noticeId, sessionId: id, text }).catch(() => {})
+      // An agent names its own outbound ids, so a guessable id here could be taken first.
+      void deliver({ id: `ntf-${crypto.randomUUID()}`, sessionId: id, text }).catch(() => {})
       return receipt
     },
     channel: {

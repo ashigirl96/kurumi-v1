@@ -535,6 +535,46 @@ test('a notice is shown in the bound terminal chat', async () => {
 
   expect(ledger.notify({ key: 'apr-chat', sessionId: queued.sessionId, text })).toBe('queued')
 
-  expect((await stream.next()).value).toEqual({ kind: 'reply', outboundId: 'ntf-apr-chat', text })
+  expect((await stream.next()).value).toEqual({
+    kind: 'reply',
+    outboundId: expect.any(String),
+    text,
+  })
+  await stream.return()
+})
+
+test('an agent that posts the notice id first cannot keep the notice from the bound terminal chat', async () => {
+  const driver = createFakeDriver()
+  ledger = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: runtime(driver),
+  })
+  const stream = chat.terminal({ agentGroupId: agentId, text: 'hello', follow: true })
+  const queued = (await stream.next()).value
+  if (!queued || queued.kind !== 'queued') throw new Error('missing queued receipt')
+  const principal = ledger.authenticate(driver.runs[0]?.env.KURUMI_TOKEN ?? '')
+  if (!principal) throw new Error('missing live container')
+  await ledger.channel.pull(principal, { waitMs: 0 })
+  await ledger.channel.post(principal, {
+    id: 'ntf-apr-forged',
+    inReplyTo: queued.inboundId,
+    body: { kind: 'text', text: 'decoy' },
+  })
+  expect((await stream.next()).value).toEqual({
+    kind: 'reply',
+    outboundId: 'ntf-apr-forged',
+    text: 'decoy',
+  })
+  const text = 'kurumi: approval apr-forged was approved'
+
+  expect(ledger.notify({ key: 'apr-forged', sessionId: queued.sessionId, text })).toBe('queued')
+
+  const shown = await Promise.race([
+    stream.next().then(({ value }) => value),
+    Bun.sleep(500).then(() => 'not shown within 500 ms'),
+  ])
+  expect(shown).toEqual({ kind: 'reply', outboundId: expect.any(String), text })
   await stream.return()
 })
