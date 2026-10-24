@@ -2031,20 +2031,20 @@ describe('a request body that stops short', () => {
       'a body declared over 10 MiB',
       'POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Length: 20000000\r\n\r\n{',
       413,
-      'body_too_large',
+      'body_too_large' as const,
     ],
     [
       'an account the agent group is not granted',
       'POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nx-api-key: kurumi:anthropic/nobody-granted\r\nContent-Length: 1000\r\n\r\n{',
       403,
-      'account_not_granted',
+      'account_not_granted' as const,
     ],
   ])(
     'is answered with Connection: close at the deadline when %s is refused before the body is read',
-    async (_name, request, status, refusal) => {
+    async (_name, stalled, status, refusal) => {
       const { tunnel, events } = await setupHeld({ bodyDeadlineMs: 100 })
 
-      const answer = await withinTwoSeconds(exchangeRaw(tunnel.socket, request))
+      const answer = await withinTwoSeconds(exchangeRaw(tunnel.socket, stalled))
 
       expect(answer).toMatchObject({ status, headers: { connection: 'close' } })
       expect(JSON.parse(answer.body)).toMatchObject({ error: refusal })

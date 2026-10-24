@@ -41,11 +41,6 @@ export type EgressApproval = EgressGate<EgressPrincipal> & {
 }
 
 export const HOLD_MS = 180_000
-/**
- * Counted to the last body byte, not between bytes, so a body sent one byte at a time ends too. A held body
- * crosses only the container bridge, so a working client never comes near it.
- */
-export const BODY_READ_MS = 30_000
 export const ALLOWANCE_MS = 10 * 60_000
 export const MAX_HELD_BODY_BYTES = 10 * 1024 * 1024
 /** In flight: buffering a body or waiting on a person. */
@@ -204,11 +199,9 @@ export function createEgressApproval(deps: {
   /** Queues `text` for the session once per key. */
   notify(notice: SessionNotice): unknown
   holdMs?: number
-  bodyReadMs?: number
   now?: () => number
 }): EgressApproval {
   const holdMs = deps.holdMs ?? HOLD_MS
-  const bodyReadMs = deps.bodyReadMs ?? BODY_READ_MS
   const now = deps.now ?? Date.now
   const rules = createRuleStore({ db: deps.db, accounts: deps.accounts, now })
   const waiters = new Map<string, (end: HoldEnd) => void>()
@@ -320,14 +313,18 @@ export function createEgressApproval(deps: {
     return ended.promise
   }
 
-  /** Admission marks the allowance `used` before the send, so no second request takes it while this one is on its way. */
-  const handBack = (approvalId: string) => () => {
-    transaction(deps.db, (tx) => {
-      tx.update(egressAllowance)
-        .set({ state: 'granted', usedAt: null })
-        .where(and(eq(egressAllowance.approvalId, approvalId), eq(egressAllowance.state, 'used')))
-        .run()
-    })
+  const regrantOnce = (approvalId: string) => {
+    let regranted = false
+    return () => {
+      if (regranted) return
+      regranted = true
+      transaction(deps.db, (tx) => {
+        tx.update(egressAllowance)
+          .set({ state: 'granted', usedAt: null })
+          .where(and(eq(egressAllowance.approvalId, approvalId), eq(egressAllowance.state, 'used')))
+          .run()
+      })
+    }
   }
 
   async function hold(input: ScreenInput<EgressPrincipal>, ruleId: RuleId): Promise<Screened> {
@@ -337,10 +334,13 @@ export function createEgressApproval(deps: {
       refusal: { code: 'body_too_large', service, limit: MAX_HELD_BODY_BYTES },
     }
     if (input.declaredLength !== null && input.declaredLength > MAX_HELD_BODY_BYTES) return tooLarge
-    const body = await readBody(input.body, input.signal, bodyReadMs)
+    const body = await readBody(input.body, input.signal, input.bodyDeadlineMs)
     if (body === 'too_large') return tooLarge
     if (body === 'timeout') {
-      return { kind: 'refuse', refusal: { code: 'body_timeout', service, limitMs: bodyReadMs } }
+      return {
+        kind: 'refuse',
+        refusal: { code: 'body_timeout', service, limitMs: input.bodyDeadlineMs },
+      }
     }
     if (body === 'gone') return { kind: 'abandoned' }
     const method = input.method.toUpperCase()
@@ -376,7 +376,7 @@ export function createEgressApproval(deps: {
     }
     const admission = transaction(deps.db, (tx) => admit(tx, held))
     if (admission.kind === 'pass') {
-      return { kind: 'forward', body, undelivered: handBack(admission.approvalId) }
+      return { kind: 'forward', body, undelivered: regrantOnce(admission.approvalId) }
     }
     if (admission.kind === 'refuse') return admission
     const { approvalId } = admission
@@ -384,7 +384,7 @@ export function createEgressApproval(deps: {
     const end = await wait(approvalId, input.signal)
     switch (end) {
       case 'approved':
-        return { kind: 'forward', body, undelivered: handBack(approvalId) }
+        return { kind: 'forward', body, undelivered: regrantOnce(approvalId) }
       case 'denied':
         return { kind: 'refuse', refusal: { code: 'approval_denied', service, approvalId } }
       case 'timeout':

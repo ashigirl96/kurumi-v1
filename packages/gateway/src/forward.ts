@@ -80,6 +80,7 @@ export type ScreenInput<Principal> = {
   declaredLength: number | null
   /** Aborts when the tunnel closes or the client hangs up. */
   signal: AbortSignal
+  bodyDeadlineMs: number
   /** Called once per wait, when the request starts waiting on a person. */
   held(): void
 }
@@ -88,7 +89,7 @@ export type Screened =
   | {
       kind: 'forward'
       body: Buffer
-      /** Called at most once, when no byte of the request reached the upstream. */
+      /** Called when no byte of the request reached the upstream. A repeat call does nothing. */
       undelivered: () => void
     }
   | { kind: 'refuse'; refusal: HoldRefusal }
@@ -107,7 +108,10 @@ export type ForwardDeps<Principal> = {
   addressRefusal?: (address: string, host: readonly string[]) => string | null
   hostAddresses?: () => readonly string[]
   log?(event: EgressEvent<Principal>): void
+  bodyDeadlineMs?: number
 }
+
+const REQUEST_BODY_DEADLINE_MS = 30_000
 
 const resolveAll = (host: string) => lookup(host, { all: true })
 
@@ -239,6 +243,7 @@ type Prepared =
 type Exchange = {
   body: Readable | null
   closes: NodeJS.EventEmitter & { readonly destroyed: boolean }
+  bodyDeadlineMs: number
   held(service: ServiceId): void
 }
 
@@ -318,6 +323,7 @@ function screening<Principal>(
     body: exchange.body,
     declaredLength: declaredLengthOf(req),
     signal: ended.signal,
+    bodyDeadlineMs: exchange.bodyDeadlineMs,
     held: () => exchange.held(account.service),
   })
   if (!screened) return null
@@ -416,7 +422,8 @@ async function prepareRequest<Principal>(
 const nothingToHandBack = () => {}
 
 /** Before the TLS handshake ends, the upstream has read no byte of the request. */
-function whenUndelivered(upstream: ClientRequest, undelivered: () => void): void {
+function requestUpstream(options: RequestOptions, undelivered: () => void): ClientRequest {
+  const upstream = request(options)
   let handshaken = false
   upstream.once('socket', (socket) =>
     socket.once('secureConnect', () => {
@@ -424,12 +431,11 @@ function whenUndelivered(upstream: ClientRequest, undelivered: () => void): void
     }),
   )
   const ended = () => {
-    upstream.off('error', ended)
-    upstream.off('close', ended)
     if (!handshaken) undelivered()
   }
-  upstream.once('error', ended)
+  upstream.prependOnceListener('error', ended)
   upstream.once('close', ended)
+  return upstream
 }
 
 function respondUnreachable(res: ServerResponse, host: string): void {
@@ -437,10 +443,31 @@ function respondUnreachable(res: ServerResponse, host: string): void {
   res.end(JSON.stringify({ error: 'upstream_unreachable', host }))
 }
 
-function respondAfterBodyDrains(req: IncomingMessage, respond: () => void): void {
+/** A client reads an answer sent after its body instead of a reset; past `answerBy` kurumi stops waiting and closes. */
+function respondAfterBodyDrains(
+  req: IncomingMessage,
+  res: ServerResponse,
+  answerBy: number,
+  respond: (close: boolean) => void,
+): void {
   req.resume()
-  if (req.complete) respond()
-  else req.once('end', respond)
+  if (req.complete) {
+    respond(false)
+    return
+  }
+  const drained = () => {
+    clearTimeout(stalled)
+    respond(false)
+  }
+  const stalled = setTimeout(() => {
+    req.off('end', drained)
+    respond(true)
+  }, answerBy - performance.now())
+  req.once('end', drained)
+  res.once('close', () => {
+    clearTimeout(stalled)
+    req.off('end', drained)
+  })
 }
 
 const badGateway = 'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
@@ -452,9 +479,12 @@ export async function forward<Principal>(
   deps: ForwardDeps<Principal>,
 ): Promise<void> {
   const record = egressRecorder(context, req, deps)
+  const bodyDeadlineMs = deps.bodyDeadlineMs ?? REQUEST_BODY_DEADLINE_MS
+  const answerBy = performance.now() + bodyDeadlineMs
   const prepared = await prepareRequest(context, req, deps, {
     body: req,
     closes: res,
+    bodyDeadlineMs,
     held: (service) => record({ decision: 'held', service }, null),
   })
   const gone = context.signal.aborted || res.destroyed
@@ -472,21 +502,18 @@ export async function forward<Principal>(
   res.once('close', () => record(decision, res.headersSent ? res.statusCode : null))
   if (prepared.kind === 'refused') {
     const { status, headers, body } = refusalResponse(prepared.refusal)
-    if (prepared.refusal.code === 'body_timeout') {
-      res.writeHead(status, { ...headers, connection: 'close' }).end(body)
-      return
-    }
-    respondAfterBodyDrains(req, () => res.writeHead(status, headers).end(body))
+    respondAfterBodyDrains(req, res, answerBy, (close) =>
+      res.writeHead(status, close ? { ...headers, connection: 'close' } : headers).end(body),
+    )
     return
   }
   if (prepared.kind === 'unreachable') {
-    respondAfterBodyDrains(req, () => respondUnreachable(res, context.target.host))
+    respondAfterBodyDrains(req, res, answerBy, () => respondUnreachable(res, context.target.host))
     return
   }
   const { options, account } = prepared
   const body = new PassThrough()
-  const upstream = request(options)
-  whenUndelivered(upstream, prepared.undelivered)
+  const upstream = requestUpstream(options, prepared.undelivered)
 
   const cancel = () => {
     upstream.destroy()
@@ -555,6 +582,7 @@ export async function forwardUpgrade<Principal>(
   const prepared = await prepareRequest(context, req, deps, {
     body: null,
     closes: client,
+    bodyDeadlineMs: deps.bodyDeadlineMs ?? REQUEST_BODY_DEADLINE_MS,
     held: (service) => record({ decision: 'held', service }, null),
   })
   const gone = context.signal.aborted || client.destroyed
@@ -584,11 +612,10 @@ export async function forwardUpgrade<Principal>(
     return
   }
   const { options, account } = prepared
-  const upstream = request({
-    ...options,
-    headers: { ...options.headers, connection: 'Upgrade', upgrade: 'websocket' },
-  })
-  whenUndelivered(upstream, prepared.undelivered)
+  const upstream = requestUpstream(
+    { ...options, headers: { ...options.headers, connection: 'Upgrade', upgrade: 'websocket' } },
+    prepared.undelivered,
+  )
   let upgraded: Duplex | undefined
   const cancel = () => {
     upstream.destroy()
