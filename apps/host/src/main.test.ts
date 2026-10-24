@@ -15,11 +15,12 @@ import { join } from 'node:path'
 
 import { seal } from '@kurumi/account/server'
 import { createAgentLedger } from '@kurumi/agent/server'
+import { createRouterClient } from '@orpc/server'
 import { z } from 'zod'
 
 import { openKurumiDb, migrateAll } from './db.ts'
 import { queryReadOnly } from './fronts.ts'
-import { initialGuard } from './main.ts'
+import { hostRouter, initialGuard, type HostContext } from './main.ts'
 import { migrations } from './migrations.ts'
 
 const homes: string[] = []
@@ -564,6 +565,48 @@ test('the temporary host guard allows host and human callers and only agent chan
     { agent: 'hold' },
   ] as const) {
     expect(initialGuard({ ...common, caller, meta }).kind).toBe('deny')
+  }
+})
+
+const outcome = (call: Promise<unknown>) =>
+  call.then(
+    () => 'answered',
+    (error: unknown) => error,
+  )
+
+test('the host router answers gateway status and log for the host and refuses them to an agent', async () => {
+  const db = openKurumiDb(join(homeForTest(), 'kurumi.db'))
+  const status = {
+    admission: 'open',
+    detail: null,
+    agentPort: { host: '127.0.0.1', port: 4000 },
+    caFingerprint: 'AB:CD',
+  } as const
+  const unused = {} as never
+  const contextFor = (caller: HostContext['caller']): HostContext => ({
+    db,
+    caller,
+    guard: initialGuard,
+    grant: null,
+    agentLedger: unused,
+    chatLedger: unused,
+    sessionLedger: unused,
+    accountLedger: unused,
+    gateway: { status: () => status, egressLog: { rows: () => [] } },
+    agentPrincipal: null,
+  })
+  try {
+    const host = createRouterClient(hostRouter, { context: contextFor({ kind: 'host' }) })
+    expect(await host.gateway.status()).toEqual(status)
+    expect(await host.gateway.log({})).toEqual([])
+
+    const agent = createRouterClient(hostRouter, {
+      context: contextFor({ kind: 'agent', agentGroupId: 'ag-test', sessionId: 's' }),
+    })
+    expect(await outcome(agent.gateway.status())).toMatchObject({ code: 'FORBIDDEN' })
+    expect(await outcome(agent.gateway.log({}))).toMatchObject({ code: 'FORBIDDEN' })
+  } finally {
+    db.$client.close()
   }
 })
 
