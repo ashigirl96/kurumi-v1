@@ -8,7 +8,7 @@
     ],
     "catalog": {
       "@peculiar/x509": "2.2.0",
-      "@types/bun": "1.4.3",
+      "@types/bun": "1.4.4",
       "drizzle-kit": "0.31.11",
       "drizzle-orm": "0.45.3",
       "oxfmt": "0.71.0",
@@ -37,5 +37,5 @@
     "oxlint-tsgolint": "catalog:",
     "typescript": "catalog:"
   },
-  "packageManager": "bun@1.4.3"
+  "packageManager": "bun@1.4.4"
 }
