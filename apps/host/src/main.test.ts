@@ -434,26 +434,35 @@ test('after a second agent group is created, a restarted host adopts the first g
   const unused = Bun.serve({ port: 0, fetch: () => new Response() })
   const env = { PATH: `${home}:${process.env.PATH}`, KURUMI_AGENT_PORT: String(unused.port) }
   await unused.stop(true)
-  const containers = (): { name: string; revision: string }[] => {
+  const listed = () => {
     const path = join(home, 'containers')
     if (!existsSync(path)) return []
     return readFileSync(path, 'utf8')
       .trim()
       .split('\n')
       .map((line) => {
-        const [, name = '', , , , , revision = ''] = z.array(z.string()).parse(JSON.parse(line))
-        return { name, revision }
+        const [, name = '', , , , id = '', revision = ''] = z
+          .array(z.string())
+          .parse(JSON.parse(line))
+        return { id, name, revision }
       })
   }
+  const containers = () => listed().map(({ name, revision }) => ({ name, revision }))
+  const survivesShutdown = async (id: string) => {
+    const rows = await cli(home, ['db', 'query', `SELECT status FROM container WHERE id = '${id}'`])
+    const [row] = z.array(z.object({ status: z.string() })).parse(JSON.parse(rows))
+    return row?.status === 'running'
+  }
   const spawnByChat = async (agent: string) => {
-    const count = containers().length
+    const count = listed().length
     await cli(home, ['chat', agent], 'hello\n')
     for (let attempt = 0; attempt < 250; attempt++) {
-      const [created] = containers().slice(count)
-      if (created) return created
+      const [created] = listed().slice(count)
+      if (created && (await survivesShutdown(created.id)))
+        return { name: created.name, revision: created.revision }
       await Bun.sleep(20)
     }
-    throw new Error(`no container was created for ${agent}`)
+    throw new Error(`no container started running for ${agent}`)
   }
 
   const first = spawnHost(home, undefined, env)
