@@ -7,10 +7,10 @@ import {
   request as httpRequest,
   type IncomingHttpHeaders,
 } from 'node:http'
-import { createServer as createHttpsServer, request } from 'node:https'
+import { Agent, createServer as createHttpsServer, request } from 'node:https'
 import { createServer } from 'node:net'
 import { Readable } from 'node:stream'
-import type { TLSSocket } from 'node:tls'
+import { connect, type TLSSocket } from 'node:tls'
 
 import {
   accountHandle,
@@ -478,25 +478,24 @@ test('a container spawned for an oauth-token key reaches a later api-key default
   expect(upstream.requests[0]?.headers['anthropic-beta']).toBeUndefined()
 })
 
-test('an intercepted host on a port other than 443 is refused before any account is chosen', async () => {
-  const { upstream, tunnel, addKey } = await setupCredentials({
-    target: { host: 'api.anthropic.com', port: 8443 },
-  })
-  addKey('main', secrets.main)
-
-  const response = await sendTestRequest(tunnel, {
-    path: '/v1/models',
-    headers: { 'x-api-key': groupSelector },
+test('credential injection refuses a non-443 port before choosing an account', () => {
+  const inject = credentialInject({
+    credentialFor: () => {
+      throw new Error('no account should be chosen')
+    },
   })
 
-  expect(response.status).toBe(403)
-  expect(JSON.parse(response.body)).toEqual({
-    error: 'port_not_allowed',
-    host: 'api.anthropic.com',
-    port: 8443,
-    next: 'connect to api.anthropic.com on port 443; kurumi serves it on no other port',
-  })
-  expect(upstream.requests).toEqual([])
+  expect(
+    inject({
+      principal: { agentGroupId: 'g1' },
+      host: 'api.anthropic.com',
+      port: 8443,
+      method: 'GET',
+      path: '/v1/models',
+      headers: new Headers(),
+      rawHeaders: [],
+    }),
+  ).toEqual({ refusal: { code: 'port_not_allowed', host: 'api.anthropic.com', port: 8443 } })
 })
 
 test('a TRACE to a credentialed host is refused with 405 and nothing goes upstream', async () => {
@@ -703,26 +702,45 @@ async function setupResolving(
   })
   const address = listener.address()
   if (!address || typeof address === 'string') throw new Error('listener has no TCP address')
-  const gateway = await startAgentPort({
-    bind: { host: '127.0.0.1', port: 0 },
-    authenticate: () => ({}),
-    intercepts: () => true,
-    forward: {
-      resolve,
-      addressRefusal,
-      hostAddresses,
-      inject: ({ path, headers }) => ({ path, headers }),
-    },
+  const target = { host, port: address.port }
+  const context = { principal: {}, target, signal: new AbortController().signal }
+  const deps = {
+    resolve,
+    addressRefusal,
+    hostAddresses,
+    inject: ({ path, headers }) => ({ path, headers }),
+  } satisfies ForwardDeps<object>
+  const ca = await createCertificateAuthority()
+  const leaf = await ca.leafFor(host)
+  const server = createHttpsServer({ key: leaf.keyPem, cert: leaf.certPem }, async (req, res) => {
+    await forward(context, req, res, deps)
   })
-  stops.push(gateway.stop)
-  // The system resolver also answers localhost, so a gateway that ignored `resolve` would dial the listener.
-  const tunnel = await openTestTunnel({
-    proxyPort: gateway.port,
-    token: 'test-token',
-    caPem: gateway.caPem,
-    target: { host, port: address.port },
+  server.on('upgrade', async (req, client, head) => {
+    await forwardUpgrade(context, req, client, head, deps)
   })
-  stops.push(tunnel.close)
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  stops.push(() => {
+    server.closeAllConnections()
+    server.close()
+  })
+  const endpoint = server.address()
+  if (!endpoint || typeof endpoint === 'string') throw new Error('server has no TCP address')
+  const socket = connect({
+    host: '127.0.0.1',
+    port: endpoint.port,
+    servername: host,
+    ca: ca.certPem,
+  })
+  const agent = new Agent({ keepAlive: true, maxSockets: 1 })
+  agent.createConnection = () => socket
+  const close = () => {
+    agent.destroy()
+    socket.destroy()
+  }
+  stops.push(close)
+  await once(socket, 'secureConnect')
+  const tunnel = { target, socket, agent, close }
   return { tunnel, dials: () => dials }
 }
 
@@ -957,17 +975,27 @@ test('a request to an intercepted host whose path names no service is logged as 
   expect(events[0]).not.toHaveProperty('account')
 })
 
-test('an intercepted host on another port is logged as refused with no service', async () => {
-  const { tunnel, events } = await setupLogged({
-    target: { host: 'api.anthropic.com', port: 8443 },
+test('CONNECT to an intercepted host on another port is logged as refused with no service', async () => {
+  const events: EgressEvent<CredentialPrincipal>[] = []
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: () => ({ agentGroupId: 'g1' }),
+    intercepts: isInterceptedHost,
+    forward: {
+      inject: ({ path, headers }) => ({ path, headers }),
+      log: (event) => events.push(event),
+    },
   })
-  const response = await sendTestRequest(tunnel, { path: '/v1/models' })
-  expect(response.status).toBe(403)
+  stops.push(gateway.stop)
+
+  expect(await connectStatus(gateway.port, 'api.anthropic.com:8443')).toBe(403)
   await until(() => events.length === 1)
   expect(events[0]).toMatchObject({
     decision: 'refused',
     refusal: 'port_not_allowed',
     service: null,
+    method: 'CONNECT',
+    path: 'api.anthropic.com:8443',
     status: 403,
   })
 })

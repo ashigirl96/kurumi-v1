@@ -302,18 +302,17 @@ test('CONNECT to an intercepted host after the CA has expired is refused with th
   expect(response).toContain(`the gateway CA expired at ${new Date(end).toISOString()}`)
 })
 
-test('concurrent tunnels on the same host retain distinct principals and destination ports', async () => {
+test('concurrent tunnels on the same host retain distinct principals', async () => {
   const ca = await createCertificateAuthority()
   const first = await startFakeUpstream({ ca })
-  const second = await startFakeUpstream({ ca })
-  stops.push(first.stop, second.stop)
+  stops.push(first.stop)
   const tokens = new Set(['first', 'second'])
   const gateway = await startAgentPort({
     bind: { host: '127.0.0.1', port: 0 },
     authenticate: (token) => (tokens.has(token) ? { name: token } : null),
     intercepts: () => true,
     forward: {
-      upstream: { host: 'fake.test', address: '127.0.0.1', caPem: ca.certPem },
+      upstream: first.destination,
       inject: ({ principal, path, headers }) => {
         headers.set('x-principal', principal.name)
         return { path, headers }
@@ -322,23 +321,26 @@ test('concurrent tunnels on the same host retain distinct principals and destina
   })
   stops.push(gateway.stop)
   const tunnels = await Promise.all(
-    [first, second].map((upstream, index) =>
+    ['first', 'second'].map((token) =>
       openTestTunnel({
         proxyPort: gateway.port,
-        token: index === 0 ? 'first' : 'second',
+        token,
         caPem: gateway.caPem,
-        target: { host: 'fake.test', port: upstream.port },
+        target: { host: 'fake.test', port: 443 },
       }),
     ),
   )
   for (const tunnel of tunnels) stops.push(tunnel.close)
   await Promise.all(tunnels.map((tunnel) => sendTestRequest(tunnel, { path: '/echo' })))
-  expect(first.requests.map((entry) => entry.headers['x-principal'])).toEqual(['first'])
-  expect(second.requests.map((entry) => entry.headers['x-principal'])).toEqual(['second'])
+  expect(
+    first.requests
+      .map((entry) => entry.headers['x-principal'])
+      .toSorted((a, b) => String(a).localeCompare(String(b))),
+  ).toEqual(['first', 'second'])
   tokens.delete('first')
   const revoked = await sendTestRequest(tunnels[0]!, { path: '/echo' })
   expect(revoked.status).toBe(407)
-  expect(first.requests).toHaveLength(1)
+  expect(first.requests).toHaveLength(2)
   expect((await sendTestRequest(tunnels[1]!, { path: '/echo' })).status).toBe(200)
 })
 
