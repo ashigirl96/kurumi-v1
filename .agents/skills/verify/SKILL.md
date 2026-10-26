@@ -8,7 +8,7 @@ description: 使い捨ての kurumi host を起動し、live の Claude subscrip
 kurumi は host process（`apps/host`）で、`$KURUMI_HOME/kurumi.sock` 越しに `kurumi` CLI（`apps/cli`）に応える。session ごとに Docker container を 1 つ動かし、container の request はすべて Agent Port の gateway を通す。1 回の検証は 1 つの **lane** を持つ。lane は番号付きの独立した host で、home・port・container を lane ごとに分ける。操作はすべて [`lane.sh`](lane.sh) から行う。この repo のどの checkout や worktree からでも動く。
 
 ```sh
-.claude/skills/verify/lane.sh <command> <lane> [args]
+.agents/skills/verify/lane.sh <command> <lane> [args]
 ```
 
 | Command | やること |

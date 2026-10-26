@@ -5,9 +5,9 @@ live の host で kurumi の利用者から見える振る舞いを確かめる�
 ## 前提
 
 - Docker が動いていて、macOS の keychain の service `kurumi-live-claude` に owner の Claude subscription token が入っている。
-- lane が起動している。`.claude/skills/verify/lane.sh up <n>` を流し、`lane.sh doctor <n>` が `FAIL` を出さない。
+- lane が起動している。`.agents/skills/verify/lane.sh up <n>` を流し、`lane.sh doctor <n>` が `FAIL` を出さない。
 - 各手順は、断りがなければ次の状態から始める。`lane.sh add-key <n>`、`lane.sh kurumi <n> agent create --name work`、`lane.sh chat <n> work '<line>'` を 1 回ずつ流し、agent の container が動いている状態。
-- 以下では `L` は `.claude/skills/verify/lane.sh`、`n` は自分の lane 番号を指す。
+- 以下では `L` は `.agents/skills/verify/lane.sh`、`n` は自分の lane 番号を指す。
 
 ## 動かし方の決まり
 
