@@ -563,6 +563,64 @@ test('invisible code points are escaped in the stored title, body, and handler e
   }
 })
 
+test.each([
+  ['slack:admin', 'slack:admin'],
+  ['slack:admin\n\u001b[31m\u0000', 'slack:admin\\u{a}\\u{1b}[31m\\u{0}'],
+])('approval output escapes stored principal ids: %j', async (userId, displayedId) => {
+  const db = openDb()
+  grantAdmin(db, userId, 'ag-a')
+  const { router, contextFor } = composedHost(db)
+  const { ledger } = recordingLedger(db)
+  const id = requestProcedure(db, ledger)
+  const server = Bun.serve({
+    unix: join(home, 'kurumi.sock'),
+    async fetch(request) {
+      const caller: Caller = new URL(request.url).pathname.endsWith('/decide')
+        ? { kind: 'human', userId }
+        : host
+      const { response } = await new RPCHandler(router).handle(request, {
+        prefix: '/rpc',
+        context: contextFor(caller),
+      })
+      return response ?? new Response('Not found', { status: 404 })
+    },
+  })
+  try {
+    const pending = JSON.parse(await kurumi('approval', 'list'))
+    const shown = JSON.parse(await kurumi('approval', 'show', id))
+    const decided = JSON.parse(await kurumi('approval', 'decide', id, '--deny'))
+    const repeated = JSON.parse(await kurumi('approval', 'decide', id, '--approve'))
+    const listed = JSON.parse(await kurumi('approval', 'list', '--status', 'decided'))
+    const settled = JSON.parse(await kurumi('approval', 'show', id))
+    expect(pending[0].approvers[0]).toEqual({ kind: 'user', userId })
+    expect(shown.approvers[0]).toEqual({ kind: 'user', userId })
+    for (const approval of [decided.approval, repeated.approval, listed[0], settled]) {
+      expect(approval.decidedBy).toEqual({ kind: 'user', userId })
+    }
+    expect(decided.message).toBe(`denied by user ${displayedId} at ${settled.decidedAt}`)
+    expect(repeated.message).toBe(`already denied by user ${displayedId} at ${settled.decidedAt}`)
+  } finally {
+    await server.stop(true)
+  }
+})
+
+test('approval refusal escapes a stored principal id', async () => {
+  const db = openDb()
+  const { ledger } = recordingLedger(db)
+  const id = requestProcedure(db, ledger)
+  const userId = 'slack:admin\n\u001b[31m\u0000'
+  grantAdmin(db, userId, 'ag-a')
+
+  expect(
+    await ledger
+      .decide({ id, decision: 'deny', by: { kind: 'human', userId } })
+      .catch((caught: unknown) => caught),
+  ).toMatchObject({
+    code: 'FORBIDDEN',
+    message: `user slack:admin\\u{a}\\u{1b}[31m\\u{0} is not an approver of ${id}`,
+  })
+})
+
 test('humans named as approvers at request time decide through the router, others do not', async () => {
   const db = openDb()
   grantAdmin(db, 'slack:scoped', 'ag-a')
