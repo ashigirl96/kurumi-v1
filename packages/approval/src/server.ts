@@ -134,7 +134,7 @@ function summary(view: ApprovalView): string {
 
 function escapeInvisible(text: string): string {
   return text.replace(
-    /[\p{C}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/gu,
+    /(?!\u0020)[\p{C}\p{Z}\p{Default_Ignorable_Code_Point}\u2800\ufffc]/gu,
     (char) => `\\u{${char.codePointAt(0)?.toString(16)}}`,
   )
 }
