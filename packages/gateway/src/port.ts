@@ -14,7 +14,7 @@ import {
   type Leaf,
 } from './ca.ts'
 import { forward, forwardUpgrade, type ConnectTarget, type ForwardDeps } from './forward.ts'
-import { nextStep } from './refusal.ts'
+import { nextStep, refusalHttp } from './refusal.ts'
 
 type Tunnel<Principal> = {
   target: ConnectTarget
@@ -209,7 +209,40 @@ export async function startAgentPort<Principal extends object>(deps: {
           })
           hold(upgraded, client)
         })
-        inner.on('clientError', (_error, client) => client.destroy())
+        inner.on('clientError', (error: NodeJS.ErrnoException & { rawPacket?: Buffer }, client) => {
+          // Unknown methods fail parsing before the request handler can refuse them.
+          const line =
+            error.code === 'HPE_INVALID_METHOD'
+              ? /^([!#$%&'*+.^_`|~0-9A-Za-z-]+) (\/[^\s#]*) HTTP\/1\.[01]\r\n/.exec(
+                  error.rawPacket?.toString('latin1') ?? '',
+                )
+              : null
+          const method = line?.[1]
+          const path = line?.[2]
+          if (!method || !path) {
+            client.destroy()
+            return
+          }
+          const refused = (async () => {
+            const principal = await tunnel.authenticate()
+            if (principal === null || client.destroyed || tunnel.signal.aborted) {
+              client.destroy()
+              return
+            }
+            const injected = await deps.forward.inject({
+              principal,
+              ...tunnel.target,
+              method,
+              path,
+              headers: new Headers(),
+              rawHeaders: [],
+            })
+            if ('refusal' in injected && injected.refusal.code === 'method_not_allowed') {
+              client.end(refusalHttp(injected.refusal), () => client.destroy())
+            } else client.destroy()
+          })().catch(() => client.destroy())
+          hold(refused, client)
+        })
         socket.once('close', () => inner.removeAllListeners())
         inner.emit('connection', socket)
       },
