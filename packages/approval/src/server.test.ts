@@ -489,8 +489,14 @@ test('the same held call from the same caller reuses its pending approval', asyn
   expect(await held(agent, 'access/users/create', input)).not.toBe(first)
 })
 
-const invisible = '\u202e\u2028\u3164\ufe0f\u{e0100}\u0085\u200b'
-const escaped = '\\u{202e}\\u{2028}\\u{3164}\\u{fe0f}\\u{e0100}\\u{85}\\u{200b}'
+const invisible =
+  '\u202e\u2028\u3164\ufe0f\u{e0100}\u0085\u200b' +
+  '\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000' +
+  '\u2800\ufffc\u115f\u1160\uffa0'
+const escaped =
+  '\\u{202e}\\u{2028}\\u{3164}\\u{fe0f}\\u{e0100}\\u{85}\\u{200b}' +
+  '\\u{a0}\\u{1680}\\u{2000}\\u{2001}\\u{2002}\\u{2003}\\u{2004}\\u{2005}\\u{2006}\\u{2007}\\u{2008}\\u{2009}\\u{200a}\\u{202f}\\u{205f}\\u{3000}' +
+  '\\u{2800}\\u{fffc}\\u{115f}\\u{1160}\\u{ffa0}'
 const unprintable = /[\p{C}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/u
 const cliMain = resolve(import.meta.dir, '../../../apps/cli/src/main.ts')
 
@@ -524,16 +530,16 @@ test('invisible code points are escaped in the stored title, body, and handler e
         kind: 'gateway.request',
         agentGroupId: null,
         sessionId: null,
-        title: `title${invisible}`,
-        body: [`body${invisible}`],
+        title: `title 日本語 text ${invisible}`,
+        body: [`body 日本語 text ${invisible}`, 'ordinary text 通常の日本語'],
         payload: { url: 'https://example.com' },
       }).approvalId,
   )
   await ledger.decide({ id: requested, decision: 'deny', by: host })
 
   expect(ledger.show(requested)).toMatchObject({
-    title: `title${escaped}`,
-    body: [`body${escaped}`],
+    title: `title 日本語 text ${escaped}`,
+    body: [`body 日本語 text ${escaped}`, 'ordinary text 通常の日本語'],
     handlerError: `boom${escaped}`,
   })
   expect(ledger.show(heldId).body.join('\n')).toContain(`Bob${escaped}approved by host`)
