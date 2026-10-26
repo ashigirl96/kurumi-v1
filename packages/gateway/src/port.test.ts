@@ -171,6 +171,20 @@ async function rawConnect(proxyPort: number, authority: string): Promise<string>
   return response
 }
 
+test('CONNECT to an intercepted host on a non-443 port is refused before opening a tunnel', async () => {
+  const { upstream, gateway } = await setup()
+
+  const response = await rawConnect(gateway.port, 'fake.test:8443')
+
+  expect(response).toStartWith('HTTP/1.1 403 Forbidden\r\n')
+  expect(response).toContain('Connection: close\r\n')
+  expect(response).toContain('Content-Type: text/plain\r\n')
+  expect(response).toContain(
+    'connect to fake.test on port 443; kurumi serves it on no other port\n',
+  )
+  expect(upstream.requests).toHaveLength(0)
+})
+
 async function countingService() {
   const service = createServer((socket) => socket.destroy())
   const state = { accepts: 0, port: 0 }
