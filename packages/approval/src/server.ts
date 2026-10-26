@@ -121,7 +121,7 @@ function recordOf(row: Row): ApprovalRecord {
 }
 
 function nameOf(principal: Principal): string {
-  return principal.kind === 'host' ? 'host' : `user ${principal.userId}`
+  return principal.kind === 'host' ? 'host' : `user ${escapeInvisible(principal.userId)}`
 }
 
 function summary(view: ApprovalView): string {
