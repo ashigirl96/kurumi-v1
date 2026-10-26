@@ -237,6 +237,37 @@ describe('a contract field marked stdin', () => {
 
   const marked = secret.meta({ stdin: true })
 
+  test('reads a repeated stdin marker in one field once, and gets no flag', async () => {
+    const contract = {
+      put: put(z.object({ secret: z.union([marked, marked]) })),
+    }
+
+    expect(await run(['put', 'n'], piped('s3cret\n'), contract)).toBe(0)
+    expect(calls).toEqual([{ path: ['put'], input: ['n', { secret: 's3cret' }] }])
+    expect(stderr).toBe('')
+
+    calls = []
+    expect(await run(['put', 'n', '--secret', 'ARGV'], piped('s3cret'), contract)).toBe(1)
+    expect(stderr).toContain("unknown option '--secret'")
+    expect(calls).toEqual([])
+  })
+
+  test('walks a shared union chain without exponential schema visits', async () => {
+    let field: z.ZodType = marked
+    for (let depth = 0; depth < 35; depth++) field = z.union([field, field])
+    const contract = { put: put(z.object({ secret: field })) }
+    const getMetadata = z.globalRegistry.get.bind(z.globalRegistry)
+    let visits = 0
+    spyOn(z.globalRegistry, 'get').mockImplementation((schema) => {
+      if (++visits > 1000) throw new Error('stdin marker walk exceeded 1000 schema visits')
+      return getMetadata(schema)
+    })
+
+    expect(await run(['put', 'n'], piped('s3cret'), contract)).toBe(0)
+    expect(calls).toEqual([{ path: ['put'], input: ['n', { secret: 's3cret' }] }])
+    expect(visits).toBeLessThan(1000)
+  })
+
   test.each(
     Object.entries({
       object: z.object({ inner: marked }),
