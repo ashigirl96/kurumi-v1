@@ -514,6 +514,32 @@ test('a TRACE to a credentialed host is refused with 405 and nothing goes upstre
   expect(upstream.requests).toEqual([])
 })
 
+test('a TRACK to a credentialed host is refused with 405 and nothing goes upstream', async () => {
+  const { upstream, tunnel, addKey } = await setupCredentials()
+  addKey('main', secrets.main)
+
+  const response = await sendTestRequest(tunnel, {
+    method: 'TRACK',
+    path: '/v1/models',
+    headers: { 'x-api-key': groupSelector },
+  })
+
+  expect(response.status).toBe(405)
+  expect(response.headers.allow).toBe('GET, HEAD, POST, PUT, PATCH, DELETE')
+  expect(response.headers['content-type']).toBe('application/json')
+  expect(response.headers['x-should-retry']).toBe('false')
+  expect(response.headers['x-kurumi-gateway']).toBe('method_not_allowed')
+  expect(JSON.parse(response.body)).toEqual({
+    error: 'method_not_allowed',
+    service: 'anthropic-api',
+    method: 'TRACK',
+    allowed: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'],
+    next: 'send the request as one of GET, HEAD, POST, PUT, PATCH, DELETE; kurumi adds no credential to TRACK',
+  })
+  expect(response.body).not.toContain(secrets.main)
+  expect(upstream.requests).toEqual([])
+})
+
 test('a group with no account is refused with a JSON 403 and nothing goes upstream', async () => {
   const { upstream, tunnel } = await setupCredentials()
 
