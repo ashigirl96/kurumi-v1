@@ -514,6 +514,59 @@ test('a TRACE to a credentialed host is refused with 405 and nothing goes upstre
   expect(upstream.requests).toEqual([])
 })
 
+test('a TRACK to a credentialed host is refused with 405 and nothing goes upstream', async () => {
+  const { upstream, tunnel, addKey } = await setupCredentials()
+  addKey('main', secrets.main)
+
+  const response = await sendTestRequest(tunnel, {
+    method: 'TRACK',
+    path: '/v1/models',
+    headers: { 'x-api-key': groupSelector },
+  })
+
+  expect(response.status).toBe(405)
+  expect(response.headers.allow).toBe('GET, HEAD, POST, PUT, PATCH, DELETE')
+  expect(response.headers['content-type']).toBe('application/json')
+  expect(response.headers['x-should-retry']).toBe('false')
+  expect(response.headers['x-kurumi-gateway']).toBe('method_not_allowed')
+  expect(JSON.parse(response.body)).toEqual({
+    error: 'method_not_allowed',
+    service: 'anthropic-api',
+    method: 'TRACK',
+    allowed: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'],
+    next: 'send the request as one of GET, HEAD, POST, PUT, PATCH, DELETE; kurumi adds no credential to TRACK',
+  })
+  expect(response.body).not.toContain(secrets.main)
+  expect(upstream.requests).toEqual([])
+})
+
+test.each([
+  'GET /v1/models HTTP/1.1\r\nHost: api.anthropic.com\r\nBad Header: value\r\n\r\n',
+  'TR@CK /v1/models HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n',
+])('malformed credentialed HTTP closes without a method refusal: %s', async (bytes) => {
+  const { upstream, tunnel, addKey } = await setupCredentials()
+  addKey('main', secrets.main)
+
+  const response = await exchangeRaw(tunnel.socket, bytes)
+
+  expect(response.status).toBeNaN()
+  expect(response.body).toBe('')
+  expect(upstream.requests).toEqual([])
+})
+
+test('a parser-rejected method without a credential refusal closes without going upstream', async () => {
+  const { upstream, tunnel } = await setup()
+
+  const response = await exchangeRaw(
+    tunnel.socket,
+    'TRACK /echo HTTP/1.1\r\nHost: fake.test\r\n\r\n',
+  )
+
+  expect(response.status).toBeNaN()
+  expect(response.body).toBe('')
+  expect(upstream.requests).toEqual([])
+})
+
 test('a group with no account is refused with a JSON 403 and nothing goes upstream', async () => {
   const { upstream, tunnel } = await setupCredentials()
 
