@@ -14,6 +14,7 @@ import {
   type Leaf,
 } from './ca.ts'
 import { forward, forwardUpgrade, type ConnectTarget, type ForwardDeps } from './forward.ts'
+import { nextStep } from './refusal.ts'
 
 type Tunnel<Principal> = {
   target: ConnectTarget
@@ -260,7 +261,28 @@ export async function startAgentPort<Principal extends object>(deps: {
     }
     if (stopping || client.destroyed) return
     deps.onConnect?.(target)
-    const listener = deps.intercepts(target.host) ? await listenerFor(target.host) : undefined
+    const intercepted = deps.intercepts(target.host)
+    if (intercepted && target.port !== 443) {
+      rejectConnect(
+        client,
+        403,
+        `${nextStep({ code: 'port_not_allowed', host: target.host, port: target.port })}\n`,
+      )
+      deps.forward.log?.({
+        decision: 'refused',
+        refusal: 'port_not_allowed',
+        service: null,
+        principal,
+        at,
+        host: target.host,
+        method: 'CONNECT',
+        path: req.url ?? '',
+        status: 403,
+        durationMs: Math.round(performance.now() - started),
+      })
+      return
+    }
+    const listener = intercepted ? await listenerFor(target.host) : undefined
     const addresses = listener ? [] : await resolve(target.host)
     const host = listener ? [] : readHostAddresses()
     const reason = addresses
