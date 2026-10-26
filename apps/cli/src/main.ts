@@ -373,18 +373,24 @@ const SAME_VALUE_DEF_KEYS = new Set(['innerType', 'in', 'out', 'options', 'left'
 
 function stdinMarkers(
   schema: z.core.$ZodType,
-  at: readonly Step[] = [],
-  ancestors: ReadonlySet<z.core.$ZodType> = new Set(),
+  memo = new Map<z.core.$ZodType, Marker[]>(),
 ): Marker[] {
-  if (ancestors.has(schema)) return []
-  const inside = new Set(ancestors).add(schema)
-  const here = z.globalRegistry.get(schema)?.stdin === true ? [{ at, schema }] : []
-  return [
-    ...here,
-    ...childSchemas(schema).flatMap(([step, child]) =>
-      stdinMarkers(child, step ? [...at, step] : at, inside),
-    ),
+  const cached = memo.get(schema)
+  if (cached) return cached
+  memo.set(schema, [])
+  const here: Marker[] = z.globalRegistry.get(schema)?.stdin === true ? [{ at: [], schema }] : []
+  const markers = [
+    ...new Set([
+      ...here,
+      ...childSchemas(schema).flatMap(([step, child]) =>
+        stdinMarkers(child, memo).map((marker) =>
+          step ? { at: [step, ...marker.at], schema: marker.schema } : marker,
+        ),
+      ),
+    ]),
   ]
+  memo.set(schema, markers)
+  return markers
 }
 
 function childSchemas(schema: z.core.$ZodType): [Step | null, z.core.$ZodType][] {
