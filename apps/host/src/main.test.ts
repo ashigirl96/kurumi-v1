@@ -758,6 +758,31 @@ test('a FIFO at vault.key is refused as not a regular file instead of blocking s
   )
 }, 5000)
 
+test('a FIFO at kurumi.lock is refused as not a regular file instead of blocking start', async () => {
+  const home = homeForTest()
+  expect(Bun.spawnSync(['mkfifo', '-m', '600', join(home, 'kurumi.lock')]).exitCode).toBe(0)
+
+  const host = spawnHost(home)
+
+  expect(await host.exited).toBe(1)
+  expect(await new Response(host.stderr).text()).toContain(
+    `${join(home, 'kurumi.lock')} is not a regular file`,
+  )
+}, 5000)
+
+test('a FIFO at runner/runner.js is refused as not a regular file instead of blocking start', async () => {
+  const home = homeForTest()
+  mkdirSync(join(home, 'runner'))
+  expect(Bun.spawnSync(['mkfifo', '-m', '600', join(home, 'runner/runner.js')]).exitCode).toBe(0)
+
+  const host = spawnHost(home)
+
+  expect(await host.exited).toBe(1)
+  expect(await new Response(host.stderr).text()).toContain(
+    `${join(home, 'runner/runner.js')} is not a regular file`,
+  )
+}, 5000)
+
 test('a gateway approval decided before a restart grants its allowance and notifies its session at the next start', async () => {
   const home = homeForTest()
   await startAndStop(home)
