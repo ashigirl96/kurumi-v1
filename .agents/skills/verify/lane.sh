@@ -98,7 +98,7 @@ doctor() {
 
 add_key() {
   security find-generic-password -s kurumi-live-claude -w |
-    kurumi account add-key anthropic --auth oauth-token --label main --auto-grant
+    kurumi account add-key anthropic --label main --auto-grant
 }
 
 chat() {

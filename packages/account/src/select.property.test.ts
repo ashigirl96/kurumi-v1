@@ -83,7 +83,7 @@ describe('whatever a slot holds', () => {
   const slots: [string, CredentialSlot, (text: string) => string][] = [
     ['bearer', { kind: 'bearer' }, (text) => `Bearer ${text}`],
     ['basic', { kind: 'basic' }, (text) => basic('x', text)],
-    ['header', { kind: 'header', header: 'x-api-key' }, (text) => text],
+    ['header', { kind: 'header', header: 'x-credential' }, (text) => text],
   ]
 
   function* texts(count: number): Generator<string> {
@@ -102,6 +102,7 @@ describe('whatever a slot holds', () => {
         const { selector } = readSelector(
           defaultSelectorShape,
           slot,
+          [],
           request({ [headerOf(slot)]: place(text) }),
         )
         for (const candidates of [several, single]) {

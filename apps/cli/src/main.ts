@@ -255,7 +255,7 @@ const renderers: Readonly<Record<string, (output: unknown) => string>> = {
         .parse(output)
         .map((view) => [
           view.handle,
-          view.authMode ?? view.kind,
+          view.kind,
           view.services.join(','),
           view.autoGrant ? 'auto-grant' : '',
         ]),

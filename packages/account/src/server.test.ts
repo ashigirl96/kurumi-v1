@@ -244,7 +244,6 @@ describe('key accounts', () => {
       vendor: 'anthropic',
       kind: 'key',
       subject: null,
-      authMode: 'api-key',
       services: ['anthropic-api'],
       status: 'active',
       autoGrant: false,
@@ -257,28 +256,12 @@ describe('key accounts', () => {
     })
   })
 
-  test('the auth mode named is stored, and a vendor without modes stores none', () => {
-    addKey({ authMode: 'oauth-token' })
-    addKey({ vendor: 'github', label: 'gh' })
-
-    expect(accountRow('main')?.authMode).toBe('oauth-token')
-    expect(accountRow('gh')?.authMode).toBeNull()
-  })
-
-  test('an auth mode the vendor lacks is refused and adds no row', () => {
-    expect(addKey({ vendor: 'github', label: 'gh', authMode: 'api-key' })).toEqual({
-      ok: false,
-      refusal: 'auth_mode_not_supported',
-    })
-    expect(accountRow('gh')).toBeUndefined()
-  })
-
   test('a duplicate label is refused and the first key stays the only row', () => {
     addKey()
     const first = accountRow('main')
     expect(first).toBeDefined()
 
-    expect(addKey({ value: 'sk-ant-other', authMode: 'oauth-token' })).toEqual({
+    expect(addKey({ value: 'sk-ant-other' })).toEqual({
       ok: false,
       refusal: 'label_taken',
     })
@@ -336,7 +319,7 @@ describe('key accounts', () => {
   })
 
   test('list shows every account by handle, without material, ordered by handle', () => {
-    addKey({ authMode: 'oauth-token', autoGrant: true })
+    addKey({ autoGrant: true })
 
     const views = ledger.list()
 
@@ -350,7 +333,6 @@ describe('key accounts', () => {
     expect(views[0]).toEqual({
       handle: accountHandle('anthropic', 'main'),
       kind: 'key',
-      authMode: 'oauth-token',
       services: ['anthropic-api'],
       autoGrant: true,
     })
@@ -504,7 +486,7 @@ describe('the account router', () => {
     expect(
       await client({ kind: 'human', userId: 'u1' }).addKey([
         'anthropic',
-        { label: 'main', value: secret, autoGrant: true, auth: 'oauth-token' },
+        { label: 'main', value: secret, autoGrant: true },
       ]),
     ).toEqual({ handle: 'anthropic/main' })
     expect(grantRows().map(({ grantedBy }) => grantedBy)).toEqual([
@@ -515,7 +497,6 @@ describe('the account router', () => {
     expect(await client().list()).toContainEqual({
       handle: 'anthropic/main',
       kind: 'key',
-      authMode: 'oauth-token',
       services: ['anthropic-api'],
       autoGrant: true,
     })
@@ -527,12 +508,6 @@ describe('the account router', () => {
     const error = await failure(client().addKey(['anthropic', { label: 'main', value: secret }]))
 
     expect(error).toEqual({ code: 'CONFLICT', message: 'anthropic/main already exists' })
-  })
-
-  test('an auth mode the vendor lacks is a BAD_REQUEST', async () => {
-    expect(
-      await failure(client().addKey(['github', { label: 'gh', value: secret, auth: 'api-key' }])),
-    ).toEqual({ code: 'BAD_REQUEST', message: 'github has no auth mode api-key; it takes none' })
   })
 
   test.each([
@@ -641,20 +616,6 @@ describe('the account router', () => {
 })
 
 describe('what the database refuses without the ledger', () => {
-  test.each([null, 'password'])(
-    'an anthropic account with auth mode %p fails the CHECK',
-    (mode) => {
-      expect(() =>
-        db.$client
-          .query(
-            `INSERT INTO account (id, vendor, label, kind, auth_mode, services, material, status, created_at)
-           VALUES ('acc-x', 'anthropic', 'x', 'key', ?, '["anthropic-api"]', x'', 'active', 0)`,
-          )
-          .run(mode),
-      ).toThrow(/CHECK constraint failed: account_auth_mode_of_vendor/)
-    },
-  )
-
   test('a service of another vendor fails the CHECK', () => {
     expect(() => insertGrant('google', 'acc-a', 'notion')).toThrow(
       /CHECK constraint failed: account_grant_service_of_vendor/,
@@ -714,7 +675,7 @@ const anthropicApi = (lines: HeaderLines = [], path = '/v1/messages', method = '
 const anthropicGroupSelector = 'sk-ant-kurumi-YW50aHJvcGlj'
 const secondSecret = 'sk-ant-api03-second'
 const oauthBeta = 'oauth-2025-04-20'
-const sdkApiKeyBetas =
+const sdkBaseBetas =
   'claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,thinking-display-updates-2026-08-18'
 const sdkOauthBetas =
   'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,advanced-tool-use-2025-11-20,effort-2025-11-24,thinking-display-updates-2026-08-18,extended-cache-ttl-2025-04-11'
@@ -829,90 +790,46 @@ describe('the credential for a Google request', () => {
 
 describe('the slot an Anthropic account is written to', () => {
   test.each([
-    [
-      'an oauth-token account read from Authorization',
-      'oauth-token',
-      [['Authorization', `Bearer ${anthropicGroupSelector}`]],
-      {
-        authorization: `Bearer ${secret}`,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta': oauthBeta,
-      },
-    ],
-    [
-      'an oauth-token account read from x-api-key',
-      'oauth-token',
-      [['X-Api-Key', anthropicGroupSelector]],
-      {
-        authorization: `Bearer ${secret}`,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta': oauthBeta,
-      },
-    ],
-    [
-      'an api-key account read from x-api-key',
-      'api-key',
-      [['X-Api-Key', anthropicGroupSelector]],
-      { 'x-api-key': secret, 'anthropic-version': '2023-06-01' },
-    ],
-    [
-      'an api-key account named in Authorization',
-      'api-key',
-      [['Authorization', 'Bearer kurumi:anthropic/main']],
-      { 'x-api-key': secret, 'anthropic-version': '2023-06-01' },
-    ],
-    [
-      'an api-key account under the client own Authorization',
-      'api-key',
-      [
-        ['Authorization', 'Bearer sk-ant-oat01-client-own'],
-        ['X-Api-Key', anthropicGroupSelector],
-      ],
-      { 'x-api-key': secret, 'anthropic-version': '2023-06-01' },
-    ],
-  ] as const)('%s', (_name, authMode, lines, headers) => {
-    addKey({ authMode, autoGrant: true })
+    ['the group selector', `Bearer ${anthropicGroupSelector}`],
+    ['a named selector', 'Bearer kurumi:anthropic/main'],
+    ['the client own credential', 'Bearer sk-ant-oat01-client-own'],
+  ])('%s is replaced with the account bearer', (_name, authorization) => {
+    addKey({ autoGrant: true })
 
-    const request = anthropicApi([...lines, ['anthropic-version', '2023-06-01']])
+    const request = anthropicApi([
+      ['Authorization', authorization],
+      ['anthropic-version', '2023-06-01'],
+    ])
 
     expect(sent(decide('g1', request))).toEqual({
       handle: accountHandle('anthropic', 'main'),
       path: '/v1/messages',
-      headers,
+      headers: {
+        authorization: `Bearer ${secret}`,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': oauthBeta,
+      },
     })
   })
 
-  test.each(['api-key', 'oauth-token'] as const)(
-    'the raw path of an %s account goes upstream as written',
-    (authMode) => {
-      addKey({ authMode, autoGrant: true })
-      const path = '/v1/./models/../messages?beta=%2Fx%41&q=a+b'
+  test('the raw path goes upstream as written', () => {
+    addKey({ autoGrant: true })
+    const path = '/v1/./models/../messages?beta=%2Fx%41&q=a+b'
 
-      expect(sent(decide('g1', anthropicApi([], path))).path).toBe(path)
-    },
-  )
+    expect(sent(decide('g1', anthropicApi([], path))).path).toBe(path)
+  })
 
-  test.each([
-    [
-      'authorization',
-      [
-        ['Authorization', 'Bearer kurumi:anthropic/main'],
-        ['authorization', 'x'],
-      ],
-    ],
-    [
-      'x-api-key',
-      [
-        ['X-Api-Key', anthropicGroupSelector],
-        ['x-api-key', 'sk-ant-other'],
-      ],
-    ],
-  ] as const)('two %s lines are refused before any account is chosen', (header, lines) => {
+  test('two Authorization lines are refused before any account is chosen', () => {
     addKey({ autoGrant: true })
 
-    expect(decide('g1', anthropicApi(lines))).toEqual({
+    const request = anthropicApi([
+      ['Authorization', 'Bearer kurumi:anthropic/main'],
+      ['authorization', 'x'],
+    ])
+
+    expect(decide('g1', request)).toEqual({
       kind: 'refuse',
-      refusal: { code: 'duplicate_slot', service: 'anthropic-api', header },
+      refusal: { code: 'duplicate_slot', service: 'anthropic-api', header: 'authorization' },
     })
   })
 
@@ -920,7 +837,7 @@ describe('the slot an Anthropic account is written to', () => {
     addKey({ autoGrant: true })
 
     const request = anthropicApi([
-      ['X-Api-Key', anthropicGroupSelector],
+      ['x-api-key', anthropicGroupSelector],
       ['X_Api_Key', 'sk-ant-other'],
     ])
 
@@ -930,43 +847,31 @@ describe('the slot an Anthropic account is written to', () => {
     })
   })
 
-  test.each([
-    ['x_api_key', 'api-key', { 'x-api-key': secret }],
-    [
-      'X-Api_Key',
-      'oauth-token',
-      { authorization: `Bearer ${secret}`, 'anthropic-beta': oauthBeta },
-    ],
-  ] as const)(
-    'a %s header does not reach the upstream beside an %s account',
-    (name, authMode, headers) => {
-      addKey({ authMode, autoGrant: true })
-
-      const request = anthropicApi([[name, 'sk-ant-api03-client-own']])
-
-      expect(sent(decide('g1', request)).headers).toEqual(headers)
-    },
-  )
-
-  test('a selector in x_api_key names the account like one in x-api-key', () => {
+  test('a selector in Authorization beside one in x-api-key is refused', () => {
     addKey({ autoGrant: true })
-    addKey({ label: 'second', value: secondSecret, autoGrant: true })
-    setDefault('g1', idOf('main'), 'anthropic-api')
 
-    const request = anthropicApi([['x_api_key', 'kurumi:anthropic/second']])
+    const request = anthropicApi([
+      ['Authorization', 'Bearer kurumi:anthropic/main'],
+      ['x-api-key', anthropicGroupSelector],
+    ])
 
-    expect(sent(decide('g1', request))).toMatchObject({
-      handle: accountHandle('anthropic', 'second'),
-      headers: { 'x-api-key': secondSecret },
+    expect(decide('g1', request)).toEqual({
+      kind: 'refuse',
+      refusal: {
+        code: 'selector_unreadable',
+        service: 'anthropic-api',
+        written: `kurumi:anthropic/main | ${anthropicGroupSelector}`,
+        accepted: ['sk-ant-kurumi-YW50aHJvcGljL21haW4', 'kurumi:anthropic/main'],
+      },
     })
   })
 
   test.each([
-    ['the Agent SDK in OAuth mode', [['anthropic-beta', sdkOauthBetas]], sdkOauthBetas],
+    ['the Agent SDK with the OAuth beta', [['anthropic-beta', sdkOauthBetas]], sdkOauthBetas],
     [
-      'the Agent SDK in API-key mode',
-      [['anthropic-beta', sdkApiKeyBetas]],
-      `${sdkApiKeyBetas},${oauthBeta}`,
+      'the Agent SDK without the OAuth beta',
+      [['anthropic-beta', sdkBaseBetas]],
+      `${sdkBaseBetas},${oauthBeta}`,
     ],
     ['no beta header', [], oauthBeta],
     ['an empty beta header', [['anthropic-beta', '']], oauthBeta],
@@ -980,6 +885,14 @@ describe('the slot an Anthropic account is written to', () => {
     ],
     ['the OAuth beta in upper case', [['anthropic-beta', 'OAUTH-2025-04-20']], oauthBeta],
     [
+      'duplicate betas with mixed case and empty entries',
+      [
+        ['anthropic-beta', ` claude-code-20250219, ${oauthBeta},,OAUTH-2025-04-20 `],
+        ['Anthropic_Beta', `claude-code-20250219,${oauthBeta}`],
+      ],
+      `claude-code-20250219,${oauthBeta}`,
+    ],
+    [
       'betas under anthropic_beta',
       [['Anthropic_Beta', 'claude-code-20250219']],
       `claude-code-20250219,${oauthBeta}`,
@@ -992,50 +905,12 @@ describe('the slot an Anthropic account is written to', () => {
       ],
       `claude-code-20250219,${oauthBeta}`,
     ],
-  ] as const)(
-    'an oauth-token account lists the OAuth beta once after %s',
-    (_client, lines, beta) => {
-      addKey({ authMode: 'oauth-token', autoGrant: true })
+  ] as const)('an account lists the OAuth beta once after %s', (_client, lines, beta) => {
+    addKey({ autoGrant: true })
 
-      expect(betaLines(sent(decide('g1', anthropicApi(lines))).headers)).toEqual([
-        ['anthropic-beta', beta],
-      ])
-    },
-  )
-
-  test.each([
-    ['the Agent SDK in API-key mode', [['anthropic-beta', sdkApiKeyBetas]], sdkApiKeyBetas],
-    [
-      'the Agent SDK in OAuth mode',
-      [['anthropic-beta', sdkOauthBetas]],
-      sdkOauthBetas.replace(`,${oauthBeta}`, ''),
-    ],
-    ['only the OAuth beta', [['anthropic-beta', oauthBeta]], undefined],
-    [
-      'the OAuth beta in upper case',
-      [['anthropic-beta', 'claude-code-20250219,OAuth-2025-04-20']],
-      'claude-code-20250219',
-    ],
-    ['only the OAuth beta under anthropic_beta', [['anthropic_beta', oauthBeta]], undefined],
-    [
-      'betas under anthropic_beta',
-      [['Anthropic_Beta', sdkOauthBetas]],
-      sdkOauthBetas.replace(`,${oauthBeta}`, ''),
-    ],
-    [
-      'one beta under both anthropic-beta and anthropic_beta',
-      [
-        ['anthropic-beta', 'claude-code-20250219'],
-        ['anthropic_beta', 'claude-code-20250219'],
-      ],
-      'claude-code-20250219',
-    ],
-  ] as const)('an api-key account drops only the OAuth beta after %s', (_client, lines, beta) => {
-    addKey({ authMode: 'api-key', autoGrant: true })
-
-    expect(betaLines(sent(decide('g1', anthropicApi(lines))).headers)).toEqual(
-      beta === undefined ? [] : [['anthropic-beta', beta]],
-    )
+    expect(betaLines(sent(decide('g1', anthropicApi(lines))).headers)).toEqual([
+      ['anthropic-beta', beta],
+    ])
   })
 
   test('a selector kurumi cannot read is refused with the selectors the group may write', () => {
@@ -1066,7 +941,7 @@ describe('the slot an Anthropic account is written to', () => {
     const decision = decide('g1', anthropicApi())
     if (decision.kind !== 'inject') throw new Error(`expected an injection, not ${decision.kind}`)
 
-    expect(decision.injection.apply().headers.get('x-api-key')).toBe(secret)
+    expect(decision.injection.apply().headers.get('authorization')).toBe(`Bearer ${secret}`)
     expect(() => JSON.stringify(decision)).toThrow(
       'an Injection holds a credential and cannot be serialized',
     )
@@ -1074,14 +949,11 @@ describe('the slot an Anthropic account is written to', () => {
   })
 })
 
-const clientLines = (env: Record<string, string>): [string, string][] =>
-  Object.entries(env).map(([name, value]) =>
-    name === 'CLAUDE_CODE_OAUTH_TOKEN'
-      ? ['Authorization', `Bearer ${value}`]
-      : ['X-Api-Key', value],
-  )
+const clientLines = (env: Record<string, string>): [string, string][] => [
+  ['Authorization', `Bearer ${env.CLAUDE_CODE_OAUTH_TOKEN ?? ''}`],
+]
 
-const fromContainer = () => decide('g1', anthropicApi(clientLines(ledger.containerEnv('g1'))))
+const fromContainer = () => decide('g1', anthropicApi(clientLines(ledger.containerEnv())))
 
 describe('the container env as the client credential', () => {
   test('one grant is used', () => {
@@ -1092,7 +964,7 @@ describe('the container env as the client credential', () => {
 
   test('the default is used among several grants', () => {
     addKey({ autoGrant: true })
-    addKey({ label: 'second', value: secondSecret, authMode: 'oauth-token', autoGrant: true })
+    addKey({ label: 'second', value: secondSecret, autoGrant: true })
     setDefault('g1', idOf('second'), 'anthropic-api')
 
     expect(sent(fromContainer())).toMatchObject({
@@ -1146,19 +1018,19 @@ describe('the methods a credential travels on', () => {
 })
 
 test('the selector a container got at spawn follows every later grant change', () => {
-  const [selector = ''] = Object.values(ledger.containerEnv('g1'))
+  const [selector = ''] = Object.values(ledger.containerEnv())
   const decideAsSpawned = () =>
     decide('g1', anthropicApi([['Authorization', `Bearer ${selector}`]]))
   const main = accountHandle('anthropic', 'main')
   const second = accountHandle('anthropic', 'second')
 
-  addKey({ authMode: 'oauth-token', autoGrant: true })
+  addKey({ autoGrant: true })
   expect(sent(decideAsSpawned())).toMatchObject({
     handle: main,
     headers: { authorization: `Bearer ${secret}` },
   })
 
-  addKey({ label: 'second', value: secondSecret, authMode: 'oauth-token', autoGrant: true })
+  addKey({ label: 'second', value: secondSecret, autoGrant: true })
   expect(decideAsSpawned()).toEqual({
     kind: 'refuse',
     refusal: { code: 'account_ambiguous', service: 'anthropic-api', granted: [main, second] },
@@ -1184,41 +1056,19 @@ test('the selector a container got at spawn follows every later grant change', (
 })
 
 describe('the container env', () => {
-  test('with no grant holds the Group Selector in the vendor default mode', () => {
-    expect(ledger.containerEnv('g1')).toEqual({ ANTHROPIC_API_KEY: anthropicGroupSelector })
+  test('holds exactly the OAuth Group Selector before any grant', () => {
+    expect(ledger.containerEnv()).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: anthropicGroupSelector })
   })
 
-  test('with one oauth-token grant holds the Group Selector as the OAuth token', () => {
-    addKey({ authMode: 'oauth-token', autoGrant: true })
+  test('holds the same OAuth Group Selector across grant and default changes', () => {
+    addKey({ autoGrant: true })
+    addKey({ label: 'second', value: secondSecret, autoGrant: true })
+    expect(ledger.containerEnv()).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: anthropicGroupSelector })
 
-    expect(ledger.containerEnv('g1')).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: anthropicGroupSelector })
-  })
-
-  test('with one api-key grant holds the Group Selector as the API key', () => {
-    addKey({ authMode: 'api-key', autoGrant: true })
-
-    expect(ledger.containerEnv('g1')).toEqual({ ANTHROPIC_API_KEY: anthropicGroupSelector })
-  })
-
-  test('with mixed modes follows the default', () => {
-    addKey({ authMode: 'api-key', autoGrant: true })
-    addKey({ label: 'second', value: secondSecret, authMode: 'oauth-token', autoGrant: true })
     setDefault('g1', idOf('second'), 'anthropic-api')
+    expect(ledger.containerEnv()).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: anthropicGroupSelector })
 
-    expect(ledger.containerEnv('g1')).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: anthropicGroupSelector })
-  })
-
-  test('with mixed modes and no default falls back to the vendor default mode', () => {
-    addKey({ authMode: 'oauth-token', autoGrant: true })
-    addKey({ label: 'second', value: secondSecret, authMode: 'api-key', autoGrant: true })
-
-    expect(ledger.containerEnv('g1')).toEqual({ ANTHROPIC_API_KEY: anthropicGroupSelector })
-  })
-
-  test('with several grants in one mode and no default uses that mode', () => {
-    addKey({ authMode: 'oauth-token', autoGrant: true })
-    addKey({ label: 'second', value: secondSecret, authMode: 'oauth-token', autoGrant: true })
-
-    expect(ledger.containerEnv('g1')).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: anthropicGroupSelector })
+    revoke('g1', idOf('second'), 'anthropic-api')
+    expect(ledger.containerEnv()).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: anthropicGroupSelector })
   })
 })

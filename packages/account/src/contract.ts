@@ -1,7 +1,7 @@
 import { kc } from '@kurumi/rpc/contract'
 import { z } from 'zod'
 
-import { authModeIds, keyVendorIds, serviceIds } from './catalog.ts'
+import { keyVendorIds, serviceIds } from './catalog.ts'
 
 export const ServiceIdSchema = z.enum(serviceIds)
 export const HandleSchema = z.string().min(1).describe('handle')
@@ -27,7 +27,6 @@ export const AddKeyOutputSchema = z.object({ handle: z.string() })
 export const AccountViewSchema = z.object({
   handle: z.string(),
   kind: z.enum(['oauth', 'key']),
-  authMode: z.enum(authModeIds).nullable(),
   services: z.array(ServiceIdSchema),
   autoGrant: z.boolean(),
 })
@@ -40,7 +39,6 @@ export const contract = {
         z.enum(keyVendorIds).describe('vendor'),
         z.object({
           label: z.string().min(1),
-          auth: z.enum(authModeIds).optional(),
           autoGrant: z.boolean().default(false),
           value: KeyValueSchema.meta({ stdin: true }),
         }),

@@ -6,16 +6,12 @@ import { and, eq, sql } from 'drizzle-orm'
 import { z } from 'zod'
 
 import {
-  authModesOf,
-  defaultAuthModeOf,
-  placementOf,
   selectorShapeOf,
   serviceFor,
   serviceIds,
   servicesOf,
   serviceSpec,
   vendorOf,
-  type AuthMode,
   type KeyVendorId,
   type ServiceId,
   type VendorId,
@@ -46,7 +42,7 @@ export type {
   SelectionRefusal,
   Selector,
 } from './select.ts'
-export type { AuthMode, KeyVendorId, ServiceId, VendorId }
+export type { KeyVendorId, ServiceId, VendorId }
 
 export type GrantKey = { agentGroupId: string; accountId: string; service: ServiceId }
 
@@ -65,12 +61,11 @@ export type AccountMaterial = z.infer<typeof accountMaterial>
 export type AddKeyInput = {
   vendor: KeyVendorId
   label: string
-  authMode?: AuthMode
   value: string
   autoGrant: boolean
 }
 
-export type AddKeyRefusal = 'label_taken' | 'auth_mode_not_supported'
+export type AddKeyRefusal = 'label_taken'
 
 export type AddKeyResult =
   | { ok: true; handle: AccountHandle }
@@ -85,7 +80,6 @@ export type RemoveResult = { ok: true } | { ok: false; refusal: HandleRefusal }
 export type AccountView = {
   handle: AccountHandle
   kind: 'oauth' | 'key'
-  authMode: AuthMode | null
   services: ServiceId[]
   autoGrant: boolean
 }
@@ -131,21 +125,25 @@ export type AccountLedger = {
   clearDefault(tx: Tx, input: { agentGroupId: string; service: ServiceId }): void
   candidates(agentGroupId: string, service: ServiceId): GrantedCandidate[]
   credentialFor(principal: CredentialPrincipal, request: EgressRequest): CredentialDecision
-  containerEnv(agentGroupId: string): Record<string, string>
+  containerEnv(): Record<string, string>
 }
 
-type GrantRow = GrantedCandidate & Pick<typeof account.$inferSelect, 'authMode' | 'material'>
+type GrantRow = GrantedCandidate & Pick<typeof account.$inferSelect, 'material'>
 
 function slotHeadersOf(service: ServiceId): string[] {
-  const slots = [
-    serviceSpec(service).slot,
-    ...authModesOf(vendorOf(service)).map((mode) => placementOf(service, mode).slot),
+  const { slot, otherCredentialHeaders = [] } = serviceSpec(service)
+  return [
+    ...new Set(
+      [
+        'authorization',
+        ...(slot.kind === 'header' ? [slot.header] : []),
+        ...otherCredentialHeaders,
+      ].map((header) => header.toLowerCase()),
+    ),
   ]
-  const named = slots.flatMap((slot) => (slot.kind === 'header' ? [slot.header.toLowerCase()] : []))
-  return [...new Set(['authorization', ...named])]
 }
 
-/** Some servers read `_` as `-` in a header name, so `x_api_key` is the `x-api-key` slot. */
+/** Some servers read `_` as `-` in a header name, so `x_credential` is the `x-credential` slot. */
 export const headerNameAsRead = (name: string): string => name.toLowerCase().replaceAll('_', '-')
 
 function withSlotNames(headers: Headers, slotHeaders: readonly string[]): Headers {
@@ -174,18 +172,14 @@ function duplicatedHeader(
 /** TRACE and its kin echo the request back, credential included. */
 const credentialedMethods: readonly string[] = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']
 
-type ModeBeta = { header: string; token: string; mode: AuthMode }
+type RequiredBeta = { header: string; token: string }
 
 /** Anthropic answers an OAuth bearer only when the request lists this beta. */
-const modeBetaOf: Partial<Record<ServiceId, ModeBeta>> = {
-  'anthropic-api': { header: 'anthropic-beta', token: 'oauth-2025-04-20', mode: 'oauth-token' },
+const requiredBetaOf: Partial<Record<ServiceId, RequiredBeta>> = {
+  'anthropic-api': { header: 'anthropic-beta', token: 'oauth-2025-04-20' },
 }
 
-function setBetaForAccountMode(
-  headers: Headers,
-  { header, token, mode }: ModeBeta,
-  authMode: AuthMode | null,
-) {
+function setRequiredBeta(headers: Headers, { header, token }: RequiredBeta) {
   const names = [...headers.keys()].filter((name) => headerNameAsRead(name) === header)
   const betas = new Set(
     names
@@ -195,9 +189,8 @@ function setBetaForAccountMode(
       .map((beta) => (beta.toLowerCase() === token ? token : beta)),
   )
   for (const name of names) headers.delete(name)
-  if (authMode === mode) betas.add(token)
-  else betas.delete(token)
-  if (betas.size > 0) headers.set(header, [...betas].join(','))
+  betas.add(token)
+  headers.set(header, [...betas].join(','))
 }
 
 function keyOf(vaultKey: Uint8Array, row: GrantRow): string | null {
@@ -232,8 +225,8 @@ function injectionFor({
   stripped: { headers: Headers; url: URL }
   requested: { path: string; url: URL }
 }): Injection {
-  const { slot } = placementOf(service, row.authMode)
-  const modeBeta = modeBetaOf[service]
+  const { slot } = serviceSpec(service)
+  const requiredBeta = requiredBetaOf[service]
   return Object.freeze({
     service,
     handle: row.handle,
@@ -242,7 +235,7 @@ function injectionFor({
       const headers = new Headers(stripped.headers)
       const url = new URL(stripped.url)
       for (const header of slotHeaders) headers.delete(header)
-      if (modeBeta) setBetaForAccountMode(headers, modeBeta, row.authMode)
+      if (requiredBeta) setRequiredBeta(headers, requiredBeta)
       switch (slot.kind) {
         case 'bearer':
           headers.set('authorization', `Bearer ${secret}`)
@@ -338,23 +331,6 @@ function opens(vaultKey: Uint8Array, accountId: string, material: Uint8Array): b
   }
 }
 
-const containerEnvServices = serviceIds.filter((service) =>
-  authModesOf(vendorOf(service)).some(
-    (mode) => placementOf(service, mode).containerEnv !== undefined,
-  ),
-)
-
-function unnamedRequestAuthMode(service: ServiceId, rows: readonly GrantRow[]): AuthMode | null {
-  const selection = selectAccount(service, rows, { kind: 'none' })
-  const chosen = selection.ok
-    ? rows.find((row) => row.accountId === selection.accountId)
-    : undefined
-  if (chosen) return chosen.authMode
-  const [first, ...others] = rows
-  if (first && others.every((row) => row.authMode === first.authMode)) return first.authMode
-  return defaultAuthModeOf(vendorOf(service))
-}
-
 export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): AccountLedger {
   const grantRowsQuery = deps.db
     .select({
@@ -362,7 +338,6 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
       vendor: account.vendor,
       label: account.label,
       status: account.status,
-      authMode: account.authMode,
       material: account.material,
       defaultAccountId: defaultAccount.accountId,
     })
@@ -394,16 +369,11 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
       handle: accountHandle(row.vendor, row.label),
       isDefault: row.defaultAccountId !== null,
       status: row.status,
-      authMode: row.authMode,
       material: row.material,
     }))
 
   return {
-    addKey(tx, { vendor, label, authMode, value, autoGrant }) {
-      const modes = authModesOf(vendor)
-      if (authMode !== undefined && !modes.includes(authMode)) {
-        return { ok: false, refusal: 'auth_mode_not_supported' }
-      }
+    addKey(tx, { vendor, label, value, autoGrant }) {
       const taken = tx
         .select({ id: account.id })
         .from(account)
@@ -420,7 +390,6 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
           label,
           subject: null,
           kind: 'key',
-          authMode: authMode ?? defaultAuthModeOf(vendor),
           services,
           material: seal(deps.vaultKey, id, JSON.stringify(material)),
           status: 'active',
@@ -453,7 +422,6 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
           vendor: account.vendor,
           label: account.label,
           kind: account.kind,
-          authMode: account.authMode,
           services: account.services,
           autoGrant: account.autoGrant,
         })
@@ -555,6 +523,7 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
       const { selector, stripped } = readSelector(
         selectorShapeOf(vendor),
         serviceSpec(service).slot,
+        serviceSpec(service).otherCredentialHeaders ?? [],
         { headers: withSlotNames(request.headers, slotHeaders), url },
       )
       const rows = grantRows(agentGroupId, service)
@@ -582,11 +551,10 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
       }
     },
 
-    containerEnv(agentGroupId) {
+    containerEnv() {
       return Object.fromEntries(
-        containerEnvServices.flatMap((service) => {
-          const mode = unnamedRequestAuthMode(service, grantRows(agentGroupId, service))
-          const env = placementOf(service, mode).containerEnv?.(groupSelector(vendorOf(service)))
+        serviceIds.flatMap((service) => {
+          const env = serviceSpec(service).containerEnv?.(groupSelector(vendorOf(service)))
           return Object.entries(env ?? {})
         }),
       )
@@ -598,14 +566,13 @@ type Refusal = AddKeyRefusal | HandleRefusal | GrantRefusal | 'grant_not_found'
 
 type RefusalSubject = {
   handle: string
-  authMode?: AuthMode
   service?: ServiceId
   agentGroupId?: string
 }
 
 function refusalError(
   refusal: Refusal,
-  { handle, authMode, service, agentGroupId }: RefusalSubject,
+  { handle, service, agentGroupId }: RefusalSubject,
 ): ORPCError<string, unknown> {
   switch (refusal) {
     case 'label_taken':
@@ -618,14 +585,6 @@ function refusalError(
       return new ORPCError('BAD_REQUEST', {
         message: `${handle} is not <vendor>/<label> with a known vendor`,
       })
-    case 'auth_mode_not_supported': {
-      const vendor = parseAccountHandle(handle)?.vendor
-      const modes = vendor ? authModesOf(vendor) : []
-      const accepted = modes.length > 0 ? `use one of ${modes.join(', ')}` : 'it takes none'
-      return new ORPCError('BAD_REQUEST', {
-        message: `${vendor} has no auth mode ${authMode}; ${accepted}`,
-      })
-    }
     case 'service_not_covered':
       return new ORPCError('BAD_REQUEST', { message: `${handle} does not cover ${service}` })
     case 'grant_not_found':
@@ -655,12 +614,11 @@ function existingAccountId(ledger: AccountLedger, tx: Tx, handle: string): strin
 const os = implement(contract).$context<KurumiContext & { accountLedger: AccountLedger }>()
 
 export const router = os.router({
-  addKey: os.addKey.handler(({ context, input: [vendor, { label, auth, autoGrant, value }] }) => {
+  addKey: os.addKey.handler(({ context, input: [vendor, { label, autoGrant, value }] }) => {
     const result = transaction(context.db, (tx) =>
-      context.accountLedger.addKey(tx, { vendor, label, authMode: auth, value, autoGrant }),
+      context.accountLedger.addKey(tx, { vendor, label, value, autoGrant }),
     )
-    if (!result.ok)
-      throw refusalError(result.refusal, { handle: `${vendor}/${label}`, authMode: auth })
+    if (!result.ok) throw refusalError(result.refusal, { handle: `${vendor}/${label}` })
     return { handle: result.handle }
   }),
   list: os.list.handler(({ context }) => context.accountLedger.list()),

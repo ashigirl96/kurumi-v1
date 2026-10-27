@@ -279,11 +279,11 @@ export async function startHost(config: HostConfig) {
               since: new Date(),
             }
           },
-          contribution: ({ agentGroupId, sessionToken }) => {
+          contribution: ({ sessionToken }) => {
             const container = revisionedEgress({ sessionToken })
             return {
               ...container,
-              env: { ...accountLedger.containerEnv(agentGroupId), ...container.env },
+              env: { ...accountLedger.containerEnv(), ...container.env },
             }
           },
         },

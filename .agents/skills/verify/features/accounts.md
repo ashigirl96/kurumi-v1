@@ -12,14 +12,14 @@ owner は vendor の key を一度追加し、kurumi はそれを vault に封�
 
 ## How to get to it (user POV)
 
-- `security find-generic-password -s kurumi-live-claude -w | kurumi account add-key anthropic --auth oauth-token --label main --auto-grant`
+- `security find-generic-password -s kurumi-live-claude -w | kurumi account add-key anthropic --label main --auto-grant`
 - `kurumi account list`、`kurumi account grant|revoke <handle> --service anthropic-api --agent-group-id <id>`、`kurumi account remove <handle>`、`kurumi account set-default|clear-default`。
 
 ## Driving it with lane.sh
 
 前提: README の基本の状態（key を追加し、`work` を作り、chat を 1 回済ませた）。
 
-- **追加.** `L add-key <n>` が `anthropic/main` を出力する。`L kurumi <n> account list` が `anthropic/main  oauth-token  anthropic-api  auto-grant` を示す。
+- **追加.** `L add-key <n>` が `anthropic/main` を出力する。`L kurumi <n> account list` が `anthropic/main  key  anthropic-api  auto-grant` を示す。
 - **差し替え.** `L probe <n>` が `x-kurumi-account: anthropic/main` と `status=200` を出力する。
 - **container は key を持たない.** `docker exec <container> sh -c 'echo $CLAUDE_CODE_OAUTH_TOKEN'` は本物の token ではなく `sk-ant-kurumi-`（selector）で始まる。evidence に値の全体を残さないよう、`cut -c1-14` を通す。
 - **Revoke.** `L kurumi <n> account revoke anthropic/main --service anthropic-api --agent-group-id <id>` のあと、`L probe <n>` が `status=403` を出力する。`L kurumi <n> gateway log --decision refused` にその行が出る。

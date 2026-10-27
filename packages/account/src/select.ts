@@ -269,6 +269,7 @@ function parseQueryValue(shape: SelectorShape, value: string): string | null {
 export function readSelector(
   shape: SelectorShape,
   slot: CredentialSlot,
+  otherCredentialHeaders: readonly string[],
   req: { headers: Headers; url: URL },
 ): { selector: Selector; stripped: { headers: Headers; url: URL } } {
   const headers = new Headers(req.headers)
@@ -276,7 +277,15 @@ export function readSelector(
   const parse = (credential: string) =>
     slot.kind === 'query' ? parseQueryValue(shape, credential) : shape.parse(credential)
   return {
-    selector: selectorIn(takeWritten(slot, headers, url), parse),
+    selector: selectorIn(
+      [
+        ...takeWritten(slot, headers, url),
+        ...otherCredentialHeaders.flatMap((header) =>
+          takeHeader(headers, header, alone(mentions), (written) => written.mentions),
+        ),
+      ],
+      parse,
+    ),
     stripped: { headers, url },
   }
 }

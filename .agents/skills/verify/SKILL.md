@@ -17,7 +17,7 @@ kurumi は host process（`apps/host`）で、`$KURUMI_HOME/kurumi.sock` 越し�
 | `up <n>` | `bun install --frozen-lockfile`、`container/` の `docker build`、`scripts/build-runner.ts` を流し、host を起動して **ready** まで待つ。ready は、`host.log` に新しい `host.runtime` 行が出て、`kurumi gateway status` が `admission open` を示した状態をいう。 |
 | `doctor <n>` | 読むだけの確認。`kurumi.lock` の pid が生きた `apps/host/src/main.ts` であること、`kurumi status` が応えること、admission が open であること、host が Agent Port を持っていること、image があることを見て、lane の container を並べる。`FAIL` が 1 つでもあれば exit 1。 |
 | `kurumi <n> <args…>` | この lane に向けて CLI を呼ぶ。例: `kurumi 3 approval list`。 |
-| `add-key <n>` | owner の subscription token を macOS の keychain（service `kurumi-live-claude`）から読み、`account add-key anthropic --auth oauth-token --label main --auto-grant` に stdin で渡す。`anthropic/main` を出力する。 |
+| `add-key <n>` | owner の subscription token を macOS の keychain（service `kurumi-live-claude`）から読み、`account add-key anthropic --label main --auto-grant` に stdin で渡す。`anthropic/main` を出力する。 |
 | `chat <n> <agent> <line>` | `kurumi chat` で 1 行送り、返事か error の行が届くまで stdin を開けておく（`KURUMI_VERIFY_REPLY_TIMEOUT`、既定 180 秒）。transcript を保存する。exit 0 は行が返ってきたことしか意味しない。`Provider error …` の notice も 1 行に数えるので、Claude が答えたかは transcript を読んで確かめる。 |
 | `probe <n>` | lane にただ 1 つある agent container から、gateway 経由で `POST https://api.anthropic.com/v1/messages`（`max_tokens` 1）を送り、`x-kurumi-account` と `status=` を出力する。model は `KURUMI_VERIFY_PROBE_MODEL`、既定は `claude-haiku-4-5`。 |
 | `down <n>` | lane の host に SIGTERM を送り、install label で container を `docker rm -f` し、home を消す。evidence は残す。 |

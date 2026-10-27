@@ -5,7 +5,7 @@
 
 export type CredentialSlot =
   | { kind: 'bearer' } // `Authorization: Bearer <secret>`
-  | { kind: 'header'; header: string } // `x-api-key: <secret>`
+  | { kind: 'header'; header: string } // `x-credential: <secret>`
   | { kind: 'basic' } // `Authorization: Basic base64(user:<secret>)` (git over https)
   | { kind: 'query'; param: string } // `?key=<secret>`
 
@@ -91,9 +91,9 @@ export const catalog = defineCatalog({
       'anthropic-api': {
         displayName: 'Anthropic API',
         hosts: [{ host: 'api.anthropic.com' }],
-        slot: { kind: 'header', header: 'x-api-key' },
+        slot: { kind: 'bearer' },
         scopes: [],
-        containerEnv: (selector) => ({ ANTHROPIC_API_KEY: selector }),
+        containerEnv: (selector) => ({ CLAUDE_CODE_OAUTH_TOKEN: selector }),
       },
     },
   },

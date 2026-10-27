@@ -264,8 +264,8 @@ function storeAccount(home: string, material: Uint8Array): void {
   const sqlite = new Database(join(home, 'kurumi.db'))
   sqlite
     .query(
-      `INSERT INTO account (id, vendor, label, kind, auth_mode, services, material, status, created_at)
-       VALUES ('acc-a', 'anthropic', 'main', 'key', 'api-key', '["anthropic-api"]', ?, 'active', 0)`,
+      `INSERT INTO account (id, vendor, label, kind, services, material, status, created_at)
+       VALUES ('acc-a', 'anthropic', 'main', 'key', '["anthropic-api"]', ?, 'active', 0)`,
     )
     .run(material)
   sqlite.close()

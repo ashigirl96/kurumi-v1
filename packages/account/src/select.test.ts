@@ -352,7 +352,7 @@ describe('readSelector', () => {
       headers: { Authorization: `Bearer kurumi:${handle}`, accept: 'application/json' },
     })
 
-    const { selector, stripped } = readSelector(defaultSelectorShape, { kind: 'bearer' }, req)
+    const { selector, stripped } = readSelector(defaultSelectorShape, { kind: 'bearer' }, [], req)
 
     expect(selector).toEqual(named(handle))
     expect(stripped.headers.has('authorization')).toBe(false)
@@ -364,13 +364,21 @@ describe('readSelector', () => {
     const shape = selectorShapeOf('anthropic')
     const req = request({
       url: 'https://api.anthropic.com/v1/messages',
-      headers: { 'X-Api-Key': shape.format('anthropic/team'), authorization: 'Bearer untouched' },
+      headers: {
+        'X-Credential': shape.format('anthropic/team'),
+        authorization: 'Bearer untouched',
+      },
     })
 
-    const { selector, stripped } = readSelector(shape, { kind: 'header', header: 'x-api-key' }, req)
+    const { selector, stripped } = readSelector(
+      shape,
+      { kind: 'header', header: 'x-credential' },
+      [],
+      req,
+    )
 
     expect(selector).toEqual(named('anthropic/team'))
-    expect(stripped.headers.has('x-api-key')).toBe(false)
+    expect(stripped.headers.has('x-credential')).toBe(false)
     expect(stripped.headers.get('authorization')).toBe('Bearer untouched')
   })
 
@@ -380,8 +388,8 @@ describe('readSelector', () => {
       url: 'https://h.example/x?key=kurumi:google/a@x',
     })
 
-    readSelector(defaultSelectorShape, { kind: 'bearer' }, req)
-    readSelector(defaultSelectorShape, { kind: 'query', param: 'key' }, req)
+    readSelector(defaultSelectorShape, { kind: 'bearer' }, [], req)
+    readSelector(defaultSelectorShape, { kind: 'query', param: 'key' }, [], req)
 
     expect(req.headers.get('authorization')).toBe(`Bearer kurumi:${handle}`)
     expect(req.url.href).toBe('https://h.example/x?key=kurumi:google/a@x')
@@ -391,6 +399,7 @@ describe('readSelector', () => {
     const { selector } = readSelector(
       defaultSelectorShape,
       { kind: 'bearer' },
+      [],
       request({ headers: { authorization: `bEaReR KURUMI:${handle}` } }),
     )
 
@@ -401,6 +410,7 @@ describe('readSelector', () => {
     const { selector } = readSelector(
       defaultSelectorShape,
       { kind: 'basic' },
+      [],
       request({ headers: { authorization: basic('x', 'kurumi:github/a:b') } }),
     )
 
@@ -417,6 +427,7 @@ describe('readSelector', () => {
     const { selector, stripped } = readSelector(
       defaultSelectorShape,
       { kind: 'basic' },
+      [],
       request({ headers }),
     )
 
@@ -428,6 +439,7 @@ describe('readSelector', () => {
     const { selector, stripped } = readSelector(
       defaultSelectorShape,
       { kind: 'query', param: 'key' },
+      [],
       request({ url: 'https://h.example/x?a=1&apikey=2&key2=3&Key=4' }),
     )
 
@@ -466,7 +478,7 @@ function decide(
   { vendor, service, slot, shape }: Target,
   req: ReturnType<typeof request>,
 ): { outcome: string; stripped: ReturnType<typeof request> } {
-  const { selector, stripped } = readSelector(shape, slot, req)
+  const { selector, stripped } = readSelector(shape, slot, [], req)
   const selection = selectAccount(service, groupOf(vendor), selector)
   if (!selection.ok) return { outcome: 'refused', stripped }
   return { outcome: selection.how === 'named' ? selection.handle : selection.how, stripped }
@@ -487,7 +499,15 @@ const placementsOf = (slot: CredentialSlot): Placement[] => {
   }
 }
 
+const headerTarget: Target = {
+  vendor: 'anthropic',
+  service: 'anthropic-api',
+  slot: { kind: 'header', header: 'x-credential' },
+  shape: selectorShapeOf('anthropic'),
+}
+
 const slotTargets: Target[] = [
+  headerTarget,
   ...new Map(
     serviceIds.flatMap((service) => {
       const { slot } = serviceSpec(service)
@@ -582,9 +602,9 @@ function oddRowsOf({ vendor, slot, shape }: Target): Row[] {
     ['a colon for the space', `Bearer:${selector}`, 'refused'],
     ['a word before the selector', `Bearer x ${selector}`, 'refused'],
     [
-      'the anthropic shape in the slot of another vendor',
+      'the anthropic shape is read only for anthropic',
       `Bearer ${selectorShapeOf('anthropic').format(`${vendor}/a`)}`,
-      'refused',
+      vendor === 'anthropic' ? `${vendor}/a` : 'refused',
     ],
     ['the selector as the Basic user (git token-as-user)', basic(selector, ''), 'refused'],
     ['the selector as the whole Basic credential', basic('kurumi', `${vendor}/a`), 'refused'],
@@ -738,7 +758,7 @@ describe.each(
 })
 
 describe('the Authorization header of a service whose slot is another header', () => {
-  const target = slotTargets.find(({ slot }) => slot.kind === 'header')!
+  const target = headerTarget
   const apiKey = target.shape.format('anthropic/b')
 
   test.each([
@@ -749,13 +769,13 @@ describe('the Authorization header of a service whose slot is another header', (
       'anthropic/b',
     ],
     [
-      'is refused beside an x-api-key selector',
-      { authorization: `Bearer ${apiKey}`, 'x-api-key': apiKey },
+      'is refused beside an x-credential selector',
+      { authorization: `Bearer ${apiKey}`, 'x-credential': apiKey },
       'refused',
     ],
     [
-      'is refused beside an x-api-key placeholder',
-      { authorization: 'Bearer kurumi:anthropic/b', 'x-api-key': 'sk-ant-api03-placeholder' },
+      'is refused beside an x-credential placeholder',
+      { authorization: 'Bearer kurumi:anthropic/b', 'x-credential': 'sk-ant-api03-placeholder' },
       'refused',
     ],
     ['is refused when it is a look-alike', { authorization: 'Bearer kurumi:' }, 'refused'],
@@ -791,6 +811,7 @@ describe('a long run of one character in a Basic credential', () => {
         readSelector(
           defaultSelectorShape,
           { kind: 'basic' },
+          [],
           request({ headers: { authorization } }),
         )
       }
@@ -828,6 +849,7 @@ describe('what a refused Basic credential echoes', () => {
     const { selector } = readSelector(
       defaultSelectorShape,
       { kind: 'basic' },
+      [],
       request({ headers: { authorization } }),
     )
 
@@ -843,6 +865,7 @@ test.each([
   const { selector } = readSelector(
     selectorShapeOf('anthropic'),
     serviceSpec('anthropic-api').slot,
+    [],
     request({ headers: { authorization } }),
   )
 
@@ -868,6 +891,7 @@ describe('an Authorization header read for the bearer and the basic slot alike',
     const { selector, stripped } = readSelector(
       defaultSelectorShape,
       { kind },
+      [],
       request({ headers: { authorization }, url: 'https://github.com/o/r.git/info/refs' }),
     )
 
@@ -926,6 +950,7 @@ describe('a selector written into the query slot', () => {
     const { selector } = readSelector(
       defaultSelectorShape,
       slot,
+      [],
       search('?key=AIzaPlaceholder&key=kurumi%3Agoogle%2Fa'),
     )
 
@@ -962,8 +987,8 @@ describe('awkward handles through every slot', () => {
     ['bearer', { kind: 'bearer' }, (value) => ({ headers: { authorization: `Bearer ${value}` } })],
     [
       'header',
-      { kind: 'header', header: 'x-api-key' },
-      (value) => ({ headers: { 'x-api-key': value } }),
+      { kind: 'header', header: 'x-credential' },
+      (value) => ({ headers: { 'x-credential': value } }),
     ],
     ['basic', { kind: 'basic' }, (value) => ({ headers: { authorization: basic('x', value) } })],
     [
@@ -985,7 +1010,7 @@ describe('awkward handles through every slot', () => {
   describe.each(shapes.map((shape, i) => [`shape ${i}`, shape] as const))('%s', (_name, shape) => {
     test.each(place)('%s slot', (_slot, slot, placed) => {
       for (const handle of handles) {
-        const { selector } = readSelector(shape, slot, request(placed(shape.format(handle))))
+        const { selector } = readSelector(shape, slot, [], request(placed(shape.format(handle))))
 
         expect(selector).toEqual(named(handle))
       }
@@ -1009,6 +1034,7 @@ describe('awkward handles through every slot', () => {
     const { selector, stripped } = readSelector(
       defaultSelectorShape,
       { kind: 'query', param: 'key' },
+      [],
       request({ url: raw }),
     )
 
@@ -1028,6 +1054,7 @@ describe('awkward handles through every slot', () => {
     const { selector } = readSelector(
       defaultSelectorShape,
       { kind: 'query', param: 'key' },
+      [],
       request({ url: `https://h.example/x?key=${written}` }),
     )
 
@@ -1039,6 +1066,7 @@ describe('awkward handles through every slot', () => {
     const { selector } = readSelector(
       defaultSelectorShape,
       { kind: 'query', param: 'key' },
+      [],
       request({ url: `https://h.example/x?key=${formatted}` }),
     )
 
@@ -1067,6 +1095,7 @@ describe('the Group Selector', () => {
         const { selector } = readSelector(
           target.shape,
           target.slot,
+          [],
           request({
             headers: { [headerOf(target.slot)]: placement.wrap(groupSelector(target.vendor)) },
           }),

@@ -16,7 +16,6 @@ import {
   accountHandle,
   createAccountLedger,
   isInterceptedHost,
-  type AuthMode,
   type CredentialPrincipal,
 } from '@kurumi/account/server'
 import { inMemoryDb, insertAgentGroup } from '@kurumi/account/testing'
@@ -274,13 +273,12 @@ async function setupCredentials({
     target,
   })
   stops.push(tunnel.close)
-  const addKey = (label: string, value: string, authMode: AuthMode = 'api-key') =>
+  const addKey = (label: string, value: string) =>
     db.transaction((tx) =>
       ledger.addKey(tx, {
         vendor: 'anthropic',
         label,
         value,
-        authMode,
         autoGrant: true,
       }),
     )
@@ -294,7 +292,7 @@ async function setupCredentials({
         service: 'anthropic-api',
       })
     })
-  return { upstream, tunnel, addKey, setDefault, containerEnv: () => ledger.containerEnv('g1') }
+  return { upstream, tunnel, addKey, setDefault, containerEnv: () => ledger.containerEnv() }
 }
 
 async function exchangeRaw(socket: TLSSocket, bytes: string) {
@@ -322,27 +320,27 @@ const mentionsKurumi = (values: readonly string[]) =>
   values.filter((value) => /kurumi/i.test(value))
 
 test.each([
-  ['api-key', { 'x-api-key': groupSelector }, 'x-api-key', secrets.main, 'authorization'],
-  [
-    'oauth-token',
-    { authorization: `Bearer ${groupSelector}` },
-    'authorization',
-    `Bearer ${secrets.main}`,
-    'x-api-key',
-  ],
+  ['Authorization', { authorization: `Bearer ${groupSelector}` }],
+  ['x-api-key', { 'x-api-key': groupSelector }],
 ] as const)(
-  'an %s account reaches the upstream in its own slot and is named on the response',
-  async (authMode, headers, slot, written, otherSlot) => {
+  'an Anthropic account named in %s reaches the upstream as a bearer and is named on the response',
+  async (_header, headers) => {
     const { upstream, tunnel, addKey } = await setupCredentials()
-    addKey('main', secrets.main, authMode)
+    addKey('main', secrets.main)
 
-    const response = await sendTestRequest(tunnel, { path: '/v1/models', headers })
+    const response = await sendTestRequest(tunnel, {
+      path: '/v1/models',
+      headers,
+    })
 
     expect(response.status).toBe(200)
     expect(response.headers['x-kurumi-account']).toBe('anthropic/main')
     expect(upstream.requests).toHaveLength(1)
-    expect(upstream.requests[0]?.headers[slot]).toBe(written)
-    expect(upstream.requests[0]?.headers[otherSlot]).toBeUndefined()
+    expect(upstream.requests[0]?.headers.authorization).toBe(`Bearer ${secrets.main}`)
+    expect(upstream.requests[0]?.headers['anthropic-beta']).toBe('oauth-2025-04-20')
+    expect(slotLines(upstream.requests[0]?.rawHeaders ?? [])).toEqual([
+      ['authorization', `Bearer ${secrets.main}`],
+    ])
     expect(mentionsKurumi(upstream.requests[0]?.rawHeaders ?? [])).toEqual([])
   },
 )
@@ -393,53 +391,38 @@ const slotLines = (rawHeaders: readonly string[]) =>
   )
 
 test.each([
-  [
-    'Authorization',
-    'api-key',
-    { 'x-api-key': groupSelector, authorization: 'Bearer sk-ant-oat01-client-own' },
-    ['x-api-key', secrets.main],
-  ],
-  [
-    'Authorization',
-    'oauth-token',
-    { 'x-api-key': groupSelector, authorization: 'Bearer sk-ant-oat01-client-own' },
-    ['authorization', `Bearer ${secrets.main}`],
-  ],
-  [
-    'x_api_key',
-    'oauth-token',
-    { x_api_key: groupSelector },
-    ['authorization', `Bearer ${secrets.main}`],
-  ],
-  [
-    'x-api-key',
-    'oauth-token',
-    { 'x-api-key': 'sk-ant-api03-client-own' },
-    ['authorization', `Bearer ${secrets.main}`],
-  ],
-] as const)(
-  'the container own %s never reaches the upstream beside an %s account',
-  async (_header, authMode, headers, injected) => {
-    const { upstream, tunnel, addKey } = await setupCredentials()
-    addKey('main', secrets.main, authMode)
+  ['Authorization', 'Bearer sk-ant-oat01-client-own'],
+  ['x-api-key', 'sk-ant-api03-client-own'],
+  ['x_api_key', 'sk-ant-api03-client-own'],
+])('the container own %s is replaced by the account bearer', async (header, value) => {
+  const { upstream, tunnel, addKey } = await setupCredentials()
+  addKey('main', secrets.main)
 
-    const response = await sendTestRequest(tunnel, { path: '/v1/models', headers })
+  const response = await sendTestRequest(tunnel, {
+    path: '/v1/models',
+    headers: { [header]: value },
+  })
 
-    expect(response.status).toBe(200)
-    expect(slotLines(upstream.requests[0]?.rawHeaders ?? [])).toEqual([[...injected]])
-  },
-)
+  expect(response.status).toBe(200)
+  expect(upstream.requests).toHaveLength(1)
+  expect(slotLines(upstream.requests[0]?.rawHeaders ?? [])).toEqual([
+    ['authorization', `Bearer ${secrets.main}`],
+  ])
+})
 
-test('a container spawned before its oauth-token key reaches the upstream as an OAuth request', async () => {
+test('a container spawned before its account is added reaches the upstream as an OAuth request', async () => {
   const { upstream, tunnel, addKey, containerEnv } = await setupCredentials()
   const env = containerEnv()
-  expect(Object.keys(env)).toEqual(['ANTHROPIC_API_KEY'])
-  addKey('main', secrets.second, 'oauth-token')
+  expect(env).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: groupSelector })
+  addKey('main', secrets.second)
 
   const response = await sendTestRequest(tunnel, {
     method: 'POST',
     path: '/v1/messages',
-    headers: { 'x-api-key': env.ANTHROPIC_API_KEY ?? '', 'anthropic-version': '2023-06-01' },
+    headers: {
+      authorization: `Bearer ${env.CLAUDE_CODE_OAUTH_TOKEN ?? ''}`,
+      'anthropic-version': '2023-06-01',
+    },
     body: '{}',
   })
 
@@ -449,12 +432,11 @@ test('a container spawned before its oauth-token key reaches the upstream as an 
     authorization: `Bearer ${secrets.second}`,
     'anthropic-beta': 'oauth-2025-04-20',
   })
-  expect(upstream.requests[0]?.headers['x-api-key']).toBeUndefined()
 })
 
-test('a container spawned for an oauth-token key reaches a later api-key default without the OAuth beta', async () => {
+test('a container selector follows a later default and keeps the OAuth beta', async () => {
   const { upstream, tunnel, addKey, setDefault, containerEnv } = await setupCredentials()
-  addKey('subscription', secrets.second, 'oauth-token')
+  addKey('subscription', secrets.second)
   const env = containerEnv()
   expect(Object.keys(env)).toEqual(['CLAUDE_CODE_OAUTH_TOKEN'])
   addKey('main', secrets.main)
@@ -473,9 +455,8 @@ test('a container spawned for an oauth-token key reaches a later api-key default
 
   expect(response.status).toBe(200)
   expect(response.headers['x-kurumi-account']).toBe('anthropic/main')
-  expect(upstream.requests[0]?.headers['x-api-key']).toBe(secrets.main)
-  expect(upstream.requests[0]?.headers.authorization).toBeUndefined()
-  expect(upstream.requests[0]?.headers['anthropic-beta']).toBeUndefined()
+  expect(upstream.requests[0]?.headers.authorization).toBe(`Bearer ${secrets.main}`)
+  expect(upstream.requests[0]?.headers['anthropic-beta']).toBe('oauth-2025-04-20')
 })
 
 test('credential injection refuses a non-443 port before choosing an account', () => {
@@ -505,7 +486,7 @@ test('a TRACE to a credentialed host is refused with 405 and nothing goes upstre
   const response = await sendTestRequest(tunnel, {
     method: 'TRACE',
     path: '/v1/models',
-    headers: { 'x-api-key': groupSelector },
+    headers: { authorization: `Bearer ${groupSelector}` },
   })
 
   expect(response.status).toBe(405)
@@ -521,7 +502,7 @@ test('a TRACK to a credentialed host is refused with 405 and nothing goes upstre
   const response = await sendTestRequest(tunnel, {
     method: 'TRACK',
     path: '/v1/models',
-    headers: { 'x-api-key': groupSelector },
+    headers: { authorization: `Bearer ${groupSelector}` },
   })
 
   expect(response.status).toBe(405)
@@ -572,7 +553,7 @@ test('a group with no account is refused with a JSON 403 and nothing goes upstre
 
   const response = await sendTestRequest(tunnel, {
     path: '/v1/models',
-    headers: { 'x-api-key': groupSelector },
+    headers: { authorization: `Bearer ${groupSelector}` },
   })
 
   expect(response.status).toBe(403)
@@ -646,7 +627,7 @@ test('a refused POST with a 16 MiB body still reads the JSON refusal', async () 
 test('two accounts and no default are refused as ambiguous, listing both', async () => {
   const { upstream, tunnel, addKey } = await setupCredentials()
   addKey('main', secrets.main)
-  addKey('second', secrets.second, 'oauth-token')
+  addKey('second', secrets.second)
 
   const response = await sendTestRequest(tunnel, { path: '/v1/models' })
 
@@ -661,12 +642,12 @@ test('two accounts and no default are refused as ambiguous, listing both', async
 test('a named account wins over the default', async () => {
   const { upstream, tunnel, addKey, setDefault } = await setupCredentials()
   addKey('main', secrets.main)
-  addKey('second', secrets.second, 'oauth-token')
+  addKey('second', secrets.second)
   setDefault('anthropic/main')
 
   const response = await sendTestRequest(tunnel, {
     path: '/v1/models',
-    headers: { 'x-api-key': 'sk-ant-kurumi-YW50aHJvcGljL3NlY29uZA' },
+    headers: { authorization: 'Bearer sk-ant-kurumi-YW50aHJvcGljL3NlY29uZA' },
   })
 
   expect(response.headers['x-kurumi-account']).toBe('anthropic/second')
@@ -676,7 +657,7 @@ test('a named account wins over the default', async () => {
 test('the default serves a request that names no account', async () => {
   const { tunnel, addKey, setDefault } = await setupCredentials()
   addKey('main', secrets.main)
-  addKey('second', secrets.second, 'oauth-token')
+  addKey('second', secrets.second)
   setDefault('anthropic/second')
 
   const response = await sendTestRequest(tunnel, {
@@ -978,7 +959,7 @@ test('an injected request is logged with its account, service, status, and a pat
   const response = await sendTestRequest(tunnel, {
     path: '/v1/messages?beta=true&key=kurumi:anthropic/main',
     method: 'POST',
-    headers: { 'x-api-key': groupSelector },
+    headers: { authorization: `Bearer ${groupSelector}` },
     body: '{"secret":"request body"}',
   })
   expect(response.status).toBe(200)
@@ -1003,7 +984,7 @@ test('a refused request is logged with its code and service, never the selector 
   const written = 'kurumi:anthropic/nobody-granted'
   const response = await sendTestRequest(tunnel, {
     path: '/v1/models',
-    headers: { 'x-api-key': written },
+    headers: { authorization: `Bearer ${written}` },
   })
   expect(response.status).toBe(403)
   await until(() => events.length === 1)
@@ -1023,7 +1004,7 @@ test.each(['TRACE', 'TRACK'])('a %s refused with 405 is logged as refused', asyn
   const response = await sendTestRequest(tunnel, {
     method,
     path: '/v1/models?key=kurumi:anthropic/main',
-    headers: { 'x-api-key': groupSelector },
+    headers: { authorization: `Bearer ${groupSelector}` },
   })
   expect(response.status).toBe(405)
   await until(() => events.length === 1)
@@ -1172,7 +1153,6 @@ async function setupHeld({
       vendor: 'anthropic',
       label: 'main',
       value: secrets.main,
-      authMode: 'api-key',
       autoGrant: true,
     }),
   )
@@ -1229,9 +1209,9 @@ async function setupHeld({
     stops.push(tunnel.close)
     return tunnel
   }
-  const addAccount = (label: string, value: string, authMode: AuthMode) =>
+  const addAccount = (label: string, value: string) =>
     db.transaction((tx) =>
-      ledger.addKey(tx, { vendor: 'anthropic', label, value, authMode, autoGrant: true }),
+      ledger.addKey(tx, { vendor: 'anthropic', label, value, autoGrant: true }),
     )
   const addAgentGroup = (id: string) => {
     insertAgentGroup(db, id)
@@ -1305,7 +1285,7 @@ const sendScoped = (
   sendTestRequest(tunnel, {
     method: 'POST',
     path,
-    headers: { 'x-api-key': selectorOf(handle) },
+    headers: { authorization: `Bearer ${selectorOf(handle)}` },
     body: prompt('scoped'),
   })
 const granted = 1_800_000_000_000
@@ -1341,7 +1321,7 @@ describe('held requests', () => {
     })
     expect(upstream.requests[0]?.headers).toMatchObject({
       'content-length': String(Buffer.byteLength(body)),
-      'x-api-key': secrets.main,
+      authorization: `Bearer ${secrets.main}`,
     })
     expect(upstream.requests[0]?.headers['transfer-encoding']).toBeUndefined()
     await until(() => events.length === 2)
@@ -1384,7 +1364,7 @@ describe('held requests', () => {
     const response = sendTestRequest(tunnel, {
       method: 'POST',
       path: '/v1/messages?beta=true',
-      headers: { 'x-api-key': groupSelector },
+      headers: { authorization: `Bearer ${groupSelector}` },
       body,
     })
     await until(() => requested.length === 1)
@@ -1609,7 +1589,7 @@ describe('held requests', () => {
   ][])('an allowance never passes a resend with %s', async (_name, resend) => {
     let clock = granted
     const held = await setupHeld({ holdMs: 50, now: () => clock, rule: scopedRule })
-    held.addAccount('second', secrets.second, 'oauth-token')
+    held.addAccount('second', secrets.second)
     expect((await sendScoped(held.tunnel)).status).toBe(403)
     await held.gate.decided({ id: held.approvalId(0) }, 'approve')
 
@@ -2227,7 +2207,7 @@ describe('a request body that stops short', () => {
     ],
     [
       'an account the agent group is not granted',
-      'POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nx-api-key: kurumi:anthropic/nobody-granted\r\nContent-Length: 1000\r\n\r\n{',
+      'POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer kurumi:anthropic/nobody-granted\r\nContent-Length: 1000\r\n\r\n{',
       403,
       'account_not_granted' as const,
     ],

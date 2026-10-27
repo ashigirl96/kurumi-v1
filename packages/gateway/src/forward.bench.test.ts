@@ -31,12 +31,11 @@ test.skipIf(!process.env.KURUMI_BENCH)(
       ledger.addKey(tx, {
         vendor: 'anthropic',
         label: 'main',
-        authMode: 'oauth-token',
         value: 'sk-ant-oat01-bench',
         autoGrant: true,
       }),
     )
-    const selector = ledger.containerEnv('g1').CLAUDE_CODE_OAUTH_TOKEN
+    const selector = ledger.containerEnv().CLAUDE_CODE_OAUTH_TOKEN
     const upstream = await startFakeUpstream({ host: 'api.anthropic.com' })
     stops.push(upstream.stop)
 
