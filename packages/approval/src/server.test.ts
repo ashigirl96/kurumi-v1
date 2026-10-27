@@ -851,6 +851,37 @@ test('when the outcome cannot be recorded, decide and start resolve, log it, and
   expect(handled).toHaveLength(3)
 })
 
+test('a logger that throws does not reject decide or start, and the outcome is still recorded', async () => {
+  const db = openDb()
+  const accessLedger = createAccessLedger({ db })
+  const ledger = createApprovalLedger({
+    db,
+    accessLedger,
+    handlers: () => ({ procedure: crash('boom'), 'gateway.request': crash('boom') }),
+    decidePath: ['approval', 'decide'],
+    log: () => {
+      throw new Error('stdout closed')
+    },
+  })
+  const atDecide = requestProcedure(db, ledger)
+  const atStart = requestProcedure(db, ledger)
+  decideBehindTheLedger(db, atStart)
+
+  const decided = await ledger.decide({ id: atDecide, decision: 'approve', by: host })
+  await ledger.start()
+
+  expect(decided.message).toMatch(/^approved by host at .*, but its handler failed: boom$/)
+  expect(ledger.show(atDecide)).toMatchObject({ handledAt: expect.any(Date), handlerError: 'boom' })
+  expect(ledger.show(atStart)).toMatchObject({ handledAt: expect.any(Date), handlerError: 'boom' })
+
+  db.run(
+    sql`CREATE TRIGGER disk_full BEFORE UPDATE OF handled_at ON pending_approval BEGIN SELECT RAISE(ABORT, 'disk full'); END`,
+  )
+  const unrecorded = requestProcedure(db, ledger)
+  const failed = await ledger.decide({ id: unrecorded, decision: 'deny', by: host })
+  expect(failed.message).toMatch(/but recording its outcome failed/)
+})
+
 test('a failed handler logs one line with the approval id and the escaped error at decide and at start', async () => {
   const db = openDb()
   const { ledger, logged } = recordingLedger(db, crash('boom‮'))
