@@ -15,10 +15,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { createAccessLedger } from '@kurumi/access/server'
-import { seal } from '@kurumi/account/server'
+import { createAccountLedger, seal } from '@kurumi/account/server'
 import { createAgentLedger } from '@kurumi/agent/server'
 import { createApprovalLedger } from '@kurumi/approval/server'
+import { transaction } from '@kurumi/rpc/server'
 import { createRouterClient } from '@orpc/server'
+import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { z } from 'zod'
 
 import { openKurumiDb, migrateAll } from './db.ts'
@@ -449,6 +451,9 @@ create)
     kurumi.revision=*) revision=\${arg#kurumi.revision=} ;;
     esac
     if [ "$previous" = --name ]; then name=$arg; fi
+    if [ "$previous" = --env ] && [ -n "$container" ]; then
+      printf '%s\\n' "\${arg%%=*}" >> "$KURUMI_HOME/$container.env"
+    fi
     previous=$arg
   done
   case "$name" in
@@ -903,3 +908,140 @@ test('kurumi gateway rules adds, lists, and removes a rule through the host, and
   )
   expect(removed).toEqual({ removed: true })
 }, 10000)
+
+test.each(['add-key', 'grant', 'revoke', 'remove', 'set-default', 'clear-default', 'restart'])(
+  '%s replaces the container when its Anthropic auth mode changes',
+  async (operation) => {
+    const home = homeForTest()
+    writeFileSync(join(home, 'docker'), inventoryDocker, { mode: 0o755 })
+    mkdirSync(join(home, 'runner'))
+    writeFileSync(join(home, 'runner/runner.js'), '')
+    const unused = Bun.serve({ port: 0, fetch: () => new Response() })
+    const env = { PATH: `${home}:${process.env.PATH}`, KURUMI_AGENT_PORT: String(unused.port) }
+    await unused.stop(true)
+    let host = spawnHost(home, undefined, env)
+    await waitForHost(home, host)
+    await cli(
+      home,
+      [
+        'account',
+        'add-key',
+        'anthropic',
+        '--auth',
+        'oauth-token',
+        '--label',
+        'oauth',
+        '--auto-grant',
+      ],
+      'fake-oauth',
+    )
+    await cli(
+      home,
+      ['account', 'add-key', 'anthropic', '--auth', 'api-key', '--label', 'api'],
+      'fake-api-key',
+    )
+    const { id: groupId } = z
+      .object({ id: z.string() })
+      .parse(JSON.parse(await cli(home, ['agent', 'create', '--name', 'work'])))
+    const scope = ['--service', 'anthropic-api', '--agent-group-id', groupId]
+    if (['revoke', 'remove', 'set-default', 'clear-default', 'restart'].includes(operation)) {
+      await cli(home, ['account', 'grant', 'anthropic/api', ...scope])
+      await cli(home, ['account', 'set-default', 'anthropic/oauth', ...scope])
+    }
+    const names = () =>
+      readFileSync(join(home, 'containers'), 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => z.array(z.string()).parse(JSON.parse(line))[5] ?? '')
+    const authEnv = () => {
+      const id = names().at(-1)
+      if (!id) return []
+      return readFileSync(join(home, `${id}.env`), 'utf8')
+        .trim()
+        .split('\n')
+        .filter((name) => name === 'CLAUDE_CODE_OAUTH_TOKEN' || name === 'ANTHROPIC_API_KEY')
+    }
+    await cli(home, ['chat', 'work'], 'before switch\n')
+    for (let attempt = 0; !existsSync(join(home, 'containers')); attempt++) {
+      if (attempt === 100) throw new Error('container never started')
+      await Bun.sleep(20)
+    }
+    expect(authEnv()).toEqual(['CLAUDE_CODE_OAUTH_TOKEN'])
+    const oldId = names()[0]
+    if (operation === 'restart') {
+      host.kill('SIGTERM')
+      expect(await host.exited).toBe(0)
+      const db = drizzle(new Database(join(home, 'kurumi.db')))
+      try {
+        const accounts = createAccountLedger({
+          db,
+          vaultKey: readFileSync(join(home, 'vault.key')),
+        })
+        transaction(db, (tx) => {
+          const found = accounts.accountIdOf(tx, 'anthropic/api')
+          if (!found.ok) throw new Error('missing api account')
+          accounts.setDefault(tx, {
+            accountId: found.accountId,
+            agentGroupId: groupId,
+            service: 'anthropic-api',
+          })
+        })
+      } finally {
+        db.$client.close(true)
+      }
+      host = spawnHost(home, undefined, env)
+      await waitForHost(home, host)
+    } else {
+      const args =
+        operation === 'add-key'
+          ? ['add-key', 'anthropic', '--auth', 'api-key', '--label', 'auto', '--auto-grant']
+          : operation === 'clear-default'
+            ? ['clear-default', ...scope]
+            : operation === 'remove'
+              ? ['remove', 'anthropic/oauth']
+              : [operation, operation === 'revoke' ? 'anthropic/oauth' : 'anthropic/api', ...scope]
+      await cli(home, ['account', ...args], operation === 'add-key' ? 'fake-api-key' : '')
+    }
+    await cli(home, ['chat', 'work'], 'after switch\n')
+    for (let attempt = 0; attempt < 100 && !authEnv().includes('ANTHROPIC_API_KEY'); attempt++)
+      await Bun.sleep(20)
+    expect(authEnv()).toEqual(['ANTHROPIC_API_KEY'])
+    expect(names()).not.toContain(oldId)
+    const pending = JSON.parse(
+      await cli(home, ['db', 'query', 'SELECT content, status FROM inbound_message ORDER BY seq']),
+    )
+    expect(pending).toEqual([
+      { content: 'before switch', status: 'pending' },
+      { content: 'after switch', status: 'pending' },
+    ])
+    if (operation === 'remove')
+      await cli(
+        home,
+        [
+          'account',
+          'add-key',
+          'anthropic',
+          '--auth',
+          'oauth-token',
+          '--label',
+          'oauth',
+          '--auto-grant',
+        ],
+        'fake-oauth',
+      )
+    else await cli(home, ['account', 'grant', 'anthropic/oauth', ...scope])
+    await cli(home, ['account', 'set-default', 'anthropic/oauth', ...scope])
+    await cli(home, ['chat', 'work'], 'back to oauth\n')
+    for (
+      let attempt = 0;
+      attempt < 100 && !authEnv().includes('CLAUDE_CODE_OAUTH_TOKEN');
+      attempt++
+    )
+      await Bun.sleep(20)
+    expect(authEnv()).toEqual(['CLAUDE_CODE_OAUTH_TOKEN'])
+    host.kill('SIGTERM')
+    expect(await host.exited).toBe(0)
+  },
+  20000,
+)
