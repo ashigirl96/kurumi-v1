@@ -21,7 +21,7 @@ KURUMI_GOOGLE_CLIENT_SECRET="$(security find-generic-password -s kurumi-live-goo
 bun packages/account/scripts/google-consent.ts --services gmail --mask
 ```
 
-別の terminal で、ログイン済み profile の表示名を `KURUMI_VERIFY_BROWSER_PROFILE` に設定し、`L consent <n> '<authorize_url>'` を実行する。account の指定は `L consent <n> '<url>' --account 2`、部分同意は `--uncheck google-calendar`、拒否は `--cancel` を付ける。成功時は driver が callback の本文を出力し、元の script が `grantedScopes` と `servicesCovered` を出す。
+別の terminal で、ログイン済み profile の表示名を `KURUMI_VERIFY_BROWSER_PROFILE` に設定し、`L consent <n> '<authorize_url>'` を実行する。account の指定は `L consent <n> '<url>' --account 2`、部分同意は `--uncheck google-calendar`、拒否は `--cancel` を付ける。driver は scope checkbox ごとに service と設定後の状態を出力する。成功時は callback の本文を出力し、元の script が `grantedScopes` と `servicesCovered` を出す。
 
 - スクリーンショットは `/tmp/kurumi-verify/lane-<n>/evidence/consent-*.png`。同じ helper がページ内のアドレス、入力値、placeholder、SVG、open shadow root、URL と iframe を撮影前と各 frame でぼかす。viewport だけを保存するため、ブラウザの URL バーは画像に含まれない。失敗時もその画面を保存する。
 - driver は正常終了、失敗、SIGINT、SIGTERM で `kurumi-verify-<n>` session を閉じる。検証後は成功・失敗とも `L down <n>` を流す。`down` もこの session を閉じる。

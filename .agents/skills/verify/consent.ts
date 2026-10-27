@@ -184,6 +184,25 @@ async function drive(argv: string[]): Promise<void> {
     await browser(['screenshot', path])
     console.log(`screenshot: ${path}`)
   }
+  const click = async (ref: string, command = 'click', stage = 'consent') => {
+    await browser(['focus', ref])
+    await browser(
+      ['eval', '--stdin'],
+      "document.activeElement?.scrollIntoView({block: 'center', inline: 'center'})",
+    )
+    await screenshot(stage)
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await browser([command, ref])
+        return
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes('is covered by') || attempt >= 2)
+          throw error
+        console.log(`covered ${command}; scrolling before retry`)
+        await browser(['scroll', 'down', String(300 * (attempt + 1))])
+      }
+    }
+  }
   const desktopUserAgent =
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36'
   let opened = false
@@ -303,34 +322,28 @@ async function drive(argv: string[]): Promise<void> {
             requireRequestedService(authorization, omitted)
             throw new Error(`account already granted ${omitted}; use an account without that grant`)
           }
-          const target = checkboxes.find((item) => {
+          const scopeCheckboxes = checkboxes.flatMap((item) => {
             const service = Object.entries(services).find(([, pattern]) =>
               pattern.test(item.name),
             )?.[0]
-            return service !== undefined && item.checked !== (service !== omitted)
+            return service ? [{ ...item, service, wanted: service !== omitted }] : []
           })
+          const target = scopeCheckboxes.find((item) => item.checked !== item.wanted)
           if (target) {
-            await browser(['scrollintoview', target.ref])
-            await browser(['scroll', 'down', '300'])
-            await screenshot('checkbox')
-            await browser([target.checked ? 'uncheck' : 'check', target.ref])
+            await click(target.ref, target.wanted ? 'check' : 'uncheck', 'checkbox')
             continue
+          }
+          for (const item of scopeCheckboxes) {
+            console.log(`scope checkbox: ${item.service}=${item.checked ? 'checked' : 'unchecked'}`)
           }
           if (checkboxes.length > 0) await screenshot('scopes')
           action = items.find((item) => /^(次へ|続行|許可|Continue|Next|Allow)$/.test(item.name))
         }
       }
       if (action) {
-        if (chooser) {
-          await browser(
-            ['eval', '--stdin'],
-            `Array.from(document.querySelectorAll('[data-identifier]')).find(e => e.getAttribute('data-identifier') === ${JSON.stringify(address)})?.scrollIntoView({block: 'center'})`,
-          )
-        }
-        await screenshot(chooser ? 'account' : 'consent')
         if ((await browser(['get', 'url'])) !== current.href) continue
         try {
-          await browser(['click', action.ref])
+          await click(action.ref, 'click', chooser ? 'account' : 'consent')
         } catch (error) {
           if ((await browser(['get', 'url'])) === current.href) throw error
         }
