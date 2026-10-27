@@ -4,15 +4,19 @@
   "type": "module",
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "catalog:",
-    "@kurumi/session": "workspace:*",
-    "@orpc/client": "catalog:",
-    "@orpc/contract": "catalog:"
-  },
-  "devDependencies": {
+    "@kurumi/access": "workspace:*",
+    "@kurumi/account": "workspace:*",
     "@kurumi/agent": "workspace:*",
+    "@kurumi/approval": "workspace:*",
     "@kurumi/chat": "workspace:*",
     "@kurumi/gateway": "workspace:*",
     "@kurumi/rpc": "workspace:*",
+    "@kurumi/session": "workspace:*",
+    "@orpc/client": "catalog:",
+    "@orpc/contract": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
     "@orpc/server": "catalog:",
     "drizzle-orm": "catalog:"
   }

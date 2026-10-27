@@ -10,6 +10,7 @@ import {
 export type Turn = {
   prompt: string
   continuation: string | null
+  mcpServers?(): Options['mcpServers']
   signal: AbortSignal
   reply(text: string): Promise<void>
   remember(continuation: string): Promise<void>
@@ -44,10 +45,15 @@ function claudeCodeEnv(workspace: string): Record<string, string> {
   }
 }
 
-function options(continuation: string | null, abortController: AbortController): Options {
+function options(
+  turn: Turn,
+  continuation: string | null,
+  abortController: AbortController,
+): Options {
   const workspace = process.cwd()
   return {
     cwd: workspace,
+    mcpServers: turn.mcpServers?.(),
     abortController,
     ...(continuation === null ? {} : { resume: continuation }),
     systemPrompt: { type: 'preset', preset: 'claude_code' },
@@ -97,7 +103,10 @@ async function attempt(turn: Turn, continuation: string | null): Promise<string 
   const abortController = new AbortController()
   const abort = () => abortController.abort()
   turn.signal.addEventListener('abort', abort, { once: true })
-  const messages = query({ prompt: turn.prompt, options: options(continuation, abortController) })
+  const messages = query({
+    prompt: turn.prompt,
+    options: options(turn, continuation, abortController),
+  })
   let failed: SDKResultMessage | null = null
   let background = false
   try {

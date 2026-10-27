@@ -621,6 +621,25 @@ export const router = os.router({
     if (!result.ok) throw refusalError(result.refusal, { handle: `${vendor}/${label}` })
     return { handle: result.handle }
   }),
+  mine: os.mine.handler(({ context }) => {
+    if (context.caller.kind !== 'agent') {
+      throw new ORPCError('FORBIDDEN', { message: 'account.mine requires an agent caller' })
+    }
+    const { agentGroupId } = context.caller
+    return {
+      accounts: serviceIds.flatMap((service) =>
+        context.accountLedger
+          .candidates(agentGroupId, service)
+          .map(({ handle, isDefault, status }) => ({
+            handle,
+            selector: selectorShapeOf(vendorOf(service)).format(handle),
+            service,
+            isDefault,
+            status,
+          })),
+      ),
+    }
+  }),
   list: os.list.handler(({ context }) => context.accountLedger.list()),
   remove: os.remove.handler(({ context, input: [handle] }) => {
     transaction(context.db, (tx) => {
