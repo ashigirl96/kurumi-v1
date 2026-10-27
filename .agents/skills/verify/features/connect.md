@@ -27,10 +27,11 @@ L google-client <n>
 L kurumi <n> agent create --name work
 L kurumi <n> account connect --services gmail --agent-group-id <group-id>
 L consent <n> '<connect-link>' --account 1
-L kurumi <n> account list --agent-group-id <group-id>
+L kurumi <n> account list
+L kurumi <n> db query 'select agent_group_id, service from account_grant'
 ```
 
-Googleの同意後、callbackは`Connected. Granted: gmail.`を表示する。`L kurumi <n> db query 'select state from connection_request'`で`completed`を確認する。GmailとCalendarを要求する場合は`--services gmail google-calendar`と空白で区切る。`account list`のGoogle行は`oauth`になり、groupに付与したserviceが並ぶ。
+Googleの同意後、callbackは`Connected. Granted: gmail.`を表示する。`L kurumi <n> db query 'select state from connection_request'`で`completed`を確認する。GmailとCalendarを要求する場合は`--services gmail google-calendar`と空白で区切る。`account list`のGoogle行は`oauth`になり、accountが持つserviceが並ぶ。groupへの付与は`account_grant`の読取queryで確認する。
 
 chatを1回流してcontainerを起動し、そのcontainerからgateway経由でGmailを読む。
 
@@ -65,5 +66,6 @@ bun packages/account/scripts/google-consent.ts --services gmail --mask
 - `--uncheck` は認可 URL で要求した service に限る。Google が既存 grant のため checkbox を出さない場合は失敗する。その service をまだ許可していない account を使う。grant の revoke は他の lane の token も失効させるため実行しない。
 - `google-client` は `account set-client` がない head では、そのコマンド名を示して失敗する。
 - `google-client`は進行中のGoogle requestをすべてキャンセルするため、必ず接続リンクの発行前に実行する。
+- `account list`に`--agent-group-id`はない。一覧のserviceはaccountが持つ範囲を示すため、groupへの付与は読取queryかagentの`list_accounts`で確認する。
 - access tokenのrefreshは未実装。期限を過ぎる前にprobeする。
 - 同意回数は完了したcode交換をaccountごとに報告する。Googleはaccountとclientごとのrefresh token数に上限がある。grantのrevokeは行わない。
