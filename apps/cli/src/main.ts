@@ -7,6 +7,7 @@ import { contract as accessContract } from '@kurumi/access/contract'
 import {
   AccountViewSchema,
   AddKeyOutputSchema,
+  ConnectOutputSchema,
   contract as accountContract,
 } from '@kurumi/account/contract'
 import { contract as agentContract } from '@kurumi/agent/contract'
@@ -215,12 +216,12 @@ function forward(
     if (meta.cli !== true) continue
     const names = childPath.map(kebabCase)
     const command = names.join(' ')
-    // Commander runs a command only when argv holds each of its names, so skipping the others never skips the run one.
-    const piped = names.every((name) => argv.includes(name))
-      ? stdinFieldOf(command, inputSchema)
-      : null
     // trpc-cli converts every input to JSON Schema, yet help shows a command's input only in its own group's listing.
     const shown = names.slice(0, -1).every((name) => argv.includes(name))
+    const piped =
+      names.every((name) => argv.includes(name)) || (shown && names.length > 1)
+        ? stdinFieldOf(command, inputSchema)
+        : null
     const render = renderers[childPath.join('.')] ?? json
     router[key] = os
       .meta(meta)
@@ -249,6 +250,7 @@ function forward(
 const json = (output: unknown) => JSON.stringify(output, null, 2)
 
 const renderers: Readonly<Record<string, (output: unknown) => string>> = {
+  'account.connect': (output) => ConnectOutputSchema.parse(output).url,
   'account.addKey': (output) => AddKeyOutputSchema.parse(output).handle,
   'account.list': (output) =>
     alignColumns(

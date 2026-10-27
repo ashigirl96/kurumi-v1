@@ -34,6 +34,7 @@ afterEach(() => {
 const link = {
   async call(path: readonly string[], input: unknown) {
     calls.push({ path, input })
+    if (path.at(-1) === 'connect') return { url: 'http://127.0.0.1:42331/connect/test-token' }
     return path.at(-1) === 'addKey' ? { handle: 'anthropic/main' } : { ok: true }
   },
 }
@@ -51,6 +52,50 @@ const run = (argv: string[], stdin: Stdin, contract: AnyContractRouter = cliCont
   runCommand(argv, { contract, link, stdin })
 
 const addKey = ['account', 'add-key', 'anthropic', '--label', 'main']
+
+test('account set-client reads the client JSON only from stdin', async () => {
+  const client = JSON.stringify({ clientId: 'test-client', clientSecret: 'test-secret' })
+  expect(await run(['account', 'set-client', 'google'], piped(client))).toBe(0)
+  expect(calls).toEqual([{ path: ['account', 'setClient'], input: ['google', { client }] }])
+  expect(stdout).not.toContain('test-secret')
+  expect(stderr).toBe('')
+})
+
+test.each(['--value', '--client', '--client-id', '--client-secret'])(
+  'account set-client rejects the %s flag',
+  async (flag) => {
+    expect(await run(['account', 'set-client', 'google', flag, 'sentinel'], piped(''))).toBe(1)
+    expect(calls).toEqual([])
+    expect(stderr).toContain('unknown option')
+    expect(stderr).not.toContain('sentinel')
+  },
+)
+
+test.each(['not-json', '{"clientId":"sentinel"}', '{"clientId":{},"clientSecret":"sentinel"}'])(
+  'account set-client rejects malformed stdin without echoing it: %s',
+  async (value) => {
+    expect(await run(['account', 'set-client', 'google'], piped(value))).toBe(1)
+    expect(calls).toEqual([])
+    expect(stderr).toContain('stdin must be JSON with clientId and clientSecret')
+    expect(stderr).not.toContain('sentinel')
+  },
+)
+
+test('account connect prints a plain link for the requested services and group', async () => {
+  expect(
+    await run(
+      ['account', 'connect', '--services', 'gmail', 'google-calendar', '--agent-group-id', 'work'],
+      piped(''),
+    ),
+  ).toBe(0)
+  expect(calls).toEqual([
+    {
+      path: ['account', 'connect'],
+      input: { services: ['gmail', 'google-calendar'], agentGroupId: 'work' },
+    },
+  ])
+  expect(stdout).toBe('http://127.0.0.1:42331/connect/test-token\n')
+})
 
 test('the CLI builds from the full host contract and status answers', async () => {
   expect(await run(['status'], piped(''))).toBe(0)

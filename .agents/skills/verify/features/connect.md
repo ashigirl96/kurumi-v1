@@ -8,12 +8,28 @@ Google の認可 URL を開き、指定した account で同意かキャンセ�
 - `--account <n>` は `KURUMI_VERIFY_GOOGLE_ACCOUNTS` のカンマ区切りリストの n 番目を選ぶ。既定は 1。account の一覧は repo 外で環境変数に設定する。
 - `--uncheck gmail` または `--uncheck google-calendar` は、その service のチェックを外して残りを選ぶ。`--cancel` は Google から `access_denied` が戻ると非ゼロで終わる。
 - `google-client` は keychain の client id と secret を `account set-client google` に渡す。clientId と clientSecret を持つ JSON を stdin で渡す。
+- `account connect` は5分・1回限りの接続リンクを発行する。使用済み・期限切れのリンクは再実行を案内する。
 
 ## How to get to it (user POV)
 
 認可 URL は `packages/account/scripts/google-consent.ts` から得る。host が発行する接続リンクも受け付ける。接続リンクは、この lane の `http://127.0.0.1:<web port>/connect/<token>` に限る。
 
 ## Driving it with lane.sh
+
+CLIから接続を始めるときは、次の順で実行する。`<group-id>`には`agent create`が返したidを使う。
+
+```sh
+L up <n>
+L doctor <n>
+L google-client <n>
+L kurumi <n> agent create --name work
+L kurumi <n> account connect --services gmail --agent-group-id <group-id>
+L consent <n> '<connect-link>' --account 2
+```
+
+Googleの同意後、callbackが`Not found`を返す段階ではtoken交換は行われない。`L kurumi <n> db query 'select state from connection_request'`で`authorizing`を確認する。使用済みリンクを再度開くと410になり、`account connect`の再実行を案内する。検証後は`L down <n>`を実行する。
+
+OAuth helperだけを検証する場合は、次のscriptを使う。
 
 ```sh
 KURUMI_GOOGLE_CLIENT_ID="$(security find-generic-password -s kurumi-live-google-client-id -w)" \

@@ -19,6 +19,7 @@ import {
   isInterceptedHost,
   router as accountRouter,
   storedAccounts,
+  storedConnections,
   VaultError,
 } from '@kurumi/account/server'
 import { createAgentLedger, router as agentRouter } from '@kurumi/agent/server'
@@ -65,6 +66,7 @@ import { createRpcFronts, queryReadOnly } from './fronts.ts'
 import { acquireLock } from './lock.ts'
 import { migrations } from './migrations.ts'
 import { loadVaultKey } from './vault-key.ts'
+import { startWeb } from './web.ts'
 
 export type HostContext = KurumiContext & {
   db: KurumiDb
@@ -130,6 +132,7 @@ export async function startHost(config: HostConfig) {
   const releaseLock = acquireLock(join(config.home, 'kurumi.lock'))
   let database: KurumiDb | undefined
   let listener: ReturnType<typeof Bun.serve> | undefined
+  let web: ReturnType<typeof startWeb> | undefined
   let chat: ReturnType<typeof createChatLedger> | undefined
   let sessions: ReturnType<typeof createSessionLedger> | undefined
   let driver: ReturnType<typeof createDockerDriver> | undefined
@@ -146,6 +149,7 @@ export async function startHost(config: HostConfig) {
         admission?.stop(),
         driver?.detach(),
         listener?.stop(true),
+        web?.stop(true),
       ])
       try {
         egressLog?.stop()
@@ -192,11 +196,17 @@ export async function startHost(config: HostConfig) {
       log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
     })
     egressLog = requestLog
-    const vaultKey = loadVaultKey(config.home, storedAccounts(db), (key) => caSealedWith(db, key))
+    const connections = storedConnections(db)
+    const vaultKey = loadVaultKey(
+      config.home,
+      storedAccounts(db),
+      (key) => caSealedWith(db, key),
+      connections,
+    )
     const ca = await loadCertificateAuthority({
       db,
       vaultKey,
-      accountsStored: storedAccounts(db).count > 0,
+      accountsStored: storedAccounts(db).count > 0 || connections.count > 0,
       log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
     }).catch((error: unknown) => {
       const dbPath = join(config.home, 'kurumi.db')
@@ -239,13 +249,19 @@ export async function startHost(config: HostConfig) {
       network: environment.KURUMI_DOCKER_NETWORK,
     })
     driver = docker
-    const accountLedger = createAccountLedger({ db, vaultKey })
+    const accessLedger = createAccessLedger({ db })
+    const accountLedger = createAccountLedger({
+      db,
+      vaultKey,
+      webPort: config.web.port,
+      canApprove: (caller, group) =>
+        accessLedger.isApprover(caller, accessLedger.approverChain(group)),
+    })
     const agentLedger = createAgentLedger({
       db,
       home: config.home,
       onCreate: (tx, agentGroupId) => accountLedger.grantAutoGrants(tx, agentGroupId),
     })
-    const accessLedger = createAccessLedger({ db })
     const approvalLedger = createApprovalLedger({
       db,
       accessLedger,
@@ -371,6 +387,7 @@ export async function startHost(config: HostConfig) {
         process.stdout.write(`${JSON.stringify({ kind: 'gateway.admission', message })}\n`)
       },
     })
+    web = startWeb(config.web, accountLedger)
     const stale = lstatSync(socket, { throwIfNoEntry: false })
     if (stale && !stale.isSocket()) throw new Error(`${socket} exists and is not a socket`)
     rmSync(socket, { force: true })

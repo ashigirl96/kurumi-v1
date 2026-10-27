@@ -83,3 +83,47 @@ export const defaultAccount = sqliteTable(
     }).onDelete('cascade'),
   ],
 )
+
+export const oauthClient = sqliteTable('oauth_client', {
+  vendor: text('vendor', { enum: ['google'] }).primaryKey(),
+  material: blob('material', { mode: 'buffer' }).notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull(),
+})
+
+export const connectionRequest = sqliteTable(
+  'connection_request',
+  {
+    id: text('id').primaryKey(),
+    agentGroupId: text('agent_group_id')
+      .notNull()
+      .references(() => agentGroup.id, { onDelete: 'cascade' }),
+    vendor: text('vendor', { enum: ['google'] }).notNull(),
+    services: text('services', { mode: 'json' }).$type<ServiceId[]>().notNull(),
+    sessionId: text('session_id'),
+    state: text('state', {
+      enum: ['open', 'authorizing', 'completed', 'expired', 'cancelled'],
+    }).notNull(),
+    oauthState: text('oauth_state').unique(),
+    pkceVerifier: blob('pkce_verifier', { mode: 'buffer' }),
+    cardMessageId: text('card_message_id'),
+    accountId: text('account_id').references(() => account.id, { onDelete: 'set null' }),
+    requestedBy: text('requested_by').notNull(),
+    createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull(),
+    expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+  },
+  (t) => [
+    uniqueIndex('connection_request_live')
+      .on(t.agentGroupId, t.vendor, t.sessionId)
+      .where(sql`${t.sessionId} IS NOT NULL AND ${t.state} IN ('open', 'authorizing')`),
+  ],
+)
+
+export const connectLink = sqliteTable('connect_link', {
+  tokenHash: text('token_hash').primaryKey(),
+  requestId: text('request_id')
+    .notNull()
+    .references(() => connectionRequest.id, { onDelete: 'cascade' }),
+  mintedFor: text('minted_for').notNull(),
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
+  usedAt: integer('used_at', { mode: 'timestamp_ms' }),
+})

@@ -16,6 +16,12 @@ import {
   type ServiceId,
   type VendorId,
 } from './catalog.ts'
+import {
+  createConnections,
+  sealedConnectionRows,
+  type ConnectionOptions,
+  type Connections,
+} from './connect.ts'
 import { contract } from './contract.ts'
 import { account, accountGrant, defaultAccount } from './schema.ts'
 import {
@@ -114,6 +120,7 @@ export type CredentialDecision =
 export type CredentialPrincipal = { agentGroupId: string }
 
 export type AccountLedger = {
+  connections: Connections
   addKey(tx: Tx, input: AddKeyInput): AddKeyResult
   remove(tx: Tx, handle: string): RemoveResult
   accountIdOf(tx: Tx, handle: string): AccountLookup
@@ -321,6 +328,18 @@ export function storedAccounts(db: Db): StoredAccounts {
   }
 }
 
+export type StoredConnections = StoredAccounts & { ids: string[] }
+
+export function storedConnections(db: Db): StoredConnections {
+  const sealed = sealedConnectionRows(db)
+  return {
+    count: sealed.length,
+    ids: sealed.map(({ id }) => id),
+    unopenedBy: (vaultKey) =>
+      sealed.filter(({ id, material }) => !opens(vaultKey, id, material)).map(({ id }) => id),
+  }
+}
+
 function opens(vaultKey: Uint8Array, accountId: string, material: Uint8Array): boolean {
   try {
     open(vaultKey, accountId, material)
@@ -331,7 +350,9 @@ function opens(vaultKey: Uint8Array, accountId: string, material: Uint8Array): b
   }
 }
 
-export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): AccountLedger {
+export function createAccountLedger(
+  deps: { db: Db; vaultKey: Uint8Array } & ConnectionOptions,
+): AccountLedger {
   const grantRowsQuery = deps.db
     .select({
       accountId: account.id,
@@ -373,6 +394,7 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
     }))
 
   return {
+    connections: createConnections(deps),
     addKey(tx, { vendor, label, value, autoGrant }) {
       const taken = tx
         .select({ id: account.id })
@@ -614,6 +636,14 @@ function existingAccountId(ledger: AccountLedger, tx: Tx, handle: string): strin
 const os = implement(contract).$context<KurumiContext & { accountLedger: AccountLedger }>()
 
 export const router = os.router({
+  setClient: os.setClient.handler(({ context, input: [, { client }] }) => {
+    if (context.caller.kind !== 'host')
+      throw new ORPCError('FORBIDDEN', { message: 'only the host may set the OAuth client' })
+    context.accountLedger.connections.setClient(client)
+  }),
+  connect: os.connect.handler(({ context, input }) =>
+    context.accountLedger.connections.connect(input, context.caller),
+  ),
   addKey: os.addKey.handler(({ context, input: [vendor, { label, autoGrant, value }] }) => {
     const result = transaction(context.db, (tx) =>
       context.accountLedger.addKey(tx, { vendor, label, value, autoGrant }),

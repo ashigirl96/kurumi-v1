@@ -13,7 +13,7 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 
-import type { StoredAccounts } from '@kurumi/account/server'
+import type { StoredAccounts, StoredConnections } from '@kurumi/account/server'
 
 const KEY_BYTES = 32
 
@@ -82,10 +82,26 @@ function createKeyAtomically(home: string, path: string): void {
 
 const shellQuoted = (text: string): string => `'${text.replaceAll("'", `'\\''`)}'`
 
+function connectionRecovery(db: string, ids: readonly string[]): string {
+  const client = ids.includes('oauth-client:google')
+  const requests = ids.filter((id) => id !== 'oauth-client:google')
+  const remove = [
+    'PRAGMA foreign_keys = ON;',
+    ...(client ? ["DELETE FROM oauth_client WHERE vendor = 'google';"] : []),
+    ...(requests.length
+      ? [
+          `DELETE FROM connection_request WHERE id IN (${requests.map((id) => `'${id.replaceAll("'", "''")}'`).join(', ')});`,
+        ]
+      : []),
+  ].join(' ')
+  return `With the host stopped, run sqlite3 ${shellQuoted(db)} ${shellQuoted(remove)} and start the host.${client ? ' Run kurumi account set-client google again.' : ''}${requests.length ? ' Run kurumi account connect again for the removed requests.' : ''}`
+}
+
 export function loadVaultKey(
   home: string,
   accounts: StoredAccounts,
   opensGatewayCa: (vaultKey: Uint8Array) => boolean,
+  connections: StoredConnections = { count: 0, ids: [], unopenedBy: () => [] },
 ): Buffer {
   const path = join(home, 'vault.key')
   const db = join(home, 'kurumi.db')
@@ -96,6 +112,19 @@ export function loadVaultKey(
   const existing = readKey(path)
   if (existing) {
     const unopened = accounts.unopenedBy(existing)
+    const unopenedConnections = connections.unopenedBy(existing)
+    if (unopenedConnections.length > 0) {
+      const knownKey =
+        opensGatewayCa(existing) ||
+        unopened.length < accounts.count ||
+        unopenedConnections.length < connections.count
+      const reason = knownKey
+        ? 'opens other stored material, but these rows are damaged or were sealed with another vault.key'
+        : 'does not match the key that sealed the saved OAuth client or pending connections'
+      throw new Error(
+        `${path} ${reason} in ${db}: ${unopenedConnections.join(', ')}. Restore vault.key from backup if these rows were sealed with another key. Otherwise discard only the unreadable rows. ${connectionRecovery(db, unopenedConnections)}`,
+      )
+    }
     if (accounts.count > 0 && unopened.length === accounts.count) {
       if (opensGatewayCa(existing)) {
         const one = unopened.length === 1
@@ -113,6 +142,11 @@ export function loadVaultKey(
       )
     }
     return existing
+  }
+  if (connections.count > 0) {
+    throw new Error(
+      `${path} is missing, but ${db} holds a saved OAuth client or pending connection, so no new key is created. Restore vault.key from backup. Without a backup, discard only the rows sealed with the missing key. ${connectionRecovery(db, connections.ids)}`,
+    )
   }
   if (accounts.count > 0) {
     throw new Error(
