@@ -1,4 +1,4 @@
-import type { Cli, CliProcess, CliResult } from './docker.ts'
+import type { Cli, CliProcess, CliResult } from './cli.ts'
 
 export class FakeProcess implements CliProcess {
   readonly result: Promise<CliResult>

@@ -2,7 +2,9 @@ import { expect, test } from 'bun:test'
 
 import { gatewayContribution, proxyEnv } from '@kurumi/gateway/server'
 
-import type { ContainerInventory, InventoryChange, ListedContainer } from './driver/docker.ts'
+import type { ContainerInventory } from './driver/docker.ts'
+import type { InventoryChange } from './driver/events.ts'
+import type { ListedContainer } from './driver/listing.ts'
 import {
   createLiveness,
   createSupervisor,
