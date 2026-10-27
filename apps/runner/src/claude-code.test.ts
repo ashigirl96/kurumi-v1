@@ -142,7 +142,7 @@ async function runTurnInContainerEnv(
     const replies = []
     await runTurn({
       prompt: 'run the probe',
-      mcpServers: { kurumi: createKurumiServer(new RPCLink({ url: ${JSON.stringify(upstream.url)} + '/rpc', headers: { authorization: 'Bearer ' + process.env.KURUMI_TOKEN } }), AbortSignal.timeout(45_000)) },
+      mcpServers: () => ({ kurumi: createKurumiServer(new RPCLink({ url: ${JSON.stringify(upstream.url)} + '/rpc', headers: { authorization: 'Bearer ' + process.env.KURUMI_TOKEN } }), AbortSignal.timeout(45_000)) }),
       continuation: null,
       signal: AbortSignal.timeout(45_000),
       reply: async (text) => { replies.push(text) },

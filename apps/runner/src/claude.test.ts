@@ -80,6 +80,42 @@ test('a lost transcript starts a fresh conversation instead of failing every tur
   }
 })
 
+test('a missing conversation retries with a usable kurumi server while the first transport is open', async () => {
+  const host = await startHost()
+  const answer = sdk.respond
+  sdk.respond = (call) =>
+    (async function* () {
+      const server = call.mcpServers?.kurumi
+      if (server?.type !== 'sdk') throw new Error('missing kurumi server')
+      await server.instance.connect({
+        async start() {},
+        async send() {},
+        async close() {},
+      })
+      yield* answer(call)
+    })()
+  const controller = new AbortController()
+  const running = runRunner({ url: host.url, token: host.token, signal: controller.signal })
+  try {
+    expect(await host.reply()).toBe('model heard: hello')
+    sdk.forget()
+    await host.send('list accounts again')
+    expect(await host.reply()).toBe('model heard: list accounts again')
+    expect(sdk.calls).toHaveLength(3)
+    expect(sdk.calls[1]?.resume).not.toBeNull()
+    expect(sdk.calls[2]?.resume).toBeNull()
+    expect(sdk.calls[2]?.mcpServers?.kurumi).not.toBe(sdk.calls[1]?.mcpServers?.kurumi)
+  } finally {
+    controller.abort()
+    await running
+    for (const call of sdk.calls) {
+      const server = call.mcpServers?.kurumi
+      if (server?.type === 'sdk') await server.instance.close()
+    }
+    await host.stop()
+  }
+})
+
 test('a line completes and the next one runs while Claude Code is still exiting', async () => {
   const host = await startHost()
   const answer = sdk.respond

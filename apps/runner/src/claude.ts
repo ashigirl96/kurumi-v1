@@ -10,7 +10,7 @@ import {
 export type Turn = {
   prompt: string
   continuation: string | null
-  mcpServers?: Options['mcpServers']
+  mcpServers?(): Options['mcpServers']
   signal: AbortSignal
   reply(text: string): Promise<void>
   remember(continuation: string): Promise<void>
@@ -53,7 +53,7 @@ function options(
   const workspace = process.cwd()
   return {
     cwd: workspace,
-    mcpServers: turn.mcpServers,
+    mcpServers: turn.mcpServers?.(),
     abortController,
     ...(continuation === null ? {} : { resume: continuation }),
     systemPrompt: { type: 'preset', preset: 'claude_code' },

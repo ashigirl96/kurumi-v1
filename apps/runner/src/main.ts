@@ -77,7 +77,7 @@ export async function runRunner(options: {
     try {
       await runTurn({
         prompt: message.content,
-        mcpServers: { kurumi: createKurumiServer(link, signal) },
+        mcpServers: () => ({ kurumi: createKurumiServer(link, signal) }),
         continuation: saved.value,
         signal,
         async reply(text) {
