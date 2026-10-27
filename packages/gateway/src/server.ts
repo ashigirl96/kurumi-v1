@@ -115,7 +115,15 @@ export async function loadCertificateAuthority(deps: {
     return certificateAuthority(replaced, clock)
   }
   const stored = { certPem: row.certPem, keyPem: opened }
-  const previousNotAfter = certificateNotAfter(stored.certPem)
+  const previousNotAfter = (() => {
+    try {
+      return certificateNotAfter(stored.certPem)
+    } catch (error) {
+      throw new CaUnreadableError('the stored gateway CA certificate cannot be parsed', {
+        cause: error,
+      })
+    }
+  })()
   if (previousNotAfter.getTime() - now() > CA_RENEWAL_WINDOW_MS) {
     return certificateAuthority(stored, clock)
   }
@@ -127,6 +135,8 @@ export async function loadCertificateAuthority(deps: {
   })
   return certificateAuthority(renewed, clock)
 }
+
+export class CaUnreadableError extends Error {}
 
 export type CaBundle = { path: string; sha: string }
 

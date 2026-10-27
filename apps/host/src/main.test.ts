@@ -387,6 +387,32 @@ test('with accounts stored, a gateway CA the vault.key cannot open stops the hos
   expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(true)
 }, 5000)
 
+test('a stored gateway CA certificate that cannot be parsed stops the host, and the printed command replaces it', async () => {
+  const home = mkdtempSync(join(tmpdir(), "kurumi host's "))
+  homes.push(home)
+  await startAndStop(home)
+  const key = readFileSync(join(home, 'vault.key'))
+  storeAccount(home, seal(key, 'acc-a', 'sk-ant-test'))
+  const sqlite = new Database(join(home, 'kurumi.db'))
+  sqlite.query('UPDATE gateway_ca SET cert_pem = ?').run('not a certificate')
+  sqlite.close()
+
+  const refused = spawnHost(home)
+
+  expect(await refused.exited).toBe(1)
+  const stderr = await new Response(refused.stderr).text()
+  const db = join(home, 'kurumi.db')
+  expect(stderr).toContain(
+    `The gateway CA certificate in ${db} cannot be parsed. With the host stopped, run sqlite3 '${db.replaceAll("'", `'\\''`)}' 'DELETE FROM gateway_ca;' and start the host, and kurumi creates a new CA.`,
+  )
+  const printed = / run (sqlite3 .+;') and start/.exec(stderr)?.[1]
+  if (!printed) throw new Error('the refusal prints no sqlite3 command')
+  expect(Bun.spawnSync(['sh', '-c', printed]).exitCode).toBe(0)
+  await startAndStop(home)
+  expect(storedCa(home)).toStartWith('-----BEGIN CERTIFICATE-----')
+  expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(true)
+}, 5000)
+
 const inventoryDocker = `#!/bin/sh
 containers="$KURUMI_HOME/containers"
 case "$1" in
