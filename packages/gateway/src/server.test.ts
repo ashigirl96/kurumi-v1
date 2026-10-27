@@ -647,6 +647,46 @@ test('a CONNECT still resolving when the Agent Port stops is written as refused 
 
 const neverSettles = () => new Promise<never>(() => {})
 
+test('the default stop grace waits for an unfinished CONNECT for exactly 2 s', async () => {
+  let resolving = false
+  const port = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: () => ({}),
+    intercepts: () => false,
+    resolve: () => {
+      resolving = true
+      return neverSettles()
+    },
+    forward: { inject: ({ path, headers }) => ({ path, headers }) },
+  })
+  const client = connect(port.port, '127.0.0.1')
+  client.on('error', ignore)
+  client.write(
+    'CONNECT stalled.test:443 HTTP/1.1\r\nHost: stalled.test:443\r\n' +
+      `Proxy-Authorization: Basic ${Buffer.from('s:t').toString('base64')}\r\n\r\n`,
+  )
+  try {
+    await until(() => resolving)
+    jest.useFakeTimers()
+    let stopped = false
+    const stopping = port.stop().then(() => {
+      stopped = true
+    })
+    while (jest.getTimerCount() === 0) await new Promise(setImmediate)
+    jest.advanceTimersByTime(1_999)
+    await new Promise(setImmediate)
+    expect(stopped).toBe(false)
+    jest.advanceTimersByTime(1)
+    await new Promise(setImmediate)
+    expect(stopped).toBe(true)
+    await stopping
+  } finally {
+    jest.useRealTimers()
+    client.destroy()
+    await port.stop()
+  }
+})
+
 test('a CONNECT whose lookup never settles does not hold the Agent Port stop, and a finished request keeps its row', async () => {
   let resolving = false
   const { port, received, rowsAfterHostStop } = await startLoggedPort(
