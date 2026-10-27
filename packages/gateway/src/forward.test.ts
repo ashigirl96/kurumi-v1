@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, jest, test } from 'bun:test'
 import { createHash, randomBytes } from 'node:crypto'
 import type { LookupAddress } from 'node:dns'
 import { getEventListeners, once } from 'node:events'
@@ -1160,7 +1160,7 @@ async function setupHeld({
   holdMs?: number
   bodyDeadlineMs?: number
   now?: () => number
-  deps?: Pick<ForwardDeps<EgressPrincipal>, 'upstream' | 'resolve'>
+  deps?: Pick<ForwardDeps<EgressPrincipal>, 'upstream' | 'resolve' | 'gate'>
   rule?: RuleInput
 } = {}) {
   const db = inMemoryDb()
@@ -2083,6 +2083,91 @@ describe('held requests', () => {
 })
 
 describe('a request body that stops short', () => {
+  test('the default body deadline answers a held body with 408 after 30 s', async () => {
+    const { gate, upstream, tunnel, requested, events } = await setupHeld()
+    const screen = jest.spyOn(gate, 'screen')
+    jest.useFakeTimers()
+    let answered = false
+    const answer = exchangeRaw(tunnel.socket, stalledMessage).then((response) => {
+      answered = true
+      return response
+    })
+    try {
+      while (screen.mock.calls.length === 0) await new Promise(setImmediate)
+      jest.advanceTimersByTime(29_999)
+      for (let turn = 0; turn < 10; turn++) await new Promise(setImmediate)
+      expect(answered).toBe(false)
+      jest.advanceTimersByTime(1)
+      await new Promise(setImmediate)
+      jest.advanceTimersByTime(0)
+      expect(await answer).toMatchObject({ status: 408, headers: { connection: 'close' } })
+      expect(JSON.parse((await answer).body)).toMatchObject({
+        error: 'body_timeout',
+        limitMs: 30_000,
+      })
+      expect(requested).toEqual([])
+      expect(upstream.requests).toEqual([])
+      expect(decisions(events)).toEqual([['refused', 'body_timeout', 408]])
+    } finally {
+      screen.mockRestore()
+      jest.useRealTimers()
+    }
+  })
+
+  test('the default body deadline answers an unreachable upstream with 502 after 30 s', async () => {
+    const resolving = Promise.withResolvers<void>()
+    const { tunnel, requested, upstream } = await setupHeld({
+      deps: {
+        upstream: undefined,
+        resolve: async () => {
+          resolving.resolve()
+          throw new Error('ENOTFOUND')
+        },
+      },
+    })
+    jest.useFakeTimers()
+    const clock = jest.spyOn(performance, 'now').mockReturnValue(0)
+    let answered = false
+    const answer = exchangeRaw(tunnel.socket, stalledMessage).then((response) => {
+      answered = true
+      return response
+    })
+    try {
+      await resolving.promise
+      await new Promise(setImmediate)
+      jest.advanceTimersByTime(29_999)
+      for (let turn = 0; turn < 10; turn++) await new Promise(setImmediate)
+      expect(answered).toBe(false)
+      jest.advanceTimersByTime(1)
+      const response = await answer
+      expect(response).toMatchObject({ status: 502, headers: { connection: 'close' } })
+      expect(response.body).toContain(
+        JSON.stringify({ error: 'upstream_unreachable', host: 'api.anthropic.com' }),
+      )
+      expect(requested).toEqual([])
+      expect(upstream.requests).toEqual([])
+    } finally {
+      clock.mockRestore()
+      jest.useRealTimers()
+    }
+  })
+
+  test('the default body deadline reaches an upgrade gate as a 30 s refusal limit', async () => {
+    const { tunnel } = await setupHeld({
+      deps: {
+        gate: {
+          screen: async ({ bodyDeadlineMs }) => ({
+            kind: 'refuse',
+            refusal: { code: 'body_timeout', service: 'anthropic-api', limitMs: bodyDeadlineMs },
+          }),
+        },
+      },
+    })
+    const answer = await exchangeRaw(tunnel.socket, streamUpgrade())
+    expect(answer.status).toBe(408)
+    expect(JSON.parse(answer.body)).toMatchObject({ error: 'body_timeout', limitMs: 30_000 })
+  })
+
   test('is answered 408 body_timeout at the deadline when a rule holds it, asks no one, and logs a refused row', async () => {
     const { upstream, tunnel, requested, events } = await setupHeld({ bodyDeadlineMs: 100 })
 
