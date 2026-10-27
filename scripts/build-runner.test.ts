@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -46,3 +46,21 @@ test('runner.js imports the Agent SDK from the image instead of bundling it', as
     rmSync(home, { recursive: true, force: true })
   }
 })
+
+test('a FIFO at runner/runner.js is refused as not a regular file instead of blocking the build', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'kurumi-build-runner-'))
+  const runner = join(home, 'runner/runner.js')
+  mkdirSync(join(home, 'runner'))
+  expect(Bun.spawnSync(['mkfifo', '-m', '600', runner]).exitCode).toBe(0)
+  const build = Bun.spawn(['bun', join(repo, 'scripts/build-runner.ts')], {
+    env: { ...process.env, KURUMI_HOME: home },
+    stderr: 'pipe',
+  })
+  try {
+    expect(await build.exited).toBe(1)
+    expect(await new Response(build.stderr).text()).toContain(`${runner} is not a regular file`)
+  } finally {
+    build.kill('SIGKILL')
+    rmSync(home, { recursive: true, force: true })
+  }
+}, 5000)
