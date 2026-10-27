@@ -219,10 +219,12 @@ function forward(
     const piped = names.every((name) => argv.includes(name))
       ? stdinFieldOf(command, inputSchema)
       : null
+    // trpc-cli converts every input to JSON Schema, yet help shows a command's input only in its own group's listing.
+    const shown = names.slice(0, -1).every((name) => argv.includes(name))
     const render = renderers[childPath.join('.')] ?? json
     router[key] = os
       .meta(meta)
-      .input(piped?.cliSchema ?? inputSchema ?? z.object({}))
+      .input((shown ? (piped?.cliSchema ?? inputSchema) : undefined) ?? z.object({}))
       .handler(async ({ input }) => {
         const sent = piped
           ? withField(input, piped.field, await readStdinValue(stdin, command, piped))
