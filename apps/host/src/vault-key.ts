@@ -80,16 +80,34 @@ function createKeyAtomically(home: string, path: string): void {
   syncDirectory(home)
 }
 
-export function loadVaultKey(home: string, accounts: StoredAccounts): Buffer {
+const shellQuoted = (text: string): string => `'${text.replaceAll("'", `'\\''`)}'`
+
+export function loadVaultKey(
+  home: string,
+  accounts: StoredAccounts,
+  opensGatewayCa: (vaultKey: Uint8Array) => boolean,
+): Buffer {
   const path = join(home, 'vault.key')
   const db = join(home, 'kurumi.db')
   const counted = accounts.count === 1 ? '1 account' : `${accounts.count} accounts`
   const them = accounts.count === 1 ? 'it' : 'them'
-  const quotedDb = `'${db.replaceAll("'", `'\\''`)}'`
+  const quotedDb = shellQuoted(db)
   const startOver = `With no backup the stored keys are lost: to start over, keep the host stopped, run sqlite3 ${quotedDb} 'PRAGMA foreign_keys = ON; DELETE FROM account;' (or delete kurumi.db with its -wal and -shm files to reset all host state), start the host, and add the keys again.`
   const existing = readKey(path)
   if (existing) {
-    if (!accounts.sealedWith(existing)) {
+    const unopened = accounts.unopenedBy(existing)
+    if (accounts.count > 0 && unopened.length === accounts.count) {
+      // The gateway CA is sealed with the same key, so opening it tells a damaged row from a wrong key.
+      if (opensGatewayCa(existing)) {
+        const rows = unopened.length === 1 ? 'the row is' : 'the rows are'
+        const ids = unopened.map((id) => `'${id.replaceAll("'", "''")}'`).join(', ')
+        const remove = shellQuoted(
+          `PRAGMA foreign_keys = ON; DELETE FROM account WHERE id IN (${ids});`,
+        )
+        throw new Error(
+          `${path} opens the gateway CA, so it is the right key, but it cannot open ${counted} in ${db}, so ${rows} damaged: ${unopened.join(', ')}. With the host stopped, run sqlite3 ${quotedDb} ${remove} and start the host, and add the key again.`,
+        )
+      }
       throw new Error(
         `${path} does not match the key that sealed the ${counted} in ${db}, so it cannot open ${them}. Put back the vault.key that sealed ${them} from your backup and start the host again. ${startOver}`,
       )

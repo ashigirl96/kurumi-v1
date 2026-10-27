@@ -26,6 +26,7 @@ import {
 } from '@kurumi/approval/server'
 import { createChatLedger, router as chatRouter } from '@kurumi/chat/server'
 import {
+  caSealedWith,
   CaUnreadableError,
   createEgressApproval,
   createEgressLog,
@@ -171,7 +172,7 @@ export async function startHost(config: HostConfig) {
       log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
     })
     egressLog = requestLog
-    const vaultKey = loadVaultKey(config.home, storedAccounts(db))
+    const vaultKey = loadVaultKey(config.home, storedAccounts(db), (key) => caSealedWith(db, key))
     const ca = await loadCertificateAuthority({
       db,
       vaultKey,

@@ -341,6 +341,30 @@ test('after the start-over SQL deletes every account, a host without vault.key s
   expect(stdout).toContain('"kind":"gateway.ca.replaced"')
 }, 5000)
 
+test('a damaged account row under the right vault.key stops the host, names the row, and the printed command removes it', async () => {
+  const home = mkdtempSync(join(tmpdir(), "kurumi host's "))
+  homes.push(home)
+  await startAndStop(home)
+  const key = readFileSync(join(home, 'vault.key'))
+  storeAccount(home, Buffer.of(0))
+
+  const refused = spawnHost(home)
+
+  expect(await refused.exited).toBe(1)
+  const stderr = await new Response(refused.stderr).text()
+  const db = join(home, 'kurumi.db')
+  const quotedDb = `'${db.replaceAll("'", `'\\''`)}'`
+  expect(stderr).toContain(
+    `${join(home, 'vault.key')} opens the gateway CA, so it is the right key, but it cannot open 1 account in ${db}, so the row is damaged: acc-a. With the host stopped, run sqlite3 ${quotedDb} 'PRAGMA foreign_keys = ON; DELETE FROM account WHERE id IN ('\\''acc-a'\\'');' and start the host, and add the key again.`,
+  )
+  expect(stderr).not.toContain('does not match')
+  const printed = / run (sqlite3 .+;') and start/.exec(stderr)?.[1]
+  if (!printed) throw new Error('the refusal prints no sqlite3 command')
+  expect(Bun.spawnSync(['sh', '-c', printed]).exitCode).toBe(0)
+  await startAndStop(home)
+  expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(true)
+}, 5000)
+
 test('with accounts stored, a wrong vault.key stops the host, names the backup, and keeps the gateway CA', async () => {
   const home = homeForTest()
   await startAndStop(home)

@@ -73,6 +73,11 @@ function openCaKey(vaultKey: Uint8Array, sealedKey: Uint8Array): string | VaultE
   }
 }
 
+export function caSealedWith(db: Db, vaultKey: Uint8Array): boolean {
+  const row = db.select({ sealedKey: gatewayCa.sealedKey }).from(gatewayCa).get()
+  return row !== undefined && !(openCaKey(vaultKey, row.sealedKey) instanceof VaultError)
+}
+
 export async function loadCertificateAuthority(deps: {
   db: Db
   vaultKey: Uint8Array
