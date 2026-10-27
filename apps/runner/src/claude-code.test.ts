@@ -71,6 +71,7 @@ function toolResults(request: MessagesRequest): string[] {
 
 function startUpstream(command: string, toolName = 'Bash') {
   const toolOutputs: string[] = []
+  const modelRequests: string[] = []
   let requests = 0
   let mineCalls = 0
   let toolNames: string[] = []
@@ -85,12 +86,17 @@ function startUpstream(command: string, toolName = 'Bash') {
           return new Response('unauthorized', { status: 401 })
         mineCalls++
         return Response.json({
-          json: { accounts: [{ handle: 'anthropic/main', selector: 'kurumi:anthropic/main' }] },
+          json: {
+            accounts: [{ handle: 'anthropic/main', selector: 'kurumi:anthropic/main' }],
+            request: { url: request.url, body: await request.text() },
+          },
         })
       }
       if (request.method !== 'POST' || pathname !== '/v1/messages')
         return Response.json({ data: [] })
-      const body: MessagesRequest = await request.json()
+      const raw = await request.text()
+      modelRequests.push(raw)
+      const body: MessagesRequest = JSON.parse(raw)
       toolNames = (body.tools ?? []).map((tool) => tool.name)
       const results = toolResults(body)
       toolOutputs.push(...results)
@@ -116,6 +122,7 @@ function startUpstream(command: string, toolName = 'Bash') {
   return {
     url: server.url.href.replace(/\/$/, ''),
     toolOutputs,
+    modelRequests,
     requests: () => requests,
     mineCalls: () => mineCalls,
     toolNames: () => toolNames,
@@ -224,5 +231,7 @@ test('the in-process kurumi tool calls the host and returns its result without t
   expect(upstream.toolNames()).toContain('mcp__kurumi__list_accounts')
   expect(upstream.mineCalls()).toBe(1)
   expect(upstream.toolOutputs.join('')).toContain('anthropic/main')
-  expect(upstream.toolOutputs.join('')).not.toContain('kurumi-session-token-probe')
+  expect(upstream.toolOutputs.join('')).toContain('/rpc/account/mine')
+  expect(upstream.modelRequests.length).toBeGreaterThan(0)
+  expect(upstream.modelRequests.join('')).not.toContain('kurumi-session-token-probe')
 }, 60_000)

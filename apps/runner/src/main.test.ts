@@ -13,6 +13,7 @@ test('runner answers through an in-process host and completes ten lines in order
   const running = runRunner({ url: host.url, token: host.token, signal: controller.signal })
   try {
     expect(await host.reply()).toBe('model heard: hello')
+    expect(sdk.calls[0]?.mcpServers?.kurumi).toMatchObject({ name: 'kurumi', type: 'sdk' })
     for (let i = 0; i < 10; i++) await host.send(`line ${i}`)
     const replies = []
     for (let i = 0; i < 10; i++) replies.push(await host.reply())

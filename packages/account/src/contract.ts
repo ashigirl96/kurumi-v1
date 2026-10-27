@@ -46,7 +46,7 @@ export const contract = {
       tool: {
         name: 'list_accounts',
         instructions:
-          'Lists the accounts you may use, per service. To pick one, put its selector where the token goes; with none, the only or default account is used.',
+          'Lists the accounts you may use, per service. A selector is a public placeholder, not a credential. Put it where a bearer token or API key goes; the gateway swaps it for the real credential when the request goes through the Agent Port. With no selector, the only or default account is used.',
       },
     })
     .output(z.object({ accounts: z.array(MyAccountSchema) })),

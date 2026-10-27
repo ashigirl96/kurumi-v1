@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { Options } from '@anthropic-ai/claude-agent-sdk'
 import {
   createAgentLedger,
   migrations as agentMigrations,
@@ -18,7 +19,12 @@ import { RPCHandler } from '@orpc/server/node'
 import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 
-export type FakeCall = { prompt: string; resume: string | null; signal: AbortSignal }
+export type FakeCall = {
+  prompt: string
+  resume: string | null
+  signal: AbortSignal
+  mcpServers: Options['mcpServers']
+}
 
 const sessions = new Map<string, string[]>()
 
@@ -75,9 +81,18 @@ await mock.module('@anthropic-ai/claude-agent-sdk', () => ({
     options,
   }: {
     prompt: string
-    options: { resume?: string; abortController: AbortController }
+    options: {
+      resume?: string
+      abortController: AbortController
+      mcpServers?: Options['mcpServers']
+    }
   }) {
-    const call = { prompt, resume: options.resume ?? null, signal: options.abortController.signal }
+    const call = {
+      prompt,
+      resume: options.resume ?? null,
+      signal: options.abortController.signal,
+      mcpServers: options.mcpServers,
+    }
     sdk.calls.push(call)
     return sdk.respond(call)
   },

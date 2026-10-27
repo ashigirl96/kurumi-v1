@@ -31,6 +31,38 @@ test('tool metadata without agent access is refused', () => {
   ).toThrow('unsafe has tool metadata without agent access')
 })
 
+test('duplicate tool names in separate contract branches fail at startup', () => {
+  const duplicate = kc.meta({
+    agent: 'own-group',
+    tool: { name: 'duplicate', instructions: 'duplicate' },
+  })
+  expect(() => toolsOf({ first: { one: duplicate }, second: duplicate }, link, signal)).toThrow(
+    'Duplicate tool name: duplicate',
+  )
+})
+
+test('aborting a turn cancels its in-flight tool RPC without stopping the runner', async () => {
+  const turn = new AbortController()
+  let received: AbortSignal | undefined
+  const pendingLink: ClientLink<Record<string, never>> = {
+    async call(_path, _input, options) {
+      received = options.signal
+      return new Promise((_, reject) => {
+        options.signal?.addEventListener('abort', () => reject(new Error('turn aborted')), {
+          once: true,
+        })
+      })
+    },
+  }
+  const [list] = toolsOf(runnerContract, pendingLink, signal)
+  if (!list) throw new Error('missing list_accounts')
+  const pending = list.handler({}, { signal: turn.signal })
+  turn.abort()
+  expect(received?.aborted).toBe(true)
+  expect(signal.aborted).toBe(false)
+  expect(await pending.catch((error: unknown) => error)).toEqual(new Error('turn aborted'))
+})
+
 test('handlers forward the contract path and input on the existing link', async () => {
   calls.length = 0
   const tools = toolsOf(runnerContract, link, signal)

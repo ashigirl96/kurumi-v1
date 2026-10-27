@@ -26,29 +26,45 @@ export function toolsOf(
   contract: AnyContractRouter,
   link: ClientLink<Record<string, never>>,
   signal: AbortSignal,
-  path: string[] = [],
 ): ReturnType<typeof tool>[] {
-  return Object.entries(contract).flatMap(([key, child]) => {
-    const childPath = [...path, key]
-    if (!isContractProcedure(child)) return toolsOf(child, link, signal, childPath)
-    const { inputSchema } = child['~orpc']
-    const meta: Meta = child['~orpc'].meta
-    if (!meta.tool) return []
-    if (!meta.agent)
-      throw new Error(`${childPath.join('.')} has tool metadata without agent access`)
-    if (inputSchema !== undefined && !(inputSchema instanceof z.ZodObject)) {
-      throw new Error(`${childPath.join('.')} needs an object input schema for a tool`)
-    }
-    return [
-      tool(meta.tool.name, meta.tool.instructions, inputSchema?.shape ?? {}, async (input) => {
-        const output = await link.call(childPath, inputSchema ? input : undefined, {
-          context: {},
-          signal,
-        })
-        return { content: [{ type: 'text', text: JSON.stringify(output) }] }
-      }),
-    ]
-  })
+  const names = new Set<string>()
+  function walk(router: AnyContractRouter, path: string[]): ReturnType<typeof tool>[] {
+    return Object.entries(router).flatMap(([key, child]) => {
+      const childPath = [...path, key]
+      if (!isContractProcedure(child)) return walk(child, childPath)
+      const { inputSchema } = child['~orpc']
+      const meta: Meta = child['~orpc'].meta
+      if (!meta.tool) return []
+      if (!meta.agent)
+        throw new Error(`${childPath.join('.')} has tool metadata without agent access`)
+      if (inputSchema !== undefined && !(inputSchema instanceof z.ZodObject)) {
+        throw new Error(`${childPath.join('.')} needs an object input schema for a tool`)
+      }
+      if (names.has(meta.tool.name)) throw new Error(`Duplicate tool name: ${meta.tool.name}`)
+      names.add(meta.tool.name)
+      return [
+        tool(
+          meta.tool.name,
+          meta.tool.instructions,
+          inputSchema?.shape ?? {},
+          async (input, extra) => {
+            const output = await link.call(childPath, inputSchema ? input : undefined, {
+              context: {},
+              signal:
+                typeof extra === 'object' &&
+                extra !== null &&
+                'signal' in extra &&
+                extra.signal instanceof AbortSignal
+                  ? extra.signal
+                  : signal,
+            })
+            return { content: [{ type: 'text', text: JSON.stringify(output) }] }
+          },
+        ),
+      ]
+    })
+  }
+  return walk(contract, [])
 }
 
 export function createKurumiServer(link: ClientLink<Record<string, never>>, signal: AbortSignal) {
