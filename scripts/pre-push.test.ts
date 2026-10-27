@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -13,9 +14,6 @@ import { join } from 'node:path'
 
 const hook = join(import.meta.dir, '../.githooks/pre-push')
 const zero = '0'.repeat(40)
-const old = '1'.repeat(40)
-const head = '2'.repeat(40)
-const update = `refs/heads/main ${head} refs/heads/main ${old}\n`
 const dirs: string[] = []
 
 afterAll(() => {
@@ -23,12 +21,34 @@ afterAll(() => {
 })
 
 function setup(scanner: 'gitleaks' | 'docker' | 'none' = 'gitleaks') {
-  const dir = mkdtempSync(join(tmpdir(), 'kurumi-pre-push-'))
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'kurumi-pre-push-')))
   dirs.push(dir)
   const bin = join(dir, 'bin')
   mkdirSync(bin)
   symlinkSync(Bun.which('git')!, join(bin, 'git'))
   expect(Bun.spawnSync(['git', 'init', '-q', dir]).exitCode).toBe(0)
+  const commit = () => {
+    expect(
+      Bun.spawnSync(
+        [
+          'git',
+          '-c',
+          'user.name=Hook Test',
+          '-c',
+          'user.email=hook-test@example.com',
+          'commit',
+          '--allow-empty',
+          '-qm',
+          'clean',
+        ],
+        { cwd: dir },
+      ).exitCode,
+    ).toBe(0)
+    return Bun.spawnSync(['git', 'rev-parse', 'HEAD'], { cwd: dir }).stdout.toString().trim()
+  }
+  const old = commit()
+  const head = commit()
+  const update = `refs/heads/main ${head} refs/heads/main ${old}\n`
   const log = join(dir, 'scan.log')
   writeFileSync(log, '')
   if (scanner !== 'none') {
@@ -49,7 +69,10 @@ exit "$SCAN_EXIT"
   }
   return {
     dir,
-    run(input: string, env: Record<string, string> = {}) {
+    old,
+    head,
+    update,
+    run: (input: string, env: Record<string, string> = {}) => {
       const result = Bun.spawnSync(['/bin/sh', hook], {
         cwd: dir,
         env: {
@@ -72,7 +95,7 @@ exit "$SCAN_EXIT"
 }
 
 test('scans every pushed ref with CI options without consuming the remaining stdin', () => {
-  const { run } = setup()
+  const { run, head, old, update } = setup()
   const result = run(update + `refs/heads/topic ${head} refs/heads/topic ${zero}\n`)
   expect(result.exitCode).toBe(0)
   expect(result.args).toEqual([
@@ -88,19 +111,19 @@ test('scans every pushed ref with CI options without consuming the remaining std
 })
 
 test('deletions and pushes with no updates need no scanner', () => {
-  const { run } = setup('none')
+  const { run, old } = setup('none')
   expect(run(`(delete) ${zero} refs/heads/topic ${old}\n`).exitCode).toBe(0)
   expect(run('').exitCode).toBe(0)
 })
 
 test('a scanner finding or failure refuses the push', () => {
-  const { run } = setup()
+  const { run, update } = setup()
   expect(run(update, { SCAN_EXIT: '1' }).exitCode).not.toBe(0)
   expect(run(update, { SCAN_EXIT: '2' }).exitCode).not.toBe(0)
 })
 
-test('Docker fallback uses the pinned image and mounts the Git common directory for worktrees', () => {
-  const { dir, run } = setup('docker')
+test('Docker fallback uses the pinned image and mounts the repository and Git common directory', () => {
+  const { dir, run, old, head, update } = setup('docker')
   const result = run(update)
   expect(result.exitCode).toBe(0)
   expect(result.args).toEqual([
@@ -121,12 +144,12 @@ test('Docker fallback uses the pinned image and mounts the Git common directory 
 })
 
 test('a failed Docker scan refuses the push', () => {
-  const { run } = setup('docker')
+  const { run, update } = setup('docker')
   expect(run(update, { SCAN_EXIT: '125' }).exitCode).not.toBe(0)
 })
 
 test('a missing scanner explains installation and the explicit bypass', () => {
-  const { run } = setup('none')
+  const { run, update } = setup('none')
   const result = run(update)
   expect(result.exitCode).not.toBe(0)
   expect(result.stderr).toContain('8.30.1')
@@ -136,10 +159,18 @@ test('a missing scanner explains installation and the explicit bypass', () => {
 })
 
 test('a different native version refuses the push to keep local scans aligned with CI', () => {
-  const { run } = setup()
+  const { run, update } = setup()
   const result = run(update, { SCAN_VERSION: '8.29.0' })
   expect(result.exitCode).not.toBe(0)
   expect(result.stderr).toContain('8.30.1')
   expect(result.stderr).toContain('git push --no-verify')
+  expect(result.args).toEqual([])
+})
+
+test('an unavailable remote commit blocks the push before invoking the scanner', () => {
+  const { run, head } = setup()
+  const result = run(`refs/heads/main ${head} refs/heads/main ${'1'.repeat(40)}\n`)
+  expect(result.exitCode).not.toBe(0)
+  expect(result.stderr).toContain('git fetch')
   expect(result.args).toEqual([])
 })
