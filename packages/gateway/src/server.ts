@@ -1,5 +1,14 @@
 import { createHash, randomUUID, X509Certificate } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { rootCertificates } from 'node:tls'
 
@@ -145,6 +154,22 @@ export class CaUnreadableError extends Error {}
 
 export type CaBundle = { path: string; sha: string }
 
+function readStagedBundle(path: string): string | null {
+  let fd: number
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null
+    throw error
+  }
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error(`${path} is not a regular file`)
+    return readFileSync(fd, 'utf8')
+  } finally {
+    closeSync(fd)
+  }
+}
+
 /**
  * `SSL_CERT_FILE` replaces the trust store of OpenSSL clients such as curl, so the bundle carries the public roots
  * next to the kurumi CA. The name is content-addressed because a running container pins the file it mounted.
@@ -155,7 +180,7 @@ export function stageCaBundle(home: string, caPem: string): CaBundle {
   const directory = join(home, 'ca')
   mkdirSync(directory, { recursive: true, mode: 0o700 })
   const path = join(directory, `combined-${sha}.pem`)
-  if (!existsSync(path) || readFileSync(path, 'utf8') !== content) {
+  if (readStagedBundle(path) !== content) {
     const temporary = join(directory, `.pending-${randomUUID()}`)
     writeFileSync(temporary, content, { mode: 0o644 })
     renameSync(temporary, path)
