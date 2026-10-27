@@ -69,8 +69,30 @@ export function hostAddresses(): string[] {
   )
 }
 
+const parseHextets = (part: string) =>
+  part ? part.split(':').map((hextet) => parseInt(hextet, 16)) : []
+
+// IPv4 parses as its IPv4-mapped form so both spellings of one address share a key.
+function hextets(address: string): number[] {
+  const literal = address.includes(':') ? address : `::ffff:${address}`
+  const [head = '', tail = ''] = new URL(`http://[${literal}]`).hostname.slice(1, -1).split('::')
+  const left = parseHextets(head)
+  const right = parseHextets(tail)
+  return [...left, ...Array<number>(8 - left.length - right.length).fill(0), ...right]
+}
+
+const prefixKey = (words: number[], prefix: number) =>
+  `${words.slice(0, prefix / 16).join(':')}/${prefix}`
+
 export function addressRefusal(host: readonly string[]): (address: string) => string | null {
-  const own = blockList(host.flatMap(hostRanges))
+  // Every host range is one address or a 6to4 /48, so exact keys at those two widths replace prefix matching.
+  const own = new Set(
+    host
+      .flatMap(hostRanges)
+      .map(([, network, prefix]) =>
+        prefixKey(hextets(network), network.includes(':') ? prefix : 96 + prefix),
+      ),
+  )
   return (address) => {
     const bare = address.replace(/%.*$/, '')
     const family = isIP(bare)
@@ -78,7 +100,8 @@ export function addressRefusal(host: readonly string[]): (address: string) => st
     const type = family === 4 ? 'ipv4' : 'ipv6'
     const reason = refused.find(({ list }) => list.check(bare, type))?.reason
     if (reason) return reason
-    return own.check(bare, type) ? 'host interface' : null
+    const words = hextets(bare)
+    return own.has(prefixKey(words, 128)) || own.has(prefixKey(words, 48)) ? 'host interface' : null
   }
 }
 

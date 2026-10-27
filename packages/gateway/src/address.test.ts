@@ -62,27 +62,46 @@ test.each([
   expect(addressRefusal([])(address)).toBeNull()
 })
 
-const host = ['127.0.0.1', '203.0.113.7', 'fe80::1%en0', '2001:db8:1::7']
+const host = [
+  '127.0.0.1',
+  '203.0.113.7',
+  'fe80::1%en0',
+  '2001:db8:1::7',
+  '2001:db8:2::9%en1',
+  '::ffff:198.51.100.9',
+]
 
 test.each([
   ['203.0.113.7', 'host interface'],
   ['::ffff:203.0.113.7', 'host interface'],
+  ['::ffff:cb00:7107', 'host interface'],
+  ['::ffff:0:203.0.113.7', 'host interface'],
   ['64:ff9b::cb00:7107', 'host interface'],
   ['2002:cb00:7107::1', 'host interface'],
+  ['2002:cb00:7107:ffff:1:2:3:4', 'host interface'],
   ['2001:db8:1::7', 'host interface'],
   ['2001:0db8:0001:0000:0000:0000:0000:0007', 'host interface'],
+  ['2001:DB8:1::7', 'host interface'],
+  ['2001:db8:1::7%en0', 'host interface'],
+  ['2001:db8:2::9', 'host interface'],
+  ['198.51.100.9', 'host interface'],
   ['127.0.0.1', 'loopback'],
   ['fe80::1', 'link-local'],
 ])('%s on this host is refused as %s', (address, reason) => {
   expect(addressRefusal(host)(address)).toBe(reason)
 })
 
-test.each(['203.0.113.8', '2001:db8:1::8', '8.8.8.8'])(
-  '%s, not on this host, is a public address',
-  (address) => {
-    expect(addressRefusal(host)(address)).toBeNull()
-  },
-)
+test.each([
+  '203.0.113.8',
+  '2002:cb00:7108::1',
+  '64:ff9b::cb00:7108',
+  '2001:db8:1::8',
+  '2001:db8:1::7:0',
+  '64:ff9b::c633:6409',
+  '8.8.8.8',
+])('%s, not on this host, is a public address', (address) => {
+  expect(addressRefusal(host)(address)).toBeNull()
+})
 
 test('the host addresses include the loopback interface', () => {
   expect(hostAddresses()).toContain('127.0.0.1')
