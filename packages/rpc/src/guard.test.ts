@@ -318,6 +318,7 @@ test('the final lint configuration rejects voided Promises and the three sync-tr
   try {
     symlinkSync(join(repo, 'node_modules'), join(dir, 'node_modules'))
     mkdirSync(join(dir, 'scripts/oxlint'), { recursive: true })
+    writeFileSync(join(dir, 'package.json'), '{}')
     copyFileSync(join(repo, '.oxlintrc.json'), join(dir, '.oxlintrc.json'))
     copyFileSync(join(repo, 'scripts/oxlint/kurumi.js'), join(dir, 'scripts/oxlint/kurumi.js'))
     writeFileSync(
