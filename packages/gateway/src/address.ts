@@ -68,12 +68,15 @@ export function hostAddresses(): string[] {
   )
 }
 
-export function addressRefusal(address: string, host: readonly string[]): string | null {
-  const bare = address.replace(/%.*$/, '')
-  const family = isIP(bare)
-  if (family === 0) return 'unparseable'
-  const type = family === 4 ? 'ipv4' : 'ipv6'
-  const reason = refused.find(({ list }) => list.check(bare, type))?.reason
-  if (reason) return reason
-  return blockList(host.flatMap(hostRanges)).check(bare, type) ? 'host interface' : null
+export function addressRefusal(host: readonly string[]): (address: string) => string | null {
+  const own = blockList(host.flatMap(hostRanges))
+  return (address) => {
+    const bare = address.replace(/%.*$/, '')
+    const family = isIP(bare)
+    if (family === 0) return 'unparseable'
+    const type = family === 4 ? 'ipv4' : 'ipv6'
+    const reason = refused.find(({ list }) => list.check(bare, type))?.reason
+    if (reason) return reason
+    return own.check(bare, type) ? 'host interface' : null
+  }
 }

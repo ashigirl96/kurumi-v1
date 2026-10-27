@@ -102,7 +102,7 @@ export async function startAgentPort<Principal extends object>(deps: {
   bind: { host: string; port: number }
   authenticate(token: string): Principal | null | Promise<Principal | null>
   intercepts(host: string): boolean
-  addressRefusal?: (address: string, host: readonly string[]) => string | null
+  addressRefusal?: (host: readonly string[]) => (address: string) => string | null
   hostAddresses?: () => readonly string[]
   resolve?: (host: string) => Promise<LookupAddress[]>
   forward: ForwardDeps<Principal>
@@ -118,7 +118,7 @@ export async function startAgentPort<Principal extends object>(deps: {
   ): Promise<void>
 }): Promise<AgentPort> {
   const ca = deps.ca ?? (await createCertificateAuthority())
-  const refusal = deps.addressRefusal ?? addressRefusal
+  const refusalOf = deps.addressRefusal ?? addressRefusal
   const readHostAddresses = deps.hostAddresses ?? hostAddresses
   const resolve = deps.resolve ?? ((host: string) => lookup(host, { all: true }))
   const listeners = new Map<string, Promise<HostListener<Principal>>>()
@@ -339,10 +339,8 @@ export async function startAgentPort<Principal extends object>(deps: {
     }
     const listener = intercepted ? await listenerFor(target.host) : undefined
     const addresses = listener ? [] : await resolve(target.host)
-    const host = listener ? [] : readHostAddresses()
-    const reason = addresses
-      .map(({ address }) => refusal(address, host))
-      .find((found) => found !== null)
+    const refusal = refusalOf(listener ? [] : readHostAddresses())
+    const reason = addresses.map(({ address }) => refusal(address)).find((found) => found !== null)
     if (reason) {
       rejectConnect(
         client,

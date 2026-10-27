@@ -901,7 +901,7 @@ test('a forwarded request dials only the pinned address, resolved once', async (
       resolved++
       return [{ address: '127.0.0.1', family: 4 }]
     },
-    { host: 'pinned.invalid', addressRefusal: () => null },
+    { host: 'pinned.invalid', addressRefusal: () => () => null },
   )
 
   await sendTestRequest(tunnel, { path: '/v1/models' })

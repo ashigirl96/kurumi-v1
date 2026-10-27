@@ -129,7 +129,7 @@ test('an unintercepted public address keeps the upstream certificate and receive
     bind: { host: '127.0.0.1', port: 0 },
     authenticate: (token) => (token === 'test-token' ? {} : null),
     intercepts: () => false,
-    addressRefusal: () => null,
+    addressRefusal: () => () => null,
     forward: { inject: ({ path, headers }) => ({ path, headers }) },
   })
   stops.push(gateway.stop)
@@ -201,7 +201,7 @@ async function gatewayResolving(addresses: string[], refused: string[]) {
     bind: { host: '127.0.0.1', port: 0 },
     authenticate: (token) => (token === 'test-token' ? {} : null),
     intercepts: () => false,
-    addressRefusal: (address) => (refused.includes(address) ? 'test-refused' : null),
+    addressRefusal: () => (address) => (refused.includes(address) ? 'test-refused' : null),
     resolve: (host) =>
       Promise.resolve(
         host === 'pinned.test'
