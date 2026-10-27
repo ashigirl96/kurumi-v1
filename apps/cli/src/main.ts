@@ -261,6 +261,7 @@ const renderers: Readonly<Record<string, (output: unknown) => string>> = {
           view.handle,
           view.kind,
           view.services.join(','),
+          view.status,
           view.autoGrant ? 'auto-grant' : '',
         ]),
     ),
