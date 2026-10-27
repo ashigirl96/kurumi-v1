@@ -82,6 +82,7 @@ function rejectConnect(socket: Duplex, status: 400 | 403 | 407 | 502, body = '')
 
 // A lookup or injection that ignores the abort could otherwise hold stop, and the host's flush and lock release behind it, forever.
 const STOP_GRACE_MS = 2_000
+const REAUTHENTICATE_MS = 1_000
 
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve) => {
@@ -382,6 +383,17 @@ export async function startAgentPort<Principal extends object>(deps: {
         if (listener.pending.get(key) === tunnel) listener.pending.delete(key)
       })
     }
+    const close = () => {
+      client.destroy()
+      outbound.destroy()
+    }
+    const reauthenticate = setInterval(() => {
+      void (async () => {
+        if ((await deps.authenticate(token)) === null) close()
+      })().catch(close)
+    }, REAUTHENTICATE_MS)
+    reauthenticate.unref()
+    aborted.signal.addEventListener('abort', () => clearInterval(reauthenticate), { once: true })
     client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
     if (head.length) outbound.write(head)
     const done = (error: NodeJS.ErrnoException | null) => {
