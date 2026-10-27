@@ -97,15 +97,16 @@ export function loadVaultKey(
   if (existing) {
     const unopened = accounts.unopenedBy(existing)
     if (accounts.count > 0 && unopened.length === accounts.count) {
-      // The gateway CA is sealed with the same key, so opening it tells a damaged row from a wrong key.
+      // A key that opens the gateway CA is the host's key, but the rows may come from a backup made under another key.
       if (opensGatewayCa(existing)) {
-        const rows = unopened.length === 1 ? 'the row is' : 'the rows are'
+        const one = unopened.length === 1
+        const rowRef = one ? 'this row' : 'these rows'
         const ids = unopened.map((id) => `'${id.replaceAll("'", "''")}'`).join(', ')
         const remove = shellQuoted(
           `PRAGMA foreign_keys = ON; DELETE FROM account WHERE id IN (${ids});`,
         )
         throw new Error(
-          `${path} opens the gateway CA, so it is the right key, but it cannot open ${counted} in ${db}, so ${rows} damaged: ${unopened.join(', ')}. With the host stopped, run sqlite3 ${quotedDb} ${remove} and start the host, and add the key again.`,
+          `${path} opens the gateway CA but cannot open ${counted} in ${db}: ${unopened.join(', ')}. If ${rowRef} came from a backup made with another vault.key, put that key back and start the host again. Otherwise ${one ? 'the row is' : 'the rows are'} damaged: with the host stopped, run sqlite3 ${quotedDb} ${remove} and start the host. The command also removes the grants and defaults of ${rowRef}: add ${one ? 'the key' : 'the keys'} again, then set those again with kurumi account grant and kurumi account set-default.`,
         )
       }
       throw new Error(
