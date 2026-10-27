@@ -10,6 +10,8 @@ usage: lane.sh <command> <lane> [args]
   add-key <lane>             add the keychain subscription token as anthropic/main (auto-grant)
   chat <lane> <agent> <line> send one line and wait for the reply; prints the transcript path
   probe <lane>               from the lane's one agent container, POST /v1/messages (max_tokens 1) through the gateway
+  consent <lane> <url>       complete Google consent (flags: --account <n>, --uncheck <service>, --cancel)
+  google-client <lane>       pipe the keychain Google OAuth client into account set-client
   down <lane>                stop the host, remove its containers and home; keep evidence
   smoke <lane>               up, add-key, agent create, one chat round trip, gateway log, down
 EOF
@@ -72,7 +74,7 @@ up() {
     sleep 1
     waited=$((waited + 1))
   done
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) lane $lane ready: pid $(host_pid), agent port $KURUMI_AGENT_PORT, image $KURUMI_AGENT_IMAGE, install $(install_label)" |
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) lane $lane ready: pid $(host_pid), agent port $KURUMI_AGENT_PORT, web port $KURUMI_WEB_PORT, image $KURUMI_AGENT_IMAGE, install $(install_label)" |
     tee -a "$evidence/lane.txt"
 }
 
@@ -99,6 +101,18 @@ doctor() {
 add_key() {
   security find-generic-password -s kurumi-live-claude -w |
     kurumi account add-key anthropic --label main --auto-grant
+}
+
+google_client() {
+  kurumi account --help 2>&1 | grep -Eq '^  set-client([[:space:]]|$)' ||
+    die "account set-client is unavailable; P3-3 must add it before google-client can run"
+  client_id=$(security find-generic-password -s kurumi-live-google-client-id -w) ||
+    die "keychain item kurumi-live-google-client-id is unavailable"
+  client_secret=$(security find-generic-password -s kurumi-live-google-client-secret -w) ||
+    die "keychain item kurumi-live-google-client-secret is unavailable"
+  printf '%s\n%s' "$client_id" "$client_secret" |
+    bun -e 'const [clientId, clientSecret] = (await Bun.stdin.text()).split("\n"); process.stdout.write(JSON.stringify({ clientId, clientSecret }))' |
+    kurumi account set-client google
 }
 
 chat() {
@@ -175,6 +189,8 @@ case $command in
   add-key) add_key ;;
   chat) chat "$@" ;;
   probe) probe ;;
+  consent) bun "$repo/.agents/skills/verify/consent.ts" "$lane" "$@" ;;
+  google-client) google_client ;;
   down) down ;;
   smoke) smoke ;;
   *) usage ;;
