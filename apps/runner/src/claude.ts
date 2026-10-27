@@ -106,7 +106,6 @@ async function attempt(turn: Turn, continuation: string | null): Promise<string 
         next = await messages.next()
       } catch (error) {
         turn.signal.throwIfAborted()
-        if (failed) break
         return `Provider error: ${error instanceof Error ? error.message : String(error)}`
       }
       if (next.done) break
@@ -121,7 +120,11 @@ async function attempt(turn: Turn, continuation: string | null): Promise<string 
         const text = textOf(message)
         if (text) await turn.reply(text)
       }
-      if (message.type === 'result' && message.is_error) failed = message
+      // Claude Code can take seconds to exit after the result, and nothing after it changes the turn.
+      if (message.type === 'result') {
+        if (message.is_error) failed = message
+        break
+      }
     }
   } catch (error) {
     abort()
