@@ -36,6 +36,7 @@ export type Forwarded = {
   path: string
   headers: Headers
   account?: { handle: AccountHandle; service: ServiceId }
+  unauthorized?: () => void
 }
 
 type Injected = Forwarded | { refusal: GatewayRefusal }
@@ -157,6 +158,7 @@ export function credentialInject(
       case 'inject':
         return {
           ...decision.injection.apply(),
+          unauthorized: decision.injection.unauthorized,
           account: {
             handle: decision.injection.handle,
             service: decision.injection.service,
@@ -229,6 +231,7 @@ type Prepared =
       decision: EgressDecision
       approvedBody?: Buffer
       undelivered: () => void
+      unauthorized?: () => void
     }
   | { kind: 'bad_request' }
   | { kind: 'refused'; refusal: GatewayRefusal; decision: EgressDecision }
@@ -408,6 +411,7 @@ async function prepareRequest<Principal>(
       agent: false,
     },
     account: injected.account?.handle,
+    unauthorized: injected.unauthorized,
     decision,
     approvedBody: body,
     undelivered: screened?.kind === 'forward' ? screened.undelivered : nothingToHandBack,
@@ -538,6 +542,7 @@ export async function forward<Principal>(
     respondUnreachable(res, context.target.host)
   })
   upstream.once('response', (response) => {
+    if (response.statusCode === 401) prepared.unauthorized?.()
     const responseHeaders = replaceAccountHeader(
       withoutHopHeaders(requestHeaders(response)),
       account,
@@ -633,6 +638,7 @@ export async function forwardUpgrade<Principal>(
     }
   })
   upstream.once('response', (response) => {
+    if (response.statusCode === 401) prepared.unauthorized?.()
     const headers = replaceAccountHeader(withoutHopHeaders(requestHeaders(response)), account)
     headers.set('connection', 'close')
     status = response.statusCode ?? 502

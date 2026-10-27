@@ -376,3 +376,28 @@ test('code exchange and refresh share a thirty-second deadline for a stalled tok
     deadline.mockRestore()
   }
 })
+
+test.each([
+  { access_token: '' },
+  { token_type: 'Basic' },
+  { expires_in: 0 },
+  { expires_in: -1 },
+  { expires_in: Number.MAX_VALUE },
+])('exchange and refresh reject invalid token material %o', async (invalid) => {
+  const { fetch } = respondWith(200, { ...tokenFull, ...invalid })
+  expect(
+    await exchangeCode({
+      vendor: 'google',
+      client,
+      code: 'code',
+      verifier: 'verifier',
+      redirectUri,
+      fetch,
+    }).catch((error: unknown) => error),
+  ).toMatchObject({ code: 'unexpected_response' })
+  expect(
+    await refresh({ vendor: 'google', client, refreshToken: 'refresh', fetch }).catch(
+      (error: unknown) => error,
+    ),
+  ).toMatchObject({ code: 'unexpected_response' })
+})

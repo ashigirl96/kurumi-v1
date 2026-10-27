@@ -650,7 +650,7 @@ test('reconnecting without a new refresh token keeps the stored refresh token', 
 test.each([
   ['exchange', 'invalid_grant'],
   ['identity', 'missing_id_token'],
-  ['validation', 'ZodError'],
+  ['validation', 'unexpected_response'],
 ] as const)('a failed %s logs only the request id and reason', async (failure, reason) => {
   const events: unknown[] = []
   tokenEndpoint(

@@ -16,7 +16,13 @@ test.each([
     403,
   ],
   [
-    { code: 'account_needs_reauth', service: 'anthropic-api', handle: main, agentGroupId: 'g1' },
+    {
+      code: 'account_needs_reauth',
+      service: 'anthropic-api',
+      handle: main,
+      agentGroupId: 'g1',
+      services: ['anthropic-api'],
+    },
     403,
   ],
   [{ code: 'account_refresh_failed', service: 'gmail', handle: googleA }, 503],
@@ -121,7 +127,13 @@ test.each([
     'connect to api.anthropic.com on port 443; kurumi serves it on no other port',
   ],
   [
-    { code: 'account_needs_reauth', service: 'anthropic-api', handle: main, agentGroupId: 'g1' },
+    {
+      code: 'account_needs_reauth',
+      service: 'anthropic-api',
+      handle: main,
+      agentGroupId: 'g1',
+      services: ['anthropic-api'],
+    },
     'ask the owner to add anthropic/main again',
   ],
   [
@@ -178,9 +190,16 @@ test('Google reauthorization names a connect command for the requesting group', 
     service: 'gmail',
     handle: googleA,
     agentGroupId: 'work',
+    services: ['gmail', 'google-calendar'],
   })
   expect(response.status).toBe(403)
   expect(JSON.parse(response.body).next).toContain(
-    'kurumi account connect --services gmail --agent-group-id work',
+    'kurumi account connect --services gmail google-calendar --agent-group-id work',
   )
+})
+
+test('a transient refresh refusal lets the client retry', () => {
+  expect(
+    refusalResponse({ code: 'account_refresh_failed', service: 'gmail', handle: googleA }).headers,
+  ).not.toHaveProperty('x-should-retry')
 })

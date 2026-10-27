@@ -1101,6 +1101,7 @@ test('an injected request names the service of the injection the ledger chose', 
         service: 'anthropic-api',
         handle,
         accountId: 'a1',
+        unauthorized: () => {},
         apply: () => ({ path: egress.path, headers: egress.headers }),
         toJSON: () => {
           throw new Error('an injection is never serialized')
@@ -2456,3 +2457,36 @@ describe('an approved request the upstream never received', () => {
     },
   )
 })
+
+test.each([false, true])(
+  'upstream 401 invalidates the injection once without replay (upgrade=%s)',
+  async (upgrade) => {
+    const unauthorized = jest.fn(() => {})
+    const inject = credentialInject({
+      credentialFor: async (_principal, egress) => ({
+        kind: 'inject',
+        injection: {
+          service: 'anthropic-api',
+          handle: accountHandle('anthropic', 'main'),
+          accountId: 'a1',
+          apply: () => ({ path: egress.path, headers: egress.headers }),
+          unauthorized,
+          toJSON: () => {
+            throw new Error('never serialize an injection')
+          },
+        },
+      }),
+    })
+    const { upstream, tunnel } = await setupCredentials({ inject })
+    upstream.setResponse('/v1/models', { status: 401, body: 'rejected' })
+    const response = upgrade
+      ? await exchangeRaw(
+          tunnel.socket,
+          'GET /v1/models HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n',
+        )
+      : await sendTestRequest(tunnel, { method: 'GET', path: '/v1/models' })
+    expect(response.status).toBe(401)
+    expect(unauthorized).toHaveBeenCalledTimes(1)
+    expect(upstream.requests).toHaveLength(1)
+  },
+)

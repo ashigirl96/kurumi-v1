@@ -1,6 +1,6 @@
 import { STATUS_CODES } from 'node:http'
 
-import type { CredentialRefusal, ServiceId } from '@kurumi/account/server'
+import { vendorOf, type CredentialRefusal, type ServiceId } from '@kurumi/account/server'
 
 export type HoldRefusal =
   | { code: 'approval_pending'; service: ServiceId; approvalId: string }
@@ -55,8 +55,8 @@ export function nextStep(refusal: GatewayRefusal): string {
         ? `${refusal.named} is not granted ${refusal.service} for this agent group; put kurumi:<handle> for one of ${refusal.granted.join(', ')} where the token goes`
         : `${refusal.named} is not granted ${refusal.service} for this agent group, and no account is; ${askToAdd}`
     case 'account_needs_reauth':
-      return refusal.handle.startsWith('google/')
-        ? `ask the owner to reconnect ${refusal.handle}: kurumi account connect --services ${refusal.service} --agent-group-id ${refusal.agentGroupId}`
+      return vendorOf(refusal.service) === 'google'
+        ? `ask the owner to reconnect ${refusal.handle}: kurumi account connect --services ${refusal.services.join(' ')} --agent-group-id ${refusal.agentGroupId}`
         : `ask the owner to add ${refusal.handle} again`
     case 'account_refresh_failed':
       return `could not refresh ${refusal.handle}; try again shortly`
@@ -113,7 +113,7 @@ export function refusalResponse(refusal: GatewayRefusal): {
       'content-type': 'application/json',
       'content-length': String(Buffer.byteLength(body)),
       // The Anthropic SDK retries a 409 unless told not to.
-      'x-should-retry': 'false',
+      ...(code !== 'account_refresh_failed' && { 'x-should-retry': 'false' }),
       'x-kurumi-gateway': code,
       ...(refusal.code === 'method_not_allowed' && { allow: refusal.allowed.join(', ') }),
     },

@@ -74,6 +74,7 @@ export type ConnectionOptions = {
           kind: 'account.refresh'
           accountId: string
           outcome: 'fresh' | 'needs_reauth' | 'transient_failure' | 'superseded'
+          durationMs: number
         }
       | { kind: 'account.connect.completed'; requestId: string; transactionMs: number }
       | { kind: 'account.connect.failed'; requestId: string; reason: string },
@@ -84,6 +85,11 @@ type OpenLink = { kind: 'authorize'; url: URL } | { kind: 'unavailable' }
 type CallbackPage =
   | { kind: 'completed'; granted: ServiceId[]; missing: ServiceId[] }
   | { kind: 'cancelled' | 'unavailable' | 'failed' | 'nothing-granted' }
+
+export function googleClient(db: Db, vaultKey: Uint8Array) {
+  const row = db.select().from(oauthClient).where(eq(oauthClient.vendor, 'google')).get()
+  return row ? GoogleClientSchema.parse(JSON.parse(open(vaultKey, clientAad, row.material))) : null
+}
 
 export function createConnections({
   db,
@@ -100,9 +106,10 @@ export function createConnections({
   const attempts = new Map<string, number>()
   const redirectUri = `http://127.0.0.1:${webPort}/oauth/callback`
   const clientOf = () => {
-    const row = db.select().from(oauthClient).where(eq(oauthClient.vendor, 'google')).get()
-    if (!row) throw new ORPCError('BAD_REQUEST', { message: 'run account set-client google first' })
-    return GoogleClientSchema.parse(JSON.parse(open(vaultKey, clientAad, row.material)))
+    const client = googleClient(db, vaultKey)
+    if (!client)
+      throw new ORPCError('BAD_REQUEST', { message: 'run account set-client google first' })
+    return client
   }
   const approver = (caller: Caller, group: string) => {
     if (caller.kind === 'agent' || !canApprove(caller, group))
@@ -321,12 +328,6 @@ export function createConnections({
           grantedScopes: identity.grantedScopes,
         })
         const expiresAt = new Date(Date.now() + tokens.expiresIn * 1000)
-        if (
-          tokens.tokenType.toLowerCase() !== 'bearer' ||
-          tokens.expiresIn <= 0 ||
-          !Number.isFinite(expiresAt.getTime())
-        )
-          throw new OAuthError('invalid OAuth token lifetime or type', 'unexpected_response', 200)
         const started = performance.now()
         const result = transaction(db, (tx): { page: CallbackPage; committed: boolean } => {
           const current = requestForState(state)

@@ -833,6 +833,7 @@ describe('the credential for a Google request', () => {
         service: 'gmail',
         handle: handleB,
         agentGroupId: 'g2',
+        services: ['gmail', 'google-calendar'],
       },
     })
   })
@@ -1187,7 +1188,12 @@ describe('Google token refresh', () => {
     expect(material().refreshToken).toBe('rotated-refresh')
     expect(held().accessExpiresAt!.getTime()).toBeGreaterThan(Date.now() + 3_500_000)
     expect(endpoint.events).toEqual([
-      { kind: 'account.refresh', accountId: 'acc-a', outcome: 'fresh' },
+      {
+        kind: 'account.refresh',
+        accountId: 'acc-a',
+        outcome: 'fresh',
+        durationMs: expect.any(Number),
+      },
     ])
     await decide('g1', request)
     expect(endpoint.calls()).toBe(1)
@@ -1210,47 +1216,51 @@ describe('Google token refresh', () => {
     expect(endpoint.calls()).toBe(1)
   })
 
-  test.each(['invalid_grant', 'invalid_client'])(
-    '%s marks needs_reauth and reconnecting the same subject clears it',
-    async (error) => {
-      let reconnect = false
-      const endpoint = setup(() =>
-        reconnect ? Response.json(tokenFull) : Response.json({ error }, { status: 400 }),
-      )
-      expect(await decide('g1', request)).toEqual({
-        kind: 'refuse',
-        refusal: {
-          code: 'account_needs_reauth',
-          service: 'gmail',
-          handle: handleA,
-          agentGroupId: 'g1',
-        },
-      })
-      expect(held().status).toBe('needs_reauth')
-      expect(ledger.list().find(({ handle }) => handle === handleA)?.status).toBe('needs_reauth')
-      await decide('g1', request)
-      expect(endpoint.calls()).toBe(1)
-      reconnect = true
-      const link = ledger.connections.connect(
-        { services: ['gmail'], agentGroupId: 'g1' },
-        { kind: 'host' },
-      )
-      const authorize = ledger.connections.openLink(new URL(link.url).pathname.split('/').at(-1)!)
-      if (authorize.kind !== 'authorize') throw new Error('expected authorization')
-      const page = await ledger.connections.callback(
-        new URL(
-          `http://127.0.0.1:4001/oauth/callback?state=${authorize.url.searchParams.get('state')}&code=new-code`,
-        ),
-      )
-      expect(page.kind).toBe('completed')
-      expect(held().status).toBe('active')
-      expect(sent(await decide('g1', request)).headers.authorization).toBe(
-        `Bearer ${tokenFull.access_token}`,
-      )
-    },
-  )
+  test.each([
+    'invalid_grant',
+    'invalid_client',
+    'unauthorized_client',
+    'access_denied',
+    'invalid_scope',
+  ])('%s marks needs_reauth and reconnecting the same subject clears it', async (error) => {
+    let reconnect = false
+    const endpoint = setup(() =>
+      reconnect ? Response.json(tokenFull) : Response.json({ error }, { status: 400 }),
+    )
+    expect(await decide('g1', request)).toEqual({
+      kind: 'refuse',
+      refusal: {
+        code: 'account_needs_reauth',
+        service: 'gmail',
+        handle: handleA,
+        agentGroupId: 'g1',
+        services: ['gmail', 'google-calendar'],
+      },
+    })
+    expect(held().status).toBe('needs_reauth')
+    expect(ledger.list().find(({ handle }) => handle === handleA)?.status).toBe('needs_reauth')
+    await decide('g1', request)
+    expect(endpoint.calls()).toBe(1)
+    reconnect = true
+    const link = ledger.connections.connect(
+      { services: ['gmail'], agentGroupId: 'g1' },
+      { kind: 'host' },
+    )
+    const authorize = ledger.connections.openLink(new URL(link.url).pathname.split('/').at(-1)!)
+    if (authorize.kind !== 'authorize') throw new Error('expected authorization')
+    const page = await ledger.connections.callback(
+      new URL(
+        `http://127.0.0.1:4001/oauth/callback?state=${authorize.url.searchParams.get('state')}&code=new-code`,
+      ),
+    )
+    expect(page.kind).toBe('completed')
+    expect(held().status).toBe('active')
+    expect(sent(await decide('g1', request)).headers.authorization).toBe(
+      `Bearer ${tokenFull.access_token}`,
+    )
+  })
 
-  test.each(['network', 'timeout', 'server', 'invalid-token'])(
+  test.each(['network', 'timeout', 'server', 'invalid-token', 'unexpected-4xx'])(
     '%s failure leaves the account active and the next call retries',
     async (reason) => {
       let failed = false
@@ -1259,6 +1269,7 @@ describe('Google token refresh', () => {
         failed = true
         if (reason === 'network') throw new TypeError('network down')
         if (reason === 'timeout') throw new DOMException('deadline', 'TimeoutError')
+        if (reason === 'unexpected-4xx') return new Response('not JSON', { status: 400 })
         if (reason === 'invalid-token') return Response.json({ ...refreshFull, expires_in: -1 })
         return Response.json({ error: 'invalid_grant' }, { status: 503 })
       })
@@ -1273,15 +1284,13 @@ describe('Google token refresh', () => {
     },
   )
 
-  test.each(['reconnect', 'set-client', 'revoke', 'remove'])(
+  test.each(['set-client', 'revoke', 'remove'])(
     'a concurrent %s cannot be overwritten or bypassed by an old refresh',
     async (change) => {
       const response = Promise.withResolvers<Response>()
       setup(() => response.promise)
       const pending = decide('g1', request)
-      if (change === 'reconnect')
-        sealMaterial('acc-a', JSON.stringify({ ...initial, accessToken: 'reconnected' }))
-      else if (change === 'set-client')
+      if (change === 'set-client')
         ledger.connections.setClient({
           clientId: 'replacement',
           clientSecret: 'replacement-secret',
@@ -1290,9 +1299,107 @@ describe('Google token refresh', () => {
       else db.transaction((tx) => ledger.remove(tx, handleA))
       response.resolve(Response.json(refreshFull))
       expect((await pending).kind).toBe('refuse')
-      if (change === 'reconnect') expect(material().accessToken).toBe('reconnected')
       if (change === 'set-client') expect(material()).toEqual(initial)
       if (change === 'remove') expect(held()).toBeUndefined()
+    },
+  )
+
+  test.each([400, 401, 403, 429, 499])(
+    'OAuth %i marks needs_reauth without retrying',
+    async (status) => {
+      const endpoint = setup(() => Response.json({ error: 'unauthorized_client' }, { status }))
+      expect((await decide('g1', request)).kind).toBe('refuse')
+      expect(held().status).toBe('needs_reauth')
+      await decide('g1', request)
+      expect(endpoint.calls()).toBe(1)
+    },
+  )
+
+  test('an upstream rejection expires only the injected OAuth material and the next request refreshes', async () => {
+    const endpoint = setup(() => Response.json({ error: 'invalid_grant' }, { status: 400 }))
+    db.update(account)
+      .set({ accessExpiresAt: new Date(Date.now() + 3_600_000) })
+      .where(eq(account.id, 'acc-a'))
+      .run()
+    const decision = await decide('g1', request)
+    if (decision.kind !== 'inject') throw new Error('expected injection')
+    decision.injection.unauthorized()
+    expect(held().accessExpiresAt?.getTime()).toBe(0)
+    expect(await decide('g1', request)).toMatchObject({
+      kind: 'refuse',
+      refusal: { code: 'account_needs_reauth', services: ['gmail', 'google-calendar'] },
+    })
+    expect(endpoint.calls()).toBe(1)
+  })
+
+  test.each(['reconnect', 'refresh'])(
+    'a late upstream rejection cannot expire material replaced by %s',
+    async (change) => {
+      setup(() => Response.json(refreshFull))
+      db.update(account)
+        .set({ accessExpiresAt: new Date(Date.now() + 3_600_000) })
+        .where(eq(account.id, 'acc-a'))
+        .run()
+      const decision = await decide('g1', request)
+      if (decision.kind !== 'inject') throw new Error('expected injection')
+      if (change === 'reconnect')
+        sealMaterial('acc-a', JSON.stringify({ ...initial, accessToken: 'new-access' }))
+      else {
+        decision.injection.unauthorized()
+        await decide('g1', request)
+      }
+      const expiresAt = held().accessExpiresAt
+      decision.injection.unauthorized()
+      expect(held().accessExpiresAt).toEqual(expiresAt)
+      expect((await decide('g1', request)).kind).toBe('inject')
+    },
+  )
+
+  test.each(['inherited', 'replaced', 'failure'])(
+    'a reconnect during refresh uses current material with a %s refresh token',
+    async (mode) => {
+      const response = Promise.withResolvers<Response>()
+      setup((init) =>
+        init?.body instanceof URLSearchParams && init.body.get('grant_type') === 'refresh_token'
+          ? response.promise
+          : Response.json({
+              ...tokenFull,
+              access_token: 'reconnected',
+              refresh_token: mode === 'replaced' ? 'new-refresh' : undefined,
+            }),
+      )
+      const pending = decide('g1', request)
+      const link = ledger.connections.connect(
+        { services: ['gmail', 'google-calendar'], agentGroupId: 'g1' },
+        { kind: 'host' },
+      )
+      const authorize = ledger.connections.openLink(new URL(link.url).pathname.split('/').at(-1)!)
+      if (authorize.kind !== 'authorize') throw new Error('expected authorization')
+      expect(
+        (
+          await ledger.connections.callback(
+            new URL(
+              `http://127.0.0.1:4001/oauth/callback?state=${authorize.url.searchParams.get('state')}&code=new-code`,
+            ),
+          )
+        ).kind,
+      ).toBe('completed')
+      response.resolve(
+        mode === 'failure'
+          ? Response.json({ error: 'invalid_grant' }, { status: 400 })
+          : Response.json({ ...refreshFull, refresh_token: 'rotated-refresh' }),
+      )
+      expect(sent(await pending).headers.authorization).toBe(
+        `Bearer ${mode === 'inherited' ? refreshFull.access_token : 'reconnected'}`,
+      )
+      expect(material().refreshToken).toBe(
+        mode === 'inherited'
+          ? 'rotated-refresh'
+          : mode === 'replaced'
+            ? 'new-refresh'
+            : 'old-refresh',
+      )
+      expect(held().status).toBe('active')
     },
   )
 
