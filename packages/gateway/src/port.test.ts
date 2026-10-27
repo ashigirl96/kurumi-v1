@@ -49,6 +49,65 @@ async function setup() {
   return { upstream, gateway }
 }
 
+test.each([
+  {},
+  { 'Proxy-Authorization': `Basic ${Buffer.from('s:wrong-token').toString('base64')}` },
+  { 'Proxy-Authorization': `Basic ${Buffer.from('s:test-token').toString('base64')}` },
+  { Authorization: 'Bearer test-token' },
+])('plain HTTP gets a gateway refusal before RPC with headers %o', async (headers) => {
+  let rpcCalls = 0
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: (token) => (token === 'test-token' ? {} : null),
+    intercepts: () => false,
+    forward: { inject: ({ path, headers }) => ({ path, headers }) },
+    rpc: async (_req, res) => {
+      rpcCalls++
+      res.writeHead(200).end('RPC')
+    },
+  })
+  stops.push(gateway.stop)
+
+  const result = await new Promise<{
+    status: number | undefined
+    body: string
+    code: string | string[] | undefined
+  }>((resolve, reject) => {
+    const req = request({
+      host: '127.0.0.1',
+      port: gateway.port,
+      path: 'http://example.com/path?query=1',
+      headers,
+    })
+    req.on('error', reject)
+    req.on('response', (res) => {
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (chunk) => {
+        body += chunk
+      })
+      res.on('end', () =>
+        resolve({
+          status: res.statusCode,
+          body,
+          code: res.headers['x-kurumi-gateway'],
+        }),
+      )
+    })
+    req.end()
+  })
+
+  expect(result).toEqual({
+    status: 403,
+    code: 'plain_http_not_allowed',
+    body: JSON.stringify({
+      error: 'plain_http_not_allowed',
+      next: 'use https:// instead of http://; kurumi only tunnels HTTPS through CONNECT',
+    }),
+  })
+  expect(rpcCalls).toBe(0)
+})
+
 test.each([undefined, 'wrong-token'])(
   'CONNECT refuses token %s before upstream traffic',
   async (token) => {
