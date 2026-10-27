@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -782,6 +783,20 @@ test('a FIFO at runner/runner.js is refused as not a regular file instead of blo
     `${join(home, 'runner/runner.js')} is not a regular file`,
   )
 }, 5000)
+
+test('a FIFO at the staged gateway CA bundle is refused as not a regular file instead of blocking start', async () => {
+  const home = homeForTest()
+  await startAndStop(home)
+  const [bundle] = readdirSync(join(home, 'ca')).filter((name) => name.startsWith('combined-'))
+  const path = join(home, 'ca', bundle!)
+  rmSync(path)
+  expect(Bun.spawnSync(['mkfifo', '-m', '644', path]).exitCode).toBe(0)
+
+  const host = spawnHost(home)
+
+  expect(await host.exited).toBe(1)
+  expect(await new Response(host.stderr).text()).toContain(`${path} is not a regular file`)
+}, 10000)
 
 test('a gateway approval decided before a restart grants its allowance and notifies its session at the next start', async () => {
   const home = homeForTest()
