@@ -1,9 +1,12 @@
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
-  existsSync,
+  closeSync,
+  constants,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -100,6 +103,23 @@ export const hostRouter = guardRouter<HostContext>().router({
     }),
   },
 })
+
+function readRunner(path: string): Uint8Array {
+  let fd: number
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK)
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT')
+      return new Uint8Array()
+    throw error
+  }
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error(`${path} is not a regular file`)
+    return readFileSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
 
 export async function startHost(config: HostConfig) {
   process.stdout.write(
@@ -213,7 +233,7 @@ export async function startHost(config: HostConfig) {
       revision: containerRevision({
         image: environment.KURUMI_AGENT_IMAGE,
         contribution: revisionedEgress,
-        runner: existsSync(runner) ? readFileSync(runner) : new Uint8Array(),
+        runner: readRunner(runner),
       }),
       image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
       network: environment.KURUMI_DOCKER_NETWORK,
