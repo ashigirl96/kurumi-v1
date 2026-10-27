@@ -4,7 +4,7 @@ import { agentGroup } from '@kurumi/agent/schema'
 import type { Caller } from '@kurumi/rpc/contract'
 import { transaction, type Db } from '@kurumi/rpc/server'
 import { ORPCError } from '@orpc/server'
-import { eq } from 'drizzle-orm'
+import { and, eq, gt, inArray } from 'drizzle-orm'
 import { z } from 'zod'
 
 import { ConnectInputSchema, GoogleClientSchema } from './contract.ts'
@@ -22,7 +22,7 @@ export type ConnectionRequest = RequestBase &
         state: 'completed'
         oauthState: string | null
         pkceVerifier: Buffer | null
-        accountId: string
+        accountId: string | null
       }
     | {
         state: 'expired' | 'cancelled'
@@ -38,7 +38,7 @@ export function parseConnectionRequest(row: RequestRow): ConnectionRequest {
     return { ...row, state, oauthState, pkceVerifier, accountId }
   if (state === 'authorizing' && oauthState !== null && pkceVerifier !== null && accountId === null)
     return { ...row, state, oauthState, pkceVerifier, accountId }
-  if (state === 'completed' && accountId !== null) return { ...row, state, accountId }
+  if (state === 'completed') return { ...row, state }
   if (state === 'expired' || state === 'cancelled') return { ...row, state }
   throw new Error(`invalid connection request state: ${row.id}`)
 }
@@ -93,6 +93,15 @@ export function createConnections({
             target: oauthClient.vendor,
             set: { material, updatedAt: new Date() },
           })
+          .run()
+        tx.update(connectionRequest)
+          .set({ state: 'cancelled' })
+          .where(
+            and(
+              eq(connectionRequest.vendor, 'google'),
+              inArray(connectionRequest.state, ['open', 'authorizing']),
+            ),
+          )
           .run()
       })
     },
@@ -227,6 +236,12 @@ export function sealedConnectionRows(db: Db): { id: string; material: Buffer }[]
     ...db
       .select()
       .from(connectionRequest)
+      .where(
+        and(
+          inArray(connectionRequest.state, ['open', 'authorizing']),
+          gt(connectionRequest.expiresAt, new Date()),
+        ),
+      )
       .all()
       .flatMap(({ id, pkceVerifier }) =>
         pkceVerifier === null ? [] : [{ id, material: pkceVerifier }],

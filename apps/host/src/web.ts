@@ -5,6 +5,7 @@ export function startWeb(
   account: Pick<AccountLedger, 'connections'>,
 ) {
   if (bind.host !== '127.0.0.1') throw new Error('web listener must bind 127.0.0.1')
+  // Containers reach this port through host.docker.internal, so every route must check a token or OAuth state; loopback only keeps OAuth at the Mac.
   return Bun.serve({
     hostname: bind.host,
     port: bind.port,

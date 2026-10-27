@@ -328,10 +328,13 @@ export function storedAccounts(db: Db): StoredAccounts {
   }
 }
 
-export function storedConnections(db: Db): StoredAccounts {
+export type StoredConnections = StoredAccounts & { ids: string[] }
+
+export function storedConnections(db: Db): StoredConnections {
   const sealed = sealedConnectionRows(db)
   return {
     count: sealed.length,
+    ids: sealed.map(({ id }) => id),
     unopenedBy: (vaultKey) =>
       sealed.filter(({ id, material }) => !opens(vaultKey, id, material)).map(({ id }) => id),
   }

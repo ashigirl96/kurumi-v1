@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite'
 import { afterEach, expect, test } from 'bun:test'
 import { randomBytes, X509Certificate } from 'node:crypto'
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -36,13 +37,16 @@ function homeForTest(prefix = 'kurumi-host-'): string {
   return home
 }
 
-function spawnHost(
+async function spawnHost(
   home: string,
   preload?: string,
   env: Record<string, string> = {},
-): Bun.Subprocess<'ignore', 'pipe', 'pipe'> {
+): Promise<Bun.Subprocess<'ignore', 'pipe', 'pipe'>> {
+  const unused = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response() })
+  const webPort = String(unused.port)
+  await unused.stop(true)
   const child = Bun.spawn([process.execPath, ...(preload ? ['--preload', preload] : []), main], {
-    env: { ...process.env, KURUMI_HOME: home, ...env },
+    env: { ...process.env, KURUMI_HOME: home, KURUMI_WEB_PORT: webPort, ...env },
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -98,9 +102,9 @@ afterEach(async () => {
 
 test('a second host fails at the lock and names the first pid', async () => {
   const home = homeForTest()
-  const first = spawnHost(home)
+  const first = await spawnHost(home)
   await waitForHost(home, first)
-  const second = spawnHost(home)
+  const second = await spawnHost(home)
   const error = await new Response(second.stderr).text()
   expect(await second.exited).toBe(1)
   expect(error).toContain('kurumi.lock')
@@ -115,7 +119,7 @@ test.each(['SIGTERM', 'SIGINT'] as const)(
   '%s stops the host cleanly and removes its socket',
   async (signal) => {
     const home = homeForTest()
-    const host = spawnHost(home)
+    const host = await spawnHost(home)
     await waitForHost(home, host)
     host.kill(signal)
     expect(await host.exited).toBe(0)
@@ -132,7 +136,7 @@ test('a repeated SIGINT during shutdown still lets the host stop cleanly', async
     `#!/bin/sh\nif [ "$1" = create ]; then : > '${created}'; sleep 1; fi\n`,
     { mode: 0o755 },
   )
-  const host = spawnHost(home, undefined, { PATH: `${home}:${process.env.PATH}` })
+  const host = await spawnHost(home, undefined, { PATH: `${home}:${process.env.PATH}` })
   await waitForHost(home, host)
   for (let attempt = 0; !existsSync(created); attempt++) {
     if (attempt === 200 || host.exitCode !== null) throw new Error('fake docker create never ran')
@@ -165,7 +169,7 @@ test('concurrent host starts name the lock owner before its pid write completes'
     `,
     )
     const started = performance.now()
-    const pair = [spawnHost(home, preload), spawnHost(home, preload)]
+    const pair = [await spawnHost(home, preload), await spawnHost(home, preload)]
     const exited = await Promise.race(
       pair.map(async (child) => ({ child, code: await child.exited })),
     )
@@ -209,7 +213,7 @@ test('the socket is mode 0600 from bind while another process polls before start
     if (attempt === 100) throw new Error('socket poller did not start')
     await Bun.sleep(10)
   }
-  const host = spawnHost(home, probeSocketBind(home))
+  const host = await spawnHost(home, probeSocketBind(home))
   await waitForHost(home, host)
   writeFileSync(join(home, 'stop-polling'), '')
   const observed = (await new Response(poller.stdout).text()).trim()
@@ -225,19 +229,34 @@ test('the socket is mode 0600 from bind while another process polls before start
 
 test('a failed socket bind restores the process umask', async () => {
   const home = homeForTest()
-  const host = spawnHost(home, probeSocketBind(home, true))
+  const host = await spawnHost(home, probeSocketBind(home, true))
   expect(await host.exited).toBe(1)
   expect(await new Response(host.stderr).text()).toContain('forced bind failure')
   expect(readFileSync(join(home, 'restored-umask'), 'utf8')).toBe('22')
 })
 
+test('a busy web port refuses startup before exposing the host socket', async () => {
+  const home = homeForTest()
+  const held = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response() })
+  try {
+    const host = await spawnHost(home, probeSocketBind(home), {
+      KURUMI_WEB_PORT: String(held.port),
+    })
+    expect(await host.exited).toBe(1)
+    expect(await new Response(host.stderr).text()).toContain('port')
+    expect(existsSync(join(home, 'bind-mode'))).toBe(false)
+  } finally {
+    await held.stop(true)
+  }
+})
+
 test('a killed host leaves a lock and socket that a new host can recover', async () => {
   const home = homeForTest()
-  const first = spawnHost(home)
+  const first = await spawnHost(home)
   await waitForHost(home, first)
   first.kill('SIGKILL')
   await first.exited
-  const replacement = spawnHost(home)
+  const replacement = await spawnHost(home)
   await waitForHost(home, replacement)
   replacement.kill('SIGTERM')
   expect(await replacement.exited).toBe(0)
@@ -245,7 +264,7 @@ test('a killed host leaves a lock and socket that a new host can recover', async
 }, 5000)
 
 async function startAndStop(home: string): Promise<string> {
-  const host = spawnHost(home)
+  const host = await spawnHost(home)
   await waitForHost(home, host)
   host.kill('SIGTERM')
   expect(await host.exited).toBe(0)
@@ -293,7 +312,7 @@ test('a host started over egress_log rows from 31 days ago prunes them and keeps
 
 test('kurumi gateway status prints the Agent Port address and the fingerprint of the stored CA', async () => {
   const home = homeForTest()
-  const host = spawnHost(home, undefined, { KURUMI_AGENT_PORT: '40059' })
+  const host = await spawnHost(home, undefined, { KURUMI_AGENT_PORT: '40059' })
   await waitForHost(home, host)
   const command = Bun.spawn(
     [process.execPath, join(import.meta.dir, '../../cli/src/main.ts'), 'gateway', 'status'],
@@ -323,8 +342,8 @@ test('with no accounts stored, a host whose vault.key was deleted starts with a 
 }, 5000)
 
 async function homeWithConnection() {
-  const home = homeForTest()
-  const host = spawnHost(home)
+  const home = homeForTest("kurumi host's ")
+  const host = await spawnHost(home)
   await waitForHost(home, host)
   const group = z
     .object({ id: z.string() })
@@ -347,11 +366,15 @@ async function homeWithConnection() {
 test('saved connections with a missing vault key stop startup without generating a replacement', async () => {
   const { home, ca } = await homeWithConnection()
   rmSync(join(home, 'vault.key'))
-  const host = spawnHost(home)
+  const host = await spawnHost(home)
   expect(await host.exited).toBe(1)
   const error = await new Response(host.stderr).text()
-  expect(error).toContain('vault.key is missing with a saved OAuth client or pending connection')
-  expect(error).toContain('reset kurumi.db with its -wal and -shm files')
+  expect(error).toContain('is missing')
+  expect(error).toContain('Restore vault.key from backup')
+  expect(error).toContain('DELETE FROM oauth_client')
+  expect(error).toContain('DELETE FROM connection_request')
+  expect(error).not.toContain('reset kurumi.db')
+  expect(error).not.toContain('Error: Error:')
   expect(existsSync(join(home, 'vault.key'))).toBe(false)
   expect(storedCa(home)).toBe(ca)
 }, 5000)
@@ -360,28 +383,108 @@ test('saved connections with a wrong vault key stop before replacing the gateway
   const { home, ca } = await homeWithConnection()
   const wrongKey = randomBytes(32)
   writeFileSync(join(home, 'vault.key'), wrongKey)
-  const host = spawnHost(home)
+  const host = await spawnHost(home)
   expect(await host.exited).toBe(1)
-  expect(await new Response(host.stderr).text()).toContain(
-    'vault.key cannot open a saved OAuth client or pending connection',
-  )
+  const error = await new Response(host.stderr).text()
+  expect(error).toContain('does not match')
+  expect(error).toContain('Restore vault.key from backup')
+  expect(error).not.toContain('damaged')
+  expect(error).not.toContain('reset kurumi.db')
   expect(storedCa(home)).toBe(ca)
   expect(readFileSync(join(home, 'vault.key')).equals(wrongKey)).toBe(true)
 }, 5000)
 
-test('a damaged pending verifier stops startup even when the client and CA open with the key', async () => {
-  const { home, key, ca } = await homeWithConnection()
-  const sqlite = new Database(join(home, 'kurumi.db'))
-  sqlite.query('UPDATE connection_request SET pkce_verifier = ?').run(Buffer.of(0))
-  sqlite.close()
-  const host = spawnHost(home)
+test('a vault key file error with saved connections is printed without another Error prefix', async () => {
+  const { home } = await homeWithConnection()
+  const path = join(home, 'vault.key')
+  chmodSync(path, 0o644)
+  const host = await spawnHost(home)
   expect(await host.exited).toBe(1)
-  expect(await new Response(host.stderr).text()).toContain(
-    'vault.key cannot open a saved OAuth client or pending connection',
-  )
-  expect(storedCa(home)).toBe(ca)
-  expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(true)
-}, 5000)
+  const error = await new Response(host.stderr).text()
+  expect(error).toStartWith(`${path} has mode 0644`)
+  expect(error).not.toContain('reset kurumi.db')
+})
+
+test.each(['oauth_client', 'connection_request'] as const)(
+  'a damaged %s row prints a targeted recovery that preserves groups and accounts',
+  async (table) => {
+    const { home, key, ca } = await homeWithConnection()
+    storeAccount(home, seal(key, 'acc-a', 'sk-ant-test'))
+    const db = openKurumiDb(join(home, 'kurumi.db'))
+    const group = db.$client.query<{ id: string }, []>('SELECT id FROM agent_group').get()!
+    const connections = createAccountLedger({ db, vaultKey: key }).connections
+    const intact = connections.createRequest(
+      { agentGroupId: group.id, services: ['gmail'] },
+      { kind: 'host' },
+    )
+    connections.openLink(connections.issueLink(intact, { kind: 'host' }))
+    db.$client.close(true)
+    const sqlite = new Database(join(home, 'kurumi.db'))
+    const requests = sqlite.query<{ id: string }, []>('SELECT id FROM connection_request').all()
+    if (table === 'oauth_client') {
+      sqlite.query('UPDATE oauth_client SET material = ?').run(Buffer.of(0))
+    } else {
+      sqlite
+        .query('UPDATE connection_request SET pkce_verifier = ? WHERE id = ?')
+        .run(Buffer.of(0), requests[0]!.id)
+    }
+    sqlite.close()
+
+    const host = await spawnHost(home)
+    expect(await host.exited).toBe(1)
+    const error = await new Response(host.stderr).text()
+    expect(error).toContain('damaged')
+    expect(error).toContain(
+      table === 'oauth_client' ? 'account set-client google' : requests[0]!.id,
+    )
+    expect(error).not.toContain('does not match')
+    expect(error).not.toContain('reset kurumi.db')
+    expect(error).not.toContain('Error: Error:')
+    const command = / run (sqlite3 .+;') and start/.exec(error)?.[1]
+    if (!command) throw new Error('no targeted sqlite3 recovery command')
+    expect(Bun.spawnSync(['sh', '-c', command]).exitCode).toBe(0)
+    const repaired = new Database(join(home, 'kurumi.db'), { readonly: true })
+    expect(repaired.query('SELECT state FROM connection_request WHERE id = ?').get(intact)).toEqual(
+      { state: 'authorizing' },
+    )
+    repaired.close()
+
+    const recovered = await spawnHost(home)
+    await waitForHost(home, recovered)
+    await cli(
+      home,
+      ['account', 'set-client', 'google'],
+      JSON.stringify({ clientId: 'reset-client', clientSecret: 'reset-secret' }),
+    )
+    expect(await cli(home, ['account', 'list'])).toContain('anthropic/main')
+    expect(await cli(home, ['agent', 'list'])).toContain('work')
+    recovered.kill('SIGTERM')
+    expect(await recovered.exited).toBe(0)
+    expect(storedCa(home)).toBe(ca)
+    expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(true)
+  },
+  5000,
+)
+
+test.each(['completed', 'expired', 'cancelled', 'past-deadline'] as const)(
+  'a damaged verifier on a %s request does not block host startup',
+  async (state) => {
+    const { home } = await homeWithConnection()
+    const sqlite = new Database(join(home, 'kurumi.db'))
+    if (state === 'past-deadline') {
+      sqlite
+        .query('UPDATE connection_request SET pkce_verifier = ?, expires_at = ?')
+        .run(Buffer.of(0), Date.now())
+    } else {
+      sqlite
+        .query('UPDATE connection_request SET pkce_verifier = ?, state = ?')
+        .run(Buffer.of(0), state)
+    }
+    sqlite.close()
+    await startAndStop(home)
+  },
+  5000,
+)
 
 test('after the start-over SQL deletes every account, a host without vault.key starts with a new gateway CA', async () => {
   const home = homeForTest()
@@ -389,7 +492,7 @@ test('after the start-over SQL deletes every account, a host without vault.key s
   const before = storedCa(home)
   storeAccount(home, Buffer.of(0))
   rmSync(join(home, 'vault.key'))
-  const refused = spawnHost(home)
+  const refused = await spawnHost(home)
   expect(await refused.exited).toBe(1)
   const startOver = Bun.spawnSync([
     'sqlite3',
@@ -411,7 +514,7 @@ test('a damaged account row under the right vault.key stops the host, names the 
   const key = readFileSync(join(home, 'vault.key'))
   storeAccount(home, Buffer.of(0))
 
-  const refused = spawnHost(home)
+  const refused = await spawnHost(home)
 
   expect(await refused.exited).toBe(1)
   const stderr = await new Response(refused.stderr).text()
@@ -435,7 +538,7 @@ test('with accounts stored, a wrong vault.key stops the host, names the backup, 
   storeAccount(home, Buffer.of(0))
   writeFileSync(join(home, 'vault.key'), randomBytes(32), { mode: 0o600 })
 
-  const second = spawnHost(home)
+  const second = await spawnHost(home)
 
   expect(await second.exited).toBe(1)
   const stderr = await new Response(second.stderr).text()
@@ -457,7 +560,7 @@ test('with accounts stored, a gateway CA the vault.key cannot open stops the hos
   sqlite.close()
   const before = storedCa(home)
 
-  const refused = spawnHost(home)
+  const refused = await spawnHost(home)
 
   expect(await refused.exited).toBe(1)
   const stderr = await new Response(refused.stderr).text()
@@ -484,7 +587,7 @@ test('a stored gateway CA certificate that cannot be parsed stops the host, and 
   sqlite.query('UPDATE gateway_ca SET cert_pem = ?').run('not a certificate')
   sqlite.close()
 
-  const refused = spawnHost(home)
+  const refused = await spawnHost(home)
 
   expect(await refused.exited).toBe(1)
   const stderr = await new Response(refused.stderr).text()
@@ -578,14 +681,14 @@ test('after a second agent group is created, a restarted host adopts the first g
     throw new Error(`no container started running for ${agent}`)
   }
 
-  const first = spawnHost(home, undefined, env)
+  const first = await spawnHost(home, undefined, env)
   await waitForHost(home, first)
   await cli(home, ['agent', 'create', '--name', 'work'])
   const work = await spawnByChat('work')
   await cli(home, ['agent', 'create', '--name', 'play'])
   first.kill('SIGTERM')
   expect(await first.exited).toBe(0)
-  const second = spawnHost(home, undefined, env)
+  const second = await spawnHost(home, undefined, env)
   await waitForHost(home, second)
   const play = await spawnByChat('play')
   second.kill('SIGTERM')
@@ -791,7 +894,7 @@ async function cli(home: string, args: string[], stdin = ''): Promise<string> {
 
 async function homeWithGrantedAccount(prefix?: string): Promise<{ home: string; key: Buffer }> {
   const home = homeForTest(prefix)
-  const first = spawnHost(home)
+  const first = await spawnHost(home)
   await waitForHost(home, first)
   await cli(home, ['agent', 'create', '--name', 'work'])
   await cli(
@@ -809,7 +912,7 @@ test('a host whose kurumi.db holds accounts refuses to start without vault.key a
   const { home } = await homeWithGrantedAccount()
   rmSync(join(home, 'vault.key'))
 
-  const second = spawnHost(home)
+  const second = await spawnHost(home)
 
   expect(await second.exited).toBe(1)
   expect(await new Response(second.stderr).text()).toContain(
@@ -822,7 +925,7 @@ test('a host refuses to start with a vault.key that did not seal its accounts', 
   const { home } = await homeWithGrantedAccount()
   writeFileSync(join(home, 'vault.key'), randomBytes(32))
 
-  const second = spawnHost(home)
+  const second = await spawnHost(home)
 
   expect(await second.exited).toBe(1)
   expect(await new Response(second.stderr).text()).toContain(
@@ -833,7 +936,7 @@ test('a host refuses to start with a vault.key that did not seal its accounts', 
 test('the start-over command a missing vault.key prints, run as printed, lets the host start with a new key', async () => {
   const { home, key } = await homeWithGrantedAccount("kurumi host's ")
   rmSync(join(home, 'vault.key'))
-  const refused = spawnHost(home)
+  const refused = await spawnHost(home)
   expect(await refused.exited).toBe(1)
   const printed = / run (sqlite3 .+;') \(or delete /.exec(
     await new Response(refused.stderr).text(),
@@ -841,7 +944,7 @@ test('the start-over command a missing vault.key prints, run as printed, lets th
   if (!printed) throw new Error('the refusal prints no sqlite3 command')
 
   expect(Bun.spawnSync(['sh', '-c', printed]).exitCode).toBe(0)
-  const host = spawnHost(home)
+  const host = await spawnHost(home)
   await waitForHost(home, host)
   host.kill('SIGTERM')
   expect(await host.exited).toBe(0)
@@ -857,7 +960,7 @@ test('a FIFO at vault.key is refused as not a regular file instead of blocking s
   const home = homeForTest()
   expect(Bun.spawnSync(['mkfifo', '-m', '600', join(home, 'vault.key')]).exitCode).toBe(0)
 
-  const host = spawnHost(home)
+  const host = await spawnHost(home)
 
   expect(await host.exited).toBe(1)
   expect(await new Response(host.stderr).text()).toContain(
@@ -869,7 +972,7 @@ test('a FIFO at kurumi.lock is refused as not a regular file instead of blocking
   const home = homeForTest()
   expect(Bun.spawnSync(['mkfifo', '-m', '600', join(home, 'kurumi.lock')]).exitCode).toBe(0)
 
-  const host = spawnHost(home)
+  const host = await spawnHost(home)
 
   expect(await host.exited).toBe(1)
   expect(await new Response(host.stderr).text()).toContain(
@@ -882,7 +985,7 @@ test('a FIFO at runner/runner.js is refused as not a regular file instead of blo
   mkdirSync(join(home, 'runner'))
   expect(Bun.spawnSync(['mkfifo', '-m', '600', join(home, 'runner/runner.js')]).exitCode).toBe(0)
 
-  const host = spawnHost(home)
+  const host = await spawnHost(home)
 
   expect(await host.exited).toBe(1)
   expect(await new Response(host.stderr).text()).toContain(
@@ -898,7 +1001,7 @@ test('a FIFO at the staged gateway CA bundle is refused as not a regular file in
   rmSync(path)
   expect(Bun.spawnSync(['mkfifo', '-m', '644', path]).exitCode).toBe(0)
 
-  const host = spawnHost(home)
+  const host = await spawnHost(home)
 
   expect(await host.exited).toBe(1)
   expect(await new Response(host.stderr).text()).toContain(`${path} is not a regular file`)
@@ -952,7 +1055,7 @@ test('a gateway approval decided before a restart grants its allowance and notif
 
 test('kurumi gateway rules adds, lists, and removes a rule through the host, and names the fix for a bad one', async () => {
   const home = homeForTest()
-  const host = spawnHost(home)
+  const host = await spawnHost(home)
   await waitForHost(home, host)
   const view = z.object({ id: z.string() }).passthrough()
 

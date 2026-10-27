@@ -148,3 +148,19 @@ test('rows the key cannot open are named as damaged when the key opens the gatew
     `${path} opens the gateway CA but cannot open 2 accounts in ${db}: acc-a, acc-'b. If these rows came from a backup made with another vault.key, put that key back and start the host again. Otherwise the rows are damaged: with the host stopped, run sqlite3 '${db}' 'PRAGMA foreign_keys = ON; DELETE FROM account WHERE id IN ('\\''acc-a'\\'', '\\''acc-'\\'''\\''b'\\'');' and start the host. The command also removes the grants and defaults of these rows: add the keys again, then set those again with kurumi account grant and kurumi account set-default.`,
   )
 })
+
+test.each(['account', 'connection'])(
+  'an intact %s distinguishes a damaged verifier even when the CA cannot open',
+  (proof) => {
+    loadVaultKey(home, noAccounts, noCa)
+    const ids = proof === 'connection' ? ['oauth-client:google', 'cr-damaged'] : ['cr-damaged']
+    expect(() =>
+      loadVaultKey(
+        home,
+        proof === 'account' ? { count: 1, unopenedBy: () => [] } : noAccounts,
+        noCa,
+        { count: ids.length, ids, unopenedBy: () => ['cr-damaged'] },
+      ),
+    ).toThrow('these rows are damaged')
+  },
+)

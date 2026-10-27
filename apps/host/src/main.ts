@@ -197,26 +197,12 @@ export async function startHost(config: HostConfig) {
     })
     egressLog = requestLog
     const connections = storedConnections(db)
-    const connectionRecovery =
-      'Restore vault.key from backup. Without a backup, keep the host stopped and reset kurumi.db with its -wal and -shm files, then configure the client and reconnect.'
-    if (
-      connections.count > 0 &&
-      !lstatSync(join(config.home, 'vault.key'), { throwIfNoEntry: false })
+    const vaultKey = loadVaultKey(
+      config.home,
+      storedAccounts(db),
+      (key) => caSealedWith(db, key),
+      connections,
     )
-      throw new Error(
-        `vault.key is missing with a saved OAuth client or pending connection. ${connectionRecovery}`,
-      )
-    let vaultKey: Buffer
-    try {
-      vaultKey = loadVaultKey(config.home, storedAccounts(db), (key) => caSealedWith(db, key))
-    } catch (error) {
-      if (connections.count === 0) throw error
-      throw new Error(`${String(error)} ${connectionRecovery}`, { cause: error })
-    }
-    if (connections.unopenedBy(vaultKey).length > 0)
-      throw new Error(
-        `vault.key cannot open a saved OAuth client or pending connection. ${connectionRecovery}`,
-      )
     const ca = await loadCertificateAuthority({
       db,
       vaultKey,
@@ -401,6 +387,7 @@ export async function startHost(config: HostConfig) {
         process.stdout.write(`${JSON.stringify({ kind: 'gateway.admission', message })}\n`)
       },
     })
+    web = startWeb(config.web, accountLedger)
     const stale = lstatSync(socket, { throwIfNoEntry: false })
     if (stale && !stale.isSocket()) throw new Error(`${socket} exists and is not a socket`)
     rmSync(socket, { force: true })
@@ -412,7 +399,6 @@ export async function startHost(config: HostConfig) {
       process.umask(umask)
     }
     await started
-    web = startWeb(config.web, accountLedger)
     process.stdout.write(
       `${JSON.stringify({ kind: 'host.runtime', install, agentPort: config.agentPort.port, image: environment.KURUMI_AGENT_IMAGE })}\n`,
     )

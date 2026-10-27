@@ -1,7 +1,7 @@
 import { kc } from '@kurumi/rpc/contract'
 import { z } from 'zod'
 
-import { keyVendorIds, serviceIds } from './catalog.ts'
+import { keyVendorIds, serviceIds, vendorOf } from './catalog.ts'
 
 export const ServiceIdSchema = z.enum(serviceIds)
 export const HandleSchema = z.string().min(1).describe('handle')
@@ -40,8 +40,7 @@ export const ConnectInputSchema = z.object({
     .array(ServiceIdSchema)
     .min(1)
     .refine(
-      (services) =>
-        services.every((service) => service === 'gmail' || service === 'google-calendar'),
+      (services) => services.every((service) => vendorOf(service) === 'google'),
       'only Google services are supported',
     ),
   agentGroupId: z.string().min(1),

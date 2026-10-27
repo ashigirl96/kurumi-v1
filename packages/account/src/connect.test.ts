@@ -3,11 +3,12 @@ import { randomBytes } from 'node:crypto'
 
 import { eq } from 'drizzle-orm'
 
+import { serviceIds, vendorOf } from './catalog.ts'
 import { createConnections, parseConnectionRequest } from './connect.ts'
 import { ConnectInputSchema } from './contract.ts'
-import { connectionRequest, connectLink, oauthClient } from './schema.ts'
+import { account, connectionRequest, connectLink, oauthClient } from './schema.ts'
 import { storedAccounts, storedConnections } from './server.ts'
-import { inMemoryDb, insertAgentGroup } from './testing.ts'
+import { inMemoryDb, insertAccount, insertAgentGroup } from './testing.ts'
 import { open } from './vault.ts'
 
 let db: ReturnType<typeof inMemoryDb>
@@ -39,6 +40,14 @@ function authorize(token: string): URL {
   return result.url
 }
 
+test('connect accepts every Google service in the catalog and refuses other vendors', () => {
+  for (const service of serviceIds) {
+    expect(
+      ConnectInputSchema.safeParse({ agentGroupId: 'work', services: [service] }).success,
+    ).toBe(vendorOf(service) === 'google')
+  }
+})
+
 test('a link works once and stores only its hash and issuing principal', () => {
   const id = create()
   const token = connections.issueLink(id, caller)
@@ -53,14 +62,19 @@ test('a link works once and stores only its hash and issuing principal', () => {
   expect(db.select().from(connectLink).get()!.usedAt).toBeInstanceOf(Date)
 })
 
-test('a link expires exactly at five minutes without being consumed', () => {
-  const token = connections.issueLink(create(), caller)
-  const row = db.select().from(connectLink).get()!
-  setSystemTime(row.expiresAt)
-  expect(connections.openLink(token)).toEqual({ kind: 'unavailable' })
-  expect(db.select().from(connectLink).get()!.usedAt).toBeNull()
-  expect(db.select().from(connectionRequest).get()!.state).toBe('open')
-})
+test.each([299_999, 300_000, 300_001])(
+  'a link opened %d ms after issuance obeys the five-minute limit',
+  (elapsed) => {
+    const issuedAt = Date.UTC(2026, 9, 28)
+    setSystemTime(issuedAt)
+    const token = connections.issueLink(create(), caller)
+    setSystemTime(issuedAt + elapsed)
+    expect(connections.openLink(token).kind).toBe(elapsed < 300_000 ? 'authorize' : 'unavailable')
+    expect(db.select().from(connectLink).get()!.usedAt).toEqual(
+      elapsed < 300_000 ? new Date(issuedAt + elapsed) : null,
+    )
+  },
+)
 
 test('two links share the full authorize URL, persisted state and sealed verifier across restart', () => {
   const id = create()
@@ -159,6 +173,22 @@ test('client and pending verifiers participate in vault key protection before an
   expect(stored.unopenedBy(randomBytes(32))).toHaveLength(2)
 })
 
+test.each(['completed', 'expired', 'cancelled', 'past-deadline'] as const)(
+  'a damaged verifier on a %s request does not need the vault key at startup',
+  (state) => {
+    const id = create()
+    authorize(connections.issueLink(id, caller))
+    db.update(connectionRequest)
+      .set({
+        pkceVerifier: Buffer.of(0),
+        ...(state === 'past-deadline' ? { expiresAt: new Date() } : { state }),
+      })
+      .where(eq(connectionRequest.id, id))
+      .run()
+    expect(storedConnections(db).unopenedBy(vaultKey)).toEqual([])
+  },
+)
+
 test('bad inputs and missing groups or clients leave no request or link', () => {
   expect(() => connections.connect({ ...input, agentGroupId: 'missing' }, caller)).toThrow(
     'not found',
@@ -176,5 +206,70 @@ test('a contradictory stored request fails parsing instead of being authorized',
   expect(() => parseConnectionRequest({ ...row, state: 'authorizing' })).toThrow(
     'invalid connection',
   )
-  expect(() => parseConnectionRequest({ ...row, state: 'completed' })).toThrow('invalid connection')
+})
+
+test('a completed request remains readable after its account is removed', () => {
+  const id = create()
+  const token = connections.issueLink(id, caller)
+  authorize(token)
+  insertAccount(db, {
+    id: 'acc-connected',
+    vendor: 'google',
+    label: 'connected',
+    services: ['gmail'],
+  })
+  db.update(connectionRequest)
+    .set({ state: 'completed', accountId: 'acc-connected' })
+    .where(eq(connectionRequest.id, id))
+    .run()
+  db.delete(account).where(eq(account.id, 'acc-connected')).run()
+  const request = parseConnectionRequest(db.select().from(connectionRequest).get()!)
+  expect(request.state).toBe('completed')
+  expect(request.accountId).toBeNull()
+  expect(connections.openLink(token)).toEqual({ kind: 'unavailable' })
+  expect(() => connections.issueLink(id, caller)).toThrow('again')
+})
+
+test('setting a client cancels open and authorizing requests without changing terminal requests', () => {
+  const pending = create()
+  const pendingLink = connections.issueLink(pending, caller)
+  const started = create()
+  const first = connections.issueLink(started, caller)
+  const second = connections.issueLink(started, caller)
+  authorize(first)
+  const terminal = create()
+  db.update(connectionRequest)
+    .set({ state: 'expired' })
+    .where(eq(connectionRequest.id, terminal))
+    .run()
+
+  connections.setClient({ clientId: 'new-client', clientSecret: 'new-secret' })
+
+  expect(connections.openLink(pendingLink)).toEqual({ kind: 'unavailable' })
+  expect(connections.openLink(second)).toEqual({ kind: 'unavailable' })
+  expect(
+    db
+      .select()
+      .from(connectionRequest)
+      .all()
+      .map(({ state }) => state),
+  ).toEqual(['cancelled', 'cancelled', 'expired'])
+  expect(authorize(connections.issueLink(create(), caller)).searchParams.get('client_id')).toBe(
+    'new-client',
+  )
+})
+
+test('a failed cancellation rolls back the client replacement', () => {
+  const id = create()
+  const first = connections.issueLink(id, caller)
+  const second = connections.issueLink(id, caller)
+  const original = authorize(first)
+  db.$client.run(`CREATE TRIGGER refuse_cancel BEFORE UPDATE ON connection_request
+    WHEN NEW.state = 'cancelled' BEGIN SELECT RAISE(ABORT, 'cannot cancel'); END`)
+
+  expect(() =>
+    connections.setClient({ clientId: 'new-client', clientSecret: 'new-secret' }),
+  ).toThrow('cannot cancel')
+
+  expect(authorize(second).href).toBe(original.href)
 })

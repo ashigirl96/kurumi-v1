@@ -1,8 +1,10 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomBytes } from 'node:crypto'
 
+import { connectionRequest } from '@kurumi/account/schema'
 import { createAccountLedger } from '@kurumi/account/server'
 import { inMemoryDb, insertAgentGroup } from '@kurumi/account/testing'
+import { eq } from 'drizzle-orm'
 
 import { startWeb } from './web.ts'
 
@@ -41,4 +43,28 @@ test('GET connects with a 302 and a second GET gives the used-link page', async 
 
 test.each(['0.0.0.0', '::', 'localhost', '192.0.2.1'])('refuses to bind %s', (host) => {
   expect(() => startWeb({ host, port: 0 }, ledger)).toThrow('must bind 127.0.0.1')
+})
+
+test('a second link is refused after the client is configured again', async () => {
+  insertAgentGroup(db, 'client-change')
+  ledger.connections.setClient({ clientId: 'old-client', clientSecret: 'old-secret' })
+  const id = ledger.connections.createRequest(
+    { agentGroupId: 'client-change', services: ['gmail'] },
+    { kind: 'host' },
+  )
+  const first = ledger.connections.issueLink(id, { kind: 'host' })
+  const second = ledger.connections.issueLink(id, { kind: 'host' })
+  web = startWeb({ host: '127.0.0.1', port: 0 }, ledger)
+  expect((await fetch(new URL(`/connect/${first}`, web.url), { redirect: 'manual' })).status).toBe(
+    302,
+  )
+
+  ledger.connections.setClient({ clientId: 'new-client', clientSecret: 'new-secret' })
+
+  const refused = await fetch(new URL(`/connect/${second}`, web.url), { redirect: 'manual' })
+  expect(refused.status).toBe(410)
+  expect(await refused.text()).toContain('run account connect again')
+  expect(db.select().from(connectionRequest).where(eq(connectionRequest.id, id)).get()!.state).toBe(
+    'cancelled',
+  )
 })
