@@ -13,7 +13,13 @@ import {
   type CertificateAuthority,
   type Leaf,
 } from './ca.ts'
-import { forward, forwardUpgrade, type ConnectTarget, type ForwardDeps } from './forward.ts'
+import {
+  forward,
+  forwardUpgrade,
+  pathWithoutQuery,
+  type ConnectTarget,
+  type ForwardDeps,
+} from './forward.ts'
 import { nextStep, refusalHttp } from './refusal.ts'
 
 type Tunnel<Principal> = {
@@ -223,6 +229,8 @@ export async function startAgentPort<Principal extends object>(deps: {
             client.destroy()
             return
           }
+          const at = Date.now()
+          const started = performance.now()
           const refused = (async () => {
             const principal = await tunnel.authenticate()
             if (principal === null || client.destroyed || tunnel.signal.aborted) {
@@ -237,9 +245,23 @@ export async function startAgentPort<Principal extends object>(deps: {
               headers: new Headers(),
               rawHeaders: [],
             })
-            if ('refusal' in injected && injected.refusal.code === 'method_not_allowed') {
-              client.end(refusalHttp(injected.refusal), () => client.destroy())
-            } else client.destroy()
+            if (!('refusal' in injected) || injected.refusal.code !== 'method_not_allowed') {
+              client.destroy()
+              return
+            }
+            client.end(refusalHttp(injected.refusal), () => client.destroy())
+            deps.forward.log?.({
+              decision: 'refused',
+              refusal: 'method_not_allowed',
+              service: injected.refusal.service,
+              principal,
+              at,
+              host: tunnel.target.host,
+              method,
+              path: pathWithoutQuery(path),
+              status: 405,
+              durationMs: Math.round(performance.now() - started),
+            })
           })().catch(() => client.destroy())
           hold(refused, client)
         })
