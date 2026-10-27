@@ -87,7 +87,7 @@ export function createGatewayLedger(deps: {
   //   env: HTTPS_PROXY/HTTP_PROXY (both cases) = http://s:<token>@<containerHostName>:<port>
   //        NO_PROXY=<containerHostName>, KURUMI_URL=http://<containerHostName>:<port>, KURUMI_TOKEN=<token>
   //        NODE_EXTRA_CA_CERTS / SSL_CERT_FILE / DENO_CERT → mounted CA bundle
-  //        ...accountLedger.containerEnv(agentGroupId)   (selectors only)
+  //        ...accountLedger.containerEnv()   (selectors only)
   //   mounts: $KURUMI_HOME/ca/combined-<sha>.pem → /etc/kurumi/ca.pem (ro), content-addressed
   //   network: egressLockdown ? lockdown : default
   throw new Error('not implemented')

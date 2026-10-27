@@ -72,8 +72,8 @@ export type AccountLedger = {
    */
   credentialFor(principal: AgentPrincipal, target: EgressTarget): Promise<CredentialDecision>
 
-  /** Placeholder env for the services this group holds (e.g. ANTHROPIC_API_KEY=<selector>). No secrets. */
-  containerEnv(agentGroupId: string): Record<string, string>
+  /** service の containerEnv に group selector を入れる。本物の token は container に渡さない。 */
+  containerEnv(): Record<string, string>
 
   /** Web listener: GET /connect/:token. Consumes the one-time link; idempotent per request (authorizing → same URL). */
   startConnection(token: string): OAuthPage

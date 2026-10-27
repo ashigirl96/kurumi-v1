@@ -4,7 +4,7 @@
 //   env (from the gateway's contribution):
 //     KURUMI_URL=http://host.docker.internal:<port>   KURUMI_TOKEN=<session token>
 //     HTTPS_PROXY=http://s:<token>@host.docker.internal:<port>   NO_PROXY=host.docker.internal
-//     NODE_EXTRA_CA_CERTS / SSL_CERT_FILE = /etc/kurumi/ca.pem   ANTHROPIC_API_KEY=<selector of anthropic/<label>>
+//     NODE_EXTRA_CA_CERTS / SSL_CERT_FILE = /etc/kurumi/ca.pem   CLAUDE_CODE_OAUTH_TOKEN=<group selector of anthropic>
 import type { ContractRouterClient } from '@orpc/contract'
 import { createORPCClient } from '@orpc/client'
 import { RPCLink } from '@orpc/client/fetch'

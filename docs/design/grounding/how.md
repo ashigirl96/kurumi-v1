@@ -213,7 +213,7 @@ nanoclaw 側（`src/gateway-providers/onecli.ts` の `ensureSession`、L156〜�
 2. `onecli.getContainerConfig({agent: agentGroupId})` → `GET /v1/container-config?agent=…`。OneCLI（`packages/api/src/routes/container-config.ts`）は identifier で Agent を引き（無ければ 404 `AGENT_NOT_FOUND`）、次を返す:
    - `HTTPS_PROXY` / `HTTP_PROXY`（大小文字両方）= `http://x:<agent.accessToken>@<GATEWAY_BASE_URL>`。`GATEWAY_BASE_URL` の既定は `host.docker.internal:10255`（`packages/api/src/lib/env.ts:28`）。
    - `NODE_EXTRA_CA_CERTS=/tmp/onecli-gateway-ca.pem`、`NODE_USE_ENV_PROXY=1`、`GIT_TERMINAL_PROMPT=0`、`GIT_HTTP_PROXY_AUTHMETHOD=basic`。
-   - Anthropic secret の `metadata.authMode` に応じて `ANTHROPIC_API_KEY=placeholder` か `CLAUDE_CODE_OAUTH_TOKEN=placeholder`。OpenAI は `OPENAI_API_KEY=placeholder` か `CODEX_HOME` + `~/.codex/auth.json` stub。
+   - Anthropic の OAuth token 用に `CLAUDE_CODE_OAUTH_TOKEN=placeholder`。kurumi は container に `CLAUDE_CODE_OAUTH_TOKEN=<group selector>` を渡し、gateway が `Authorization: Bearer <secret>` に差し替える。OpenAI は `OPENAI_API_KEY=placeholder` か `CODEX_HOME` + `~/.codex/auth.json` stub。
    - `caCertificate`、`caCertificateContainerPath`、`credentialStubs`、`warnings`。
 3. `contributionFromConfig`: env をコピーし、CA を `data/onecli/ca-<sha>.pem` に、host の system CA と結合した bundle を `combined-<sha>.pem` に置いて `/tmp/onecli-combined-ca.pem` に mount し、`SSL_CERT_FILE` と `DENO_CERT` を設定する。stub も同様（ChatGPT の `account_id:"onecli-managed"` を `GET /v1/secrets` の metadata から実 ID に書き換える。Codex 用で、この fork は claude provider しか入れていない）。mount はすべて `{class:'allowlisted-extra', mode:'ro', groupScope}`。Host に `ANTHROPIC_BASE_URL` があれば `ANTHROPIC_AUTH_TOKEN=gateway-managed` と一緒に足す。
 4. `networkAccess: {endpoint:'host.docker.internal', target:{kind:'runtime', identity:'onecli'}}`。docker driver の `dockerNetworkArgs` が、egress lockdown なら `--network nanoclaw-egress`、Linux なら `--add-host=host.docker.internal:host-gateway`、macOS なら何も付けない。
@@ -433,7 +433,7 @@ route: `GET /api/agent-groups`、`GET /api/files/:id`、`GET /api/agent-groups/:
 
 **同期 transaction とイベント.** drizzle の bun:sqlite `transaction()` は async callback で await 後に throw しても rollback しない（実測）。だから cross-domain 書き込みは `tx` を取る同期メソッドで、side effect（fs、子 process）は commit 後に `queueMicrotask` で走らせるか呼び出し側が行う。await の後は transaction 内で id から読み直す（`packages/task/src/close.ts` の `closeTask`）。イベントは「変わった」という合図だけで、transaction 内で publish する。subscriber は DB を読み直す。Backend 内の domain 間購読は listener 形式（async iterator は 100 件で落とす）で、`queueMicrotask` で遅らせ、`start()` で全行に invariant を当て直して取りこぼしを補う。
 
-**子 process の作法.** detached（自分の process group）で spawn して group を kill、SIGTERM → 2 秒 → SIGKILL、stderr は必ず読み捨てる（読まない pipe は claude を止める）、env は明示（`inheritableEnv()` が `MONICA_*`、`CLAUDECODE`、`CLAUDE_CODE_*` を落とす）、claude の env は allowlist（`USER`、`HOME`）から作る（ADR-0033、起動した shell 次第で `ANTHROPIC_API_KEY` や `ANTHROPIC_BASE_URL` が混ざり認証が勝手に切り替わるため）。`ChatAgent`（`packages/chat/src/chat-agent.ts`）は質問ごとに新しい `query()`、warm spare 1 つ、同時 4 つまで、`settingSources: []`、`tools: ['WebSearch']`、`disallowedTools: ['mcp__*']`、`persistSession: false`。
+**子 process の作法.** detached（自分の process group）で spawn して group を kill、SIGTERM → 2 秒 → SIGKILL、stderr は必ず読み捨てる（読まない pipe は claude を止める）、env は明示（`inheritableEnv()` が `MONICA_*`、`CLAUDECODE`、`CLAUDE_CODE_*` を落とす）、claude の env は allowlist（`USER`、`HOME`）から作る（ADR-0033、起動した shell 次第で認証用の env や `ANTHROPIC_BASE_URL` が混ざり認証先が変わるため）。`ChatAgent`（`packages/chat/src/chat-agent.ts`）は質問ごとに新しい `query()`、warm spare 1 つ、同時 4 つまで、`settingSources: []`、`tools: ['WebSearch']`、`disallowedTools: ['mcp__*']`、`persistSession: false`。
 
 **ptyd と reconcile.** workbench は detached daemon `monica-ptyd`（Backend より長生き）と Unix socket で話し、接続のたびに DB 行と daemon の `list` を突き合わせる。DB にあって daemon に無い行は `lost`、行の無い daemon session は terminate。行は `starting` で入れて `WHERE status='starting'` で昇格。id は Backend が作る（`ts-<uuidv7>`、DB を消しても再利用されない）。nanoclaw の `adoptRunningSessions` と同じ問題を解いている。
 
@@ -568,7 +568,7 @@ skill で入れられるが**この fork に入っていない**もの（`.claud
 | G2 | CA 生成と host ごとの leaf cert（24 時間、キャッシュ） | `apps/gateway/src/ca.rs` | OC |
 | G3 | container config API（proxy env、placeholder の API key / OAuth token、CA、stub） | `packages/api/src/routes/container-config.ts` | OC |
 | G4 | agent の作成と token 発行（`identifier`、`aoc_` token） | `packages/api/src/routes/agents.ts`、`services/agent-service.ts` | OC |
-| G5 | Secret 注入（Anthropic api key / OAuth、OpenAI api key / OAuth（4 host）と refresh、generic の `injectionConfig`、host/path pattern）、暗号化保存（AES-256-GCM） | `apps/gateway/src/secret_inject.rs`、`crypto.rs`、`packages/api/src/routes/secrets.ts` | OC |
+| G5 | Secret 注入（Anthropic の bearer OAuth token、OpenAI api key / OAuth（4 host）と refresh、generic の `injectionConfig`、host/path pattern）、暗号化保存（AES-256-GCM） | `apps/gateway/src/secret_inject.rs`、`crypto.rs`、`packages/api/src/routes/secrets.ts` | OC |
 | G6 | app provider registry（約 38 provider: host/path rule、Bearer/Basic、追加 header/param、host rewrite、refresh endpoint） | `apps/gateway/src/apps.rs`、`packages/api/src/apps/*` | OC |
 | G7 | OAuth 接続（authorize / callback、HMAC state、label で重複判定、複数アカウント、再接続、BYOC `AppConfig` か env の client）と非 OAuth 接続（API key、service account） | `packages/api/src/routes/apps.ts` | OC |
 | G8 | access token の lazy refresh と暗号化書き戻し | `apps/gateway/src/connect.rs` `resolve_access_token`、`apps.rs` `refresh_access_token` | OC |
