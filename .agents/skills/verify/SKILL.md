@@ -20,13 +20,15 @@ kurumi は host process（`apps/host`）で、`$KURUMI_HOME/kurumi.sock` 越し�
 | `add-key <n>` | owner の subscription token を macOS の keychain（service `kurumi-live-claude`）から読み、`account add-key anthropic --label main --auto-grant` に stdin で渡す。`anthropic/main` を出力する。 |
 | `chat <n> <agent> <line>` | `kurumi chat` で 1 行送り、返事か error の行が届くまで stdin を開けておく（`KURUMI_VERIFY_REPLY_TIMEOUT`、既定 180 秒）。transcript を保存する。exit 0 は行が返ってきたことしか意味しない。`Provider error …` の notice も 1 行に数えるので、Claude が答えたかは transcript を読んで確かめる。 |
 | `probe <n>` | lane にただ 1 つある agent container から、gateway 経由で `POST https://api.anthropic.com/v1/messages`（`max_tokens` 1）を送り、`x-kurumi-account` と `status=` を出力する。model は `KURUMI_VERIFY_PROBE_MODEL`、既定は `claude-haiku-4-5`。 |
-| `down <n>` | lane の host に SIGTERM を送り、install label で container を `docker rm -f` し、home を消す。evidence は残す。 |
+| `consent <n> <url> [flags]` | Google の同意画面を進める。`--account <n>`、`--uncheck <service>`、`--cancel` は [connect.md](features/connect.md) を参照。host は不要。 |
+| `google-client <n>` | keychain の Google client を `account set-client google` に渡す。CLI が未実装ならコマンド名を示して失敗する。 |
+| `down <n>` | lane の browser session を閉じ、host に SIGTERM を送り、install label で container を `docker rm -f` し、home を消す。evidence は残す。 |
 
 まず `smoke` を流す。通れば、この checkout で host・image・runner・key・chat の経路が動いている。そのうえで、変えた feature を個別のコマンドで動かす。
 
 ## Launch
 
-lane `n` は `/tmp/kurumi-verify/lane-<n>/` に置く。`home/` が `KURUMI_HOME` で、`evidence/` は残す。Agent Port は `41000+10n`。image は `kurumi-agent:verify-<HEAD の short SHA>` で、`KURUMI_AGENT_IMAGE` を設定すればそちらを使う。lane は並べて動かせるので、同時に走る検証にはそれぞれ別の番号を割り当てる。`up` の前に設定した host の環境変数（`KURUMI_STALE_AFTER_MS`、`KURUMI_DOCKER_NETWORK` など）は、そのまま host に渡る。
+lane `n` は `/tmp/kurumi-verify/lane-<n>/` に置く。`home/` が `KURUMI_HOME` で、`evidence/` は残す。Agent Port は `41000+10n`、loopback の Web Port は `41001+10n`。image は `kurumi-agent:verify-<HEAD の short SHA>` で、`KURUMI_AGENT_IMAGE` を設定すればそちらを使う。lane は並べて動かせるので、同時に走る検証にはそれぞれ別の番号を割り当てる。`up` の前に設定した host の環境変数（`KURUMI_STALE_AFTER_MS`、`KURUMI_DOCKER_NETWORK` など）は、そのまま host に渡る。
 
 lane の path を短くしているのは、macOS が unix socket の path を 104 byte までに制限するからだ。長い scratch directory の下に home を置くと、`kurumi.sock` の bind に失敗する。
 
@@ -40,7 +42,7 @@ owner の普段の host は `~/.kurumi` を使う。`lane.sh` は必ず `KURUMI_
 
 証拠はすべて `/tmp/kurumi-verify/lane-<n>/evidence/` に置き、`down` のあとも残る。
 
-- `lane.txt`: `up` のたびに 1 行足す。pid、Agent Port、image、install label を持つ。install label は `docker ps --filter label=kurumi.install=<install>` に渡す。
+- `lane.txt`: `up` のたびに 1 行足す。pid、Agent Port、Web Port、image、install label を持つ。install label は `docker ps --filter label=kurumi.install=<install>` に渡す。
 - `host.log`: host の起動ごとに追記する JSON lines。`host.runtime`、`session.inbound.*`、`session.outbound.delivered`、`session.container.*`、`gateway.admission` が出る。
 - `chat-<UTC 時刻>.txt`: `queued (session ses-…)` と返事の行。ここの時刻はすべて UTC で、`gateway log` の行と揃う。
 - `smoke` はほかに `add-key.txt`、`agent.json`、`gateway-log.txt` を書く。個別のコマンドが保存するのは `lane.txt`、`host.log`、chat の transcript だけなので、それ以外は `| tee /tmp/kurumi-verify/lane-<n>/evidence/<slug>.txt` で自分で残す。

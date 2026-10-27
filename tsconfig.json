@@ -26,6 +26,7 @@
     "packages/*/migrations",
     "packages/*/scripts",
     "packages/*/drizzle.config.ts",
-    "scripts"
+    "scripts",
+    ".agents/skills/verify/**/*.ts"
   ]
 }
