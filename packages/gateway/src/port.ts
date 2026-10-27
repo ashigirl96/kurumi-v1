@@ -20,7 +20,7 @@ import {
   type ConnectTarget,
   type ForwardDeps,
 } from './forward.ts'
-import { nextStep, refusalHttp } from './refusal.ts'
+import { nextStep, refusalHttp, refusalResponse } from './refusal.ts'
 
 type Tunnel<Principal> = {
   target: ConnectTarget
@@ -406,6 +406,11 @@ export async function startAgentPort<Principal extends object>(deps: {
   }
 
   async function handleOuter(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (/^http:\/\//i.test(req.url ?? '')) {
+      const { status, headers, body } = refusalResponse({ code: 'plain_http_not_allowed' })
+      res.writeHead(status, headers).end(body)
+      return
+    }
     const nonce = deps.probeNonce?.()
     if (req.method === 'GET' && nonce && req.url === `/probe/${nonce}`) {
       res.writeHead(200, { 'content-type': 'text/plain' }).end(nonce)

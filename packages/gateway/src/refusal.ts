@@ -20,6 +20,7 @@ export type GatewayRefusal =
   | CredentialRefusal
   | { code: 'upstream_not_public'; host: string; reason: string }
   | { code: 'port_not_allowed'; host: string; port: number }
+  | { code: 'plain_http_not_allowed' }
   | HoldRefusal
 
 export const REFUSAL_STATUS = {
@@ -32,6 +33,7 @@ export const REFUSAL_STATUS = {
   method_not_allowed: 405,
   upstream_not_public: 403,
   port_not_allowed: 403,
+  plain_http_not_allowed: 403,
   approval_pending: 403,
   approval_denied: 403,
   body_too_large: 413,
@@ -63,6 +65,8 @@ export function nextStep(refusal: GatewayRefusal): string {
       return `send the request as one of ${refusal.allowed.join(', ')}; kurumi adds no credential to ${refusal.method}`
     case 'port_not_allowed':
       return `connect to ${refusal.host} on port 443; kurumi serves it on no other port`
+    case 'plain_http_not_allowed':
+      return 'use https:// instead of http://; kurumi only tunnels HTTPS through CONNECT'
     case 'upstream_not_public':
       return `ask the owner to check the DNS answer for ${refusal.host} on the kurumi host; it resolves to a ${refusal.reason} address, and kurumi forwards only to public addresses`
     case 'approval_pending':

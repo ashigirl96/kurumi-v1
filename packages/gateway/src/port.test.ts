@@ -54,7 +54,7 @@ test.each([
   { 'Proxy-Authorization': `Basic ${Buffer.from('s:wrong-token').toString('base64')}` },
   { 'Proxy-Authorization': `Basic ${Buffer.from('s:test-token').toString('base64')}` },
   { Authorization: 'Bearer test-token' },
-])('plain HTTP gets a gateway refusal before RPC with headers %o', async (headers) => {
+])('plain HTTP gets a gateway refusal before RPC with headers %o', async (proxyHeaders) => {
   let rpcCalls = 0
   const gateway = await startAgentPort({
     bind: { host: '127.0.0.1', port: 0 },
@@ -77,7 +77,7 @@ test.each([
       host: '127.0.0.1',
       port: gateway.port,
       path: 'http://example.com/path?query=1',
-      headers,
+      headers: proxyHeaders,
     })
     req.on('error', reject)
     req.on('response', (res) => {
