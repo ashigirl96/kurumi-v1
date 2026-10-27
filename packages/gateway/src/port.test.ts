@@ -147,6 +147,94 @@ test('an unintercepted public address keeps the upstream certificate and receive
   expect(upstream.requests[0]?.headers['x-injected']).toBeUndefined()
 })
 
+test('a passthrough tunnel stops forwarding after its token is revoked', async () => {
+  const upstream = await startFakeUpstream({ host: '127.0.0.1' })
+  stops.push(upstream.stop)
+  let active = true
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: (token) => (active && token === 'test-token' ? {} : null),
+    intercepts: () => false,
+    addressRefusal: () => () => null,
+    forward: { inject: ({ path, headers }) => ({ path, headers }) },
+  })
+  stops.push(gateway.stop)
+  const tunnel = await openTestTunnel({
+    proxyPort: gateway.port,
+    token: 'test-token',
+    caPem: upstream.caPem,
+    target: { host: '127.0.0.1', port: upstream.port },
+  })
+  stops.push(tunnel.close)
+  expect((await sendTestRequest(tunnel, { path: '/before' })).status).toBe(200)
+
+  active = false
+  await Bun.sleep(1_500)
+  if (!tunnel.socket.destroyed) {
+    await sendTestRequest(tunnel, { path: '/after' })
+  }
+
+  expect(upstream.requests.map((entry) => entry.path)).toEqual(['/before'])
+  expect(tunnel.socket.destroyed).toBe(true)
+})
+
+test.each([false, true])(
+  'an idle tunnel closes on revocation with interception %s',
+  async (intercepted) => {
+    const upstream = await startFakeUpstream({ host: '127.0.0.1' })
+    stops.push(upstream.stop)
+    let active = true
+    const gateway = await startAgentPort({
+      bind: { host: '127.0.0.1', port: 0 },
+      authenticate: async () => (active ? {} : null),
+      intercepts: () => intercepted,
+      addressRefusal: () => () => null,
+      forward: { inject: ({ path, headers }) => ({ path, headers }) },
+    })
+    stops.push(gateway.stop)
+    const tunnel = await openTestTunnel({
+      proxyPort: gateway.port,
+      token: 'test-token',
+      caPem: intercepted ? gateway.caPem : upstream.caPem,
+      target: intercepted
+        ? { host: 'fake.test', port: 443 }
+        : { host: '127.0.0.1', port: upstream.port },
+    })
+    stops.push(tunnel.close)
+
+    active = false
+    await Bun.sleep(1_500)
+
+    expect(tunnel.socket.destroyed).toBe(true)
+    expect(upstream.requests).toHaveLength(0)
+  },
+)
+
+test.each(['peer', 'stop'])('closing a tunnel via %s stops re-authenticating it', async (mode) => {
+  let checks = 0
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: () => {
+      checks++
+      return {}
+    },
+    intercepts: () => true,
+    forward: { inject: ({ path, headers }) => ({ path, headers }) },
+  })
+  stops.push(gateway.stop)
+  const tunnel = await openTestTunnel({
+    proxyPort: gateway.port,
+    token: 'test-token',
+    caPem: gateway.caPem,
+  })
+  stops.push(tunnel.close)
+  expect(checks).toBe(1)
+  if (mode === 'peer') tunnel.close()
+  else await gateway.stop()
+  await Bun.sleep(1_500)
+  expect(checks).toBe(1)
+})
+
 async function rawConnect(proxyPort: number, authority: string): Promise<string> {
   const client = connect({ host: '127.0.0.1', port: proxyPort })
   stops.push(() => {
