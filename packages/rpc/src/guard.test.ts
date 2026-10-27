@@ -348,6 +348,7 @@ test('the final lint configuration rejects voided Promises and the three sync-tr
       [join(repo, 'node_modules/.bin/oxlint'), '-f', 'json', 'probe.ts', ...Object.keys(rejected)],
       {
         cwd: dir,
+        env: { ...process.env, PATH: '' },
         stdout: 'pipe',
         stderr: 'pipe',
       },
@@ -424,7 +425,7 @@ test('TypeScript rejects Promise returns through inline, imported, block, functi
         join(dir, 'valid.ts'),
         ...Object.keys(rejected).map((file) => join(dir, file)),
       ],
-      { cwd: dir, stdout: 'pipe', stderr: 'pipe' },
+      { cwd: dir, env: { ...process.env, PATH: '' }, stdout: 'pipe', stderr: 'pipe' },
     )
     const output = await new Response(result.stdout).text()
     const errors = await new Response(result.stderr).text()

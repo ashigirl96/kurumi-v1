@@ -34,7 +34,7 @@ export async function lintProbes(
   const roots = [...new Set(Object.keys(files).map((path) => path.split('/')[0]!))]
   const oxlint = Bun.spawn([join(repo, 'node_modules/.bin/oxlint'), '-f', 'json', ...roots], {
     cwd: dir,
-    env: process.env,
+    env: { ...process.env, PATH: '' },
     stdout: 'pipe',
   })
   const report = (await new Response(oxlint.stdout).json()) as { diagnostics: Diagnostic[] }
