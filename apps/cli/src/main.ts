@@ -313,7 +313,7 @@ class StdinRouteError extends Error {}
 
 function stdinFieldOf(command: string, schema: unknown): StdinField | null {
   if (!(schema instanceof z.core.$ZodType)) return null
-  const markers = stdinMarkers(schema)
+  const { markers, cyclic } = stdinMarkers(schema)
   const [marker, ...others] = markers
   if (!marker) return null
   const refuse = (why: string) => new StdinRouteError(`kurumi ${command} cannot read stdin: ${why}`)
@@ -341,6 +341,7 @@ function stdinFieldOf(command: string, schema: unknown): StdinField | null {
     metadata: z.registry(),
   })
   if (typeof maxLength !== 'number') throw refuse(`${where} needs a maximum length`)
+  if (cyclic) throw refuse(`${where} is marked stdin, but a recursive schema reaches it again`)
   const rest = Object.entries(options._zod.def.shape).filter(([name]) => name !== property.name)
   const [first, ...more] = [...items.slice(0, -1), z.object(Object.fromEntries(rest))]
   return {
@@ -371,16 +372,21 @@ const pathOf = (at: readonly Step[]): string =>
 
 const SAME_VALUE_DEF_KEYS = new Set(['innerType', 'in', 'out', 'options', 'left', 'right'])
 
-function stdinMarkers(root: z.core.$ZodType): Marker[] {
-  const memo = new Map<z.core.$ZodType, Marker[]>()
+function stdinMarkers(root: z.core.$ZodType): { markers: Marker[]; cyclic: boolean } {
+  const memo = new Map<z.core.$ZodType, { markers: Marker[]; low: number }>()
   const open = new Map<z.core.$ZodType, number>()
-  // `low` is the shallowest node still on the walk that this node's subtree reached back to.
+  const unfinished: z.core.$ZodType[] = []
+  let entered = 0
+  let cyclic = false
+  // `low` is the first-entered node of an unfinished cycle that this node's subtree reached.
   const walk = (schema: z.core.$ZodType): { markers: Marker[]; low: number } => {
     const cached = memo.get(schema)
-    if (cached) return { markers: cached, low: Infinity }
-    const depth = open.get(schema)
-    if (depth !== undefined) return { markers: [], low: depth }
-    open.set(schema, open.size)
+    if (cached) return cached
+    const order = open.get(schema)
+    if (order !== undefined) return { markers: [], low: order }
+    const self = entered++
+    open.set(schema, self)
+    const start = unfinished.length
     const children = childSchemas(schema).map(([step, child]) => ({ step, ...walk(child) }))
     open.delete(schema)
     const here: Marker[] = z.globalRegistry.get(schema)?.stdin === true ? [{ at: [], schema }] : []
@@ -395,11 +401,19 @@ function stdinMarkers(root: z.core.$ZodType): Marker[] {
       ]),
     ]
     const low = Math.min(...children.map((child) => child.low))
-    // A node that reached back above itself saw only part of its cycle, so its markers depend on the path.
-    if (low >= open.size) memo.set(schema, markers)
-    return { markers, low }
+    if (low < self) {
+      // A node that reached back above itself saw only part of its cycle, so its markers hold until that cycle finishes.
+      unfinished.push(schema)
+      memo.set(schema, { markers, low })
+      return { markers, low }
+    }
+    for (const member of unfinished.splice(start)) memo.delete(member)
+    if (low === self && markers.length > 0) cyclic = true
+    const finished = { markers, low: Infinity }
+    memo.set(schema, finished)
+    return finished
   }
-  return walk(root).markers
+  return { markers: walk(root).markers, cyclic }
 }
 
 function childSchemas(schema: z.core.$ZodType): [Step | null, z.core.$ZodType][] {

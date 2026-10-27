@@ -365,6 +365,11 @@ describe('a contract field marked stdin', () => {
       'input[1].s and input<rest>.back.s are each marked stdin, but only one field can be',
     ],
     [
+      'a cycle through the options object',
+      put(cyclic.options),
+      'input[1].s is marked stdin, but a recursive schema reaches it again',
+    ],
+    [
       'an object input',
       kc.meta({ cli: true }).input(z.object({ secret: marked })),
       'input.secret is marked stdin, but only a field of the trailing options object can be',
