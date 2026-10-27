@@ -200,6 +200,13 @@ export function createApprovalLedger({
   const rowOf = (id: string): Row | undefined =>
     db.select().from(pendingApproval).where(eq(pendingApproval.id, id)).get()
 
+  // The outcome is already decided when settle logs it, so a broken logger must not undo the call.
+  const report = (event: ApprovalLog): void => {
+    try {
+      log(event)
+    } catch {}
+  }
+
   const show = (id: string): ApprovalView => {
     const row = rowOf(id)
     if (row === undefined)
@@ -217,7 +224,7 @@ export function createApprovalLedger({
       errorText,
     )
     if (handlerError !== null) {
-      log({ kind: 'approval.handler.failed', approvalId: id, error: handlerError })
+      report({ kind: 'approval.handler.failed', approvalId: id, error: handlerError })
     }
     try {
       db.update(pendingApproval)
@@ -227,7 +234,7 @@ export function createApprovalLedger({
       return { recorded: true }
     } catch (error) {
       const reason = errorText(error)
-      log({ kind: 'approval.outcome.unrecorded', approvalId: id, error: reason })
+      report({ kind: 'approval.outcome.unrecorded', approvalId: id, error: reason })
       return { recorded: false, reason }
     }
   }
