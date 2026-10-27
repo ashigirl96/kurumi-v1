@@ -14,7 +14,8 @@ import { join } from 'node:path'
 
 import { loadVaultKey } from './vault-key.ts'
 
-const noAccounts = { count: 0, sealedWith: () => true }
+const noAccounts = { count: 0, unopenedBy: () => [] }
+const noCa = () => false
 
 let home: string
 let path: string
@@ -29,7 +30,7 @@ afterEach(() => {
 })
 
 test('the first start creates a 32-byte key readable only by its owner', () => {
-  const key = loadVaultKey(home, noAccounts)
+  const key = loadVaultKey(home, noAccounts, noCa)
 
   expect(key.byteLength).toBe(32)
   expect(statSync(path).mode & 0o777).toBe(0o600)
@@ -40,7 +41,7 @@ test('the first start creates a 32-byte key readable only by its owner', () => {
 test('the key is created at 0600 even under a permissive umask', () => {
   const umask = process.umask(0o000)
   try {
-    loadVaultKey(home, noAccounts)
+    loadVaultKey(home, noAccounts, noCa)
   } finally {
     process.umask(umask)
   }
@@ -49,10 +50,10 @@ test('the key is created at 0600 even under a permissive umask', () => {
 })
 
 test('a restart reuses the same key and leaves the file unchanged', () => {
-  const first = loadVaultKey(home, noAccounts)
+  const first = loadVaultKey(home, noAccounts, noCa)
   const before = statSync(path)
 
-  const second = loadVaultKey(home, noAccounts)
+  const second = loadVaultKey(home, noAccounts, noCa)
 
   expect(second.equals(first)).toBe(true)
   expect(readFileSync(path).equals(first)).toBe(true)
@@ -61,10 +62,10 @@ test('a restart reuses the same key and leaves the file unchanged', () => {
 })
 
 test('a key other users can read is refused with the file, its mode and the fix', () => {
-  loadVaultKey(home, noAccounts)
+  loadVaultKey(home, noAccounts, noCa)
   chmodSync(path, 0o644)
 
-  expect(() => loadVaultKey(home, noAccounts)).toThrow(
+  expect(() => loadVaultKey(home, noAccounts, noCa)).toThrow(
     `${path} has mode 0644, so other users can read it. Run: chmod 600 ${path}`,
   )
 })
@@ -72,7 +73,7 @@ test('a key other users can read is refused with the file, its mode and the fix'
 test('a key of the wrong length is refused', () => {
   writeFileSync(path, Buffer.alloc(31), { mode: 0o600 })
 
-  expect(() => loadVaultKey(home, noAccounts)).toThrow(`${path} is 31 bytes, not 32`)
+  expect(() => loadVaultKey(home, noAccounts, noCa)).toThrow(`${path} is 31 bytes, not 32`)
 })
 
 test('a symbolic link in place of the key is refused', () => {
@@ -80,13 +81,15 @@ test('a symbolic link in place of the key is refused', () => {
   writeFileSync(target, Buffer.alloc(32), { mode: 0o600 })
   symlinkSync(target, path)
 
-  expect(() => loadVaultKey(home, noAccounts)).toThrow(`${path} is a symbolic link`)
+  expect(() => loadVaultKey(home, noAccounts, noCa)).toThrow(`${path} is a symbolic link`)
 })
 
 test('a missing key while accounts are stored is refused with both recoveries and no new key is written', () => {
   const db = join(home, 'kurumi.db')
 
-  expect(() => loadVaultKey(home, { count: 2, sealedWith: () => false })).toThrow(
+  expect(() =>
+    loadVaultKey(home, { count: 2, unopenedBy: () => ['acc-a', 'acc-b'] }, noCa),
+  ).toThrow(
     `${path} is missing, but ${db} holds 2 accounts sealed with it, and a new key could not open them, so none is created. Restore vault.key from your backup and start the host again. With no backup the stored keys are lost: to start over, keep the host stopped, run sqlite3 '${db}' 'PRAGMA foreign_keys = ON; DELETE FROM account;' (or delete kurumi.db with its -wal and -shm files to reset all host state), start the host, and add the keys again.`,
   )
   expect(readdirSync(home)).toEqual([])
@@ -94,17 +97,21 @@ test('a missing key while accounts are stored is refused with both recoveries an
 
 test('a key that did not seal the stored accounts is refused with both recoveries', () => {
   const db = join(home, 'kurumi.db')
-  const key = loadVaultKey(home, noAccounts)
+  const key = loadVaultKey(home, noAccounts, noCa)
   const tried: Buffer[] = []
 
   expect(() =>
-    loadVaultKey(home, {
-      count: 1,
-      sealedWith: (candidate) => {
-        tried.push(Buffer.from(candidate))
-        return false
+    loadVaultKey(
+      home,
+      {
+        count: 1,
+        unopenedBy: (candidate) => {
+          tried.push(Buffer.from(candidate))
+          return ['acc-a']
+        },
       },
-    }),
+      noCa,
+    ),
   ).toThrow(
     `${path} does not match the key that sealed the 1 account in ${db}, so it cannot open it. Put back the vault.key that sealed it from your backup and start the host again. With no backup the stored keys are lost: to start over, keep the host stopped, run sqlite3 '${db}' 'PRAGMA foreign_keys = ON; DELETE FROM account;' (or delete kurumi.db with its -wal and -shm files to reset all host state), start the host, and add the keys again.`,
   )
@@ -112,9 +119,32 @@ test('a key that did not seal the stored accounts is refused with both recoverie
 })
 
 test('the key that sealed the stored accounts is loaded', () => {
-  const key = loadVaultKey(home, noAccounts)
+  const key = loadVaultKey(home, noAccounts, noCa)
 
   expect(
-    loadVaultKey(home, { count: 1, sealedWith: (candidate) => key.equals(candidate) }),
+    loadVaultKey(
+      home,
+      { count: 1, unopenedBy: (candidate) => (key.equals(candidate) ? [] : ['acc-a']) },
+      noCa,
+    ),
   ).toEqual(key)
+})
+
+test('a damaged row beside rows the key opens does not stop the key from loading', () => {
+  const key = loadVaultKey(home, noAccounts, noCa)
+
+  expect(loadVaultKey(home, { count: 2, unopenedBy: () => ['acc-damaged'] }, () => true)).toEqual(
+    key,
+  )
+})
+
+test('rows the key cannot open are named as damaged when the key opens the gateway CA', () => {
+  const db = join(home, 'kurumi.db')
+  loadVaultKey(home, noAccounts, noCa)
+
+  expect(() =>
+    loadVaultKey(home, { count: 2, unopenedBy: () => ['acc-a', "acc-'b"] }, () => true),
+  ).toThrow(
+    `${path} opens the gateway CA, so it is the right key, but it cannot open 2 accounts in ${db}, so the rows are damaged: acc-a, acc-'b. With the host stopped, run sqlite3 '${db}' 'PRAGMA foreign_keys = ON; DELETE FROM account WHERE id IN ('\\''acc-a'\\'', '\\''acc-'\\'''\\''b'\\'');' and start the host, and add the key again.`,
+  )
 })

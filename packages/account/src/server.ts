@@ -317,14 +317,14 @@ function grant(tx: Tx, { agentGroupId, accountId, service, grantedBy }: GrantInp
   return { ok: true }
 }
 
-export type StoredAccounts = { count: number; sealedWith: (vaultKey: Uint8Array) => boolean }
+export type StoredAccounts = { count: number; unopenedBy: (vaultKey: Uint8Array) => string[] }
 
 export function storedAccounts(db: Db): StoredAccounts {
   const sealed = db.select({ id: account.id, material: account.material }).from(account).all()
   return {
     count: sealed.length,
-    sealedWith: (vaultKey) =>
-      sealed.length === 0 || sealed.some(({ id, material }) => opens(vaultKey, id, material)),
+    unopenedBy: (vaultKey) =>
+      sealed.filter(({ id, material }) => !opens(vaultKey, id, material)).map(({ id }) => id),
   }
 }
 

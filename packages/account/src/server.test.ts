@@ -411,11 +411,11 @@ describe('stored accounts', () => {
     }
 
     expect(storedAccounts(stored).count).toBe(2)
-    expect(storedAccounts(stored).sealedWith(vaultKey)).toBe(true)
-    expect(storedAccounts(stored).sealedWith(randomBytes(32))).toBe(false)
+    expect(storedAccounts(stored).unopenedBy(vaultKey)).toEqual([])
+    expect(storedAccounts(stored).unopenedBy(randomBytes(32))).toHaveLength(2)
   })
 
-  test('a damaged row does not make the key that sealed the others a mismatch', () => {
+  test('a damaged row is the only one the key that sealed the others cannot open', () => {
     const stored = inMemoryDb()
     insertAccount(stored, {
       id: 'acc-damaged',
@@ -429,13 +429,13 @@ describe('stored accounts', () => {
     )
 
     expect(storedAccounts(stored).count).toBe(2)
-    expect(storedAccounts(stored).sealedWith(vaultKey)).toBe(true)
-    expect(storedAccounts(stored).sealedWith(randomBytes(32))).toBe(false)
+    expect(storedAccounts(stored).unopenedBy(vaultKey)).toEqual(['acc-damaged'])
+    expect(storedAccounts(stored).unopenedBy(randomBytes(32))).toHaveLength(2)
   })
 
   test('none means any key will do', () => {
     expect(storedAccounts(inMemoryDb()).count).toBe(0)
-    expect(storedAccounts(inMemoryDb()).sealedWith(randomBytes(32))).toBe(true)
+    expect(storedAccounts(inMemoryDb()).unopenedBy(randomBytes(32))).toEqual([])
   })
 })
 
