@@ -27,7 +27,8 @@ import {
 } from '../server.ts'
 import { createFakeDriver } from '../testing.ts'
 import type { Cli, CliResult } from './cli.ts'
-import { createDockerDriver, type ContainerSpec, type InventoryChange } from './docker.ts'
+import { createDockerDriver, type ContainerSpec } from './docker.ts'
+import type { InventoryChange } from './events.ts'
 import { FakeCli, type FakeProcess } from './fake-cli.ts'
 import type { ListedContainer } from './listing.ts'
 

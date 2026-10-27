@@ -10,6 +10,7 @@ import {
   type CliProcess,
   type CliResult,
 } from './cli.ts'
+import { createEvents, type InventoryChange } from './events.ts'
 import { endForeignWaits, listingFormat, parseListing, type ListedContainer } from './listing.ts'
 
 export type ContainerSpec = {
@@ -27,10 +28,6 @@ export type ContainerDriver = {
   onExit(listener: (containerId: string, code: number) => void): () => void
 }
 
-export type InventoryChange =
-  | { kind: 'subscribed'; attempt: number }
-  | { kind: 'lost'; code: number | null; retryMs: number }
-  | { kind: 'event' }
 export type ContainerInventory = {
   sweep(): Promise<ListedContainer[]>
   adopt(container: ListedContainer): RunResult
@@ -259,7 +256,6 @@ export function createDockerDriver(options: {
   const residue = new Map<string, AgentContainer>()
   const work = new Set<Promise<unknown>>()
   const listeners = new Set<(containerId: string, code: number) => void>()
-  let watcher: ((change: InventoryChange) => void) | undefined
   const shutdown = new AbortController()
   const commands = new Set<CliProcess>()
   const detached = new Set<AgentContainer>()
@@ -598,90 +594,13 @@ export function createDockerDriver(options: {
     return removeAgent(listed)
   }
 
-  const eventWindowMs = 60_000
-  let subscription: CliProcess | undefined
-  let resubscribe: ReturnType<typeof setTimeout> | undefined
-  let losses = 0
-  let announced = false
-  let since: number | undefined
-
-  function subscribe(): void {
-    resubscribe = undefined
-    if (shutdown.signal.aborted || !watcher) return
-    const startedAt = Date.now()
-    const began = performance.now()
-    let proc: CliProcess
-    try {
-      proc = cli.start(
-        [
-          'events',
-          ...[
-            `label=kurumi.install=${options.install}`,
-            'type=container',
-            'event=create',
-            'event=die',
-            'event=destroy',
-          ].flatMap((filter) => ['--filter', filter]),
-          ...(since === undefined ? [] : ['--since', (since / 1000).toFixed(3)]),
-          '--until',
-          ((startedAt + eventWindowMs) / 1000).toFixed(3),
-          '--format',
-          '{{.Action}}',
-        ],
-        {
-          onLine(line) {
-            if (line.trim()) watcher?.({ kind: 'event' })
-          },
-        },
-      )
-    } catch {
-      lost(null, began)
-      return
-    }
-    subscription = proc
-    const attempt = losses
-    const confirmation = setTimeout(() => {
-      if (subscription !== proc || (announced && attempt === 0)) return
-      announced = true
-      watcher?.({ kind: 'subscribed', attempt })
-    }, 1_000)
-    confirmation.unref()
-    void proc.result
-      .then(
-        (exit) => exit.code,
-        () => null,
-      )
-      .then((code) => {
-        clearTimeout(confirmation)
-        if (subscription !== proc) return
-        subscription = undefined
-        if (shutdown.signal.aborted || !watcher) return
-        const ran = performance.now() - began >= 1_000
-        if (ran) since = startedAt - 1_000
-        if (code === 0 && ran) {
-          losses = 0
-          subscribe()
-        } else lost(code, began)
-      })
-      .catch(() => {})
-  }
-
-  function lost(code: number | null, began: number): void {
-    losses = performance.now() - began >= 10_000 ? 1 : losses + 1
-    const retryMs = Math.min(30_000, 1_000 * 2 ** Math.min(losses - 1, 5))
-    watcher?.({ kind: 'lost', code, retryMs })
-    resubscribe = setTimeout(subscribe, retryMs)
-    resubscribe.unref()
-  }
-
-  function endWatch(): void {
-    clearTimeout(resubscribe)
-    resubscribe = undefined
-    if (subscription) void track(subscription.result).catch(() => {})
-    subscription?.kill()
-    announced = false
-    losses = 0
-  }
+  const { watch, endWatch } = createEvents({
+    cli,
+    install: options.install,
+    signal: shutdown.signal,
+    track,
+    error,
+  })
 
   function close({ keepRunning }: { keepRunning: boolean }): Promise<void> {
     if (stopping) return stopping
@@ -852,15 +771,7 @@ export function createDockerDriver(options: {
       return track(removeListed(container, ''))
     },
     nameOf: agentName,
-    watch(listener) {
-      if (watcher) throw error('the inventory already has a watcher')
-      watcher = listener
-      subscribe()
-      return () => {
-        watcher = undefined
-        endWatch()
-      }
-    },
+    watch,
     onExit(listener) {
       listeners.add(listener)
       return () => {
