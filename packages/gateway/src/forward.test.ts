@@ -1017,6 +1017,32 @@ test('a refused request is logged with its code and service, never the selector 
   expect(JSON.stringify(events)).not.toContain(secrets.main)
 })
 
+test.each(['TRACE', 'TRACK'])('a %s refused with 405 is logged as refused', async (method) => {
+  const { tunnel, addKey, events } = await setupLogged()
+  addKey('main', secrets.main)
+  const response = await sendTestRequest(tunnel, {
+    method,
+    path: '/v1/models?key=kurumi:anthropic/main',
+    headers: { 'x-api-key': groupSelector },
+  })
+  expect(response.status).toBe(405)
+  await until(() => events.length === 1)
+  expect(events).toEqual([
+    {
+      decision: 'refused',
+      refusal: 'method_not_allowed',
+      service: 'anthropic-api',
+      principal: { agentGroupId: 'g1' },
+      at: expect.any(Number),
+      host: 'api.anthropic.com',
+      method,
+      path: '/v1/models',
+      status: 405,
+      durationMs: expect.any(Number),
+    },
+  ])
+})
+
 test('a request to an intercepted host whose path names no service is logged as passed', async () => {
   const { tunnel, events } = await setupLogged({
     target: { host: 'www.googleapis.com', port: 443 },
