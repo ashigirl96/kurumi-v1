@@ -97,7 +97,6 @@ export function loadVaultKey(
   if (existing) {
     const unopened = accounts.unopenedBy(existing)
     if (accounts.count > 0 && unopened.length === accounts.count) {
-      // A key that opens the gateway CA is the host's key, but the rows may come from a backup made under another key.
       if (opensGatewayCa(existing)) {
         const one = unopened.length === 1
         const rowRef = one ? 'this row' : 'these rows'
