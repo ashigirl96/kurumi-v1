@@ -255,9 +255,19 @@ async function drive(argv: string[]): Promise<void> {
     ])
     const deadline = Date.now() + 120_000
     let selected = false
+    let submitted: string | undefined
     let authorization = initial
     while (Date.now() < deadline) {
-      const current = new URL(await browser(['get', 'url']))
+      let location = await browser(['get', 'url'])
+      if (location === 'chrome-error://chromewebdata/') {
+        const attempted: unknown = JSON.parse(
+          await browser(['eval', '--stdin'], "performance.getEntriesByType('navigation')[0]?.name"),
+        )
+        if (typeof attempted !== 'string')
+          throw new Error('browser did not record the failed navigation URL')
+        location = attempted
+      }
+      const current = new URL(location)
       if (current.hostname === '127.0.0.1' && current.pathname === '/oauth/callback') {
         const redirect = authorization.searchParams.get('redirect_uri')
         if (
@@ -279,6 +289,11 @@ async function drive(argv: string[]): Promise<void> {
         await screenshot('refused')
         throw new Error('consent left Google without reaching the loopback callback')
       }
+      if (current.href === submitted) {
+        await Bun.sleep(250)
+        continue
+      }
+      submitted = undefined
       const requested = authorizationUrl(consentUrl(current.href, webPort))
       if (requested.searchParams.has('scope')) {
         authorization = requested
@@ -344,6 +359,11 @@ async function drive(argv: string[]): Promise<void> {
         if ((await browser(['get', 'url'])) !== current.href) continue
         try {
           await click(action.ref, 'click', chooser ? 'account' : 'consent')
+          if (
+            /^(次へ|続行|許可|Continue|Next|Allow|キャンセル|拒否|Cancel|Deny)$/.test(action.name)
+          ) {
+            submitted = current.href
+          }
         } catch (error) {
           if ((await browser(['get', 'url'])) === current.href) throw error
         }
