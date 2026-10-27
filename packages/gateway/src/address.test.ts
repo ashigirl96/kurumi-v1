@@ -41,7 +41,7 @@ test.each([
   ['100::1', 'reserved'],
   ['not-an-address', 'unparseable'],
 ])('%s is refused as %s', (address, reason) => {
-  expect(addressRefusal(address, [])).toBe(reason)
+  expect(addressRefusal([])(address)).toBe(reason)
 })
 
 test.each([
@@ -59,7 +59,7 @@ test.each([
   '2002:808:808::1',
   '::ffff:0:808:808',
 ])('%s is a public address', (address) => {
-  expect(addressRefusal(address, [])).toBeNull()
+  expect(addressRefusal([])(address)).toBeNull()
 })
 
 const host = ['127.0.0.1', '203.0.113.7', 'fe80::1%en0', '2001:db8:1::7']
@@ -74,13 +74,13 @@ test.each([
   ['127.0.0.1', 'loopback'],
   ['fe80::1', 'link-local'],
 ])('%s on this host is refused as %s', (address, reason) => {
-  expect(addressRefusal(address, host)).toBe(reason)
+  expect(addressRefusal(host)(address)).toBe(reason)
 })
 
 test.each(['203.0.113.8', '2001:db8:1::8', '8.8.8.8'])(
   '%s, not on this host, is a public address',
   (address) => {
-    expect(addressRefusal(address, host)).toBeNull()
+    expect(addressRefusal(host)(address)).toBeNull()
   },
 )
 

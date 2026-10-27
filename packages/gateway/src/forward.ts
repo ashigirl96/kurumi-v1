@@ -105,7 +105,7 @@ export type ForwardDeps<Principal> = {
   gate?: EgressGate<Principal>
   upstream?: UpstreamDestination
   resolve?: (host: string) => Promise<LookupAddress[]>
-  addressRefusal?: (address: string, host: readonly string[]) => string | null
+  addressRefusal?: (host: readonly string[]) => (address: string) => string | null
   hostAddresses?: () => readonly string[]
   log?(event: EgressEvent<Principal>): void
   bodyDeadlineMs?: number
@@ -144,10 +144,8 @@ async function pinPublicUpstream(
     return { kind: 'unreachable' }
   }
   if (addresses.length === 0) return { kind: 'unreachable' }
-  const ownAddresses = readHostAddresses()
-  const reason = addresses
-    .map(({ address }) => refusalOf(address, ownAddresses))
-    .find((found) => found !== null)
+  const refusal = refusalOf(readHostAddresses())
+  const reason = addresses.map(({ address }) => refusal(address)).find((found) => found !== null)
   if (reason) return { kind: 'refused', refusal: { code: 'upstream_not_public', host, reason } }
   return { kind: 'pinned', lookup: pinnedLookup(addresses) }
 }
