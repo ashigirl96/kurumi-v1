@@ -23,6 +23,14 @@ export async function lintProbes(
   mkdirSync(join(dir, 'scripts/oxlint'), { recursive: true })
   copyFileSync(join(repo, 'scripts/oxlint/kurumi.js'), join(dir, 'scripts/oxlint/kurumi.js'))
   symlinkSync(join(repo, 'node_modules'), join(dir, 'node_modules'))
+  const packages = new Set([
+    '.',
+    ...Object.keys(files).flatMap((path) => /^(?:packages|apps)\/[^/]+(?=\/)/.exec(path) ?? []),
+  ])
+  for (const member of packages) {
+    mkdirSync(join(dir, member), { recursive: true })
+    writeFileSync(join(dir, member, 'package.json'), '{}')
+  }
   for (const [path, source] of Object.entries(files)) {
     mkdirSync(join(dir, dirname(path)), { recursive: true })
     writeFileSync(join(dir, path), source)

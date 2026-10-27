@@ -1,6 +1,6 @@
 // oxlint は node で動き、node の版によっては TS の plugin を読めないので JS で書く。
 
-import { realpathSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 const TESTING_ENTRY = /^@kurumi\/[^/]+\/testing$/
@@ -42,6 +42,25 @@ function specifierOf(node) {
   return undefined
 }
 
+function importVisitors(check) {
+  const checkSource = (node) => check(node, specifierOf(node.source))
+  return {
+    ImportDeclaration: checkSource,
+    ExportNamedDeclaration: checkSource,
+    ExportAllDeclaration: checkSource,
+    ImportExpression: checkSource,
+    CallExpression: (node) => {
+      if (isRequire(node.callee)) check(node, specifierOf(node.arguments[0]))
+    },
+    Literal: (node) => {
+      const { type } = node.parent ?? {}
+      if (type === 'TSImportType' || type === 'TSExternalModuleReference') {
+        check(node, specifierOf(node))
+      }
+    },
+  }
+}
+
 const SCHEMA_ENTRY = /^@kurumi\/([^/]+)\/schema$/
 
 function isFunction(node) {
@@ -73,6 +92,27 @@ export default {
         }
       },
     },
+    'workspace-dependencies': {
+      create(context) {
+        const root = realPathOf(context.cwd)
+        const ownPackage = packageOf(realPathOf(context.filename), root)
+        const manifestPath = join(ownPackage, 'package.json')
+        const manifest = JSON.parse(readFileSync(join(root, manifestPath), 'utf8'))
+        const declared = new Set(
+          ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'].flatMap(
+            (field) => Object.keys(manifest[field] ?? {}),
+          ),
+        )
+        return importVisitors((node, specifier) => {
+          const name = /^@kurumi\/[^/]+/.exec(specifier ?? '')?.[0]
+          if (!name || name === manifest.name || declared.has(name)) return
+          context.report({
+            node,
+            message: `${manifestPath} must declare ${name} as a dependency`,
+          })
+        })
+      },
+    },
     'no-relative-package-import': {
       create(context) {
         const root = realPathOf(context.cwd)
@@ -88,22 +128,7 @@ export default {
               '相対 path で package の外の file を import しない。他の package の entry は @kurumi/<package>/<entry> で import する（docs/design/module-map.md）',
           })
         }
-        const checkSource = (node) => check(node, specifierOf(node.source))
-        return {
-          ImportDeclaration: checkSource,
-          ExportNamedDeclaration: checkSource,
-          ExportAllDeclaration: checkSource,
-          ImportExpression: checkSource,
-          CallExpression: (node) => {
-            if (isRequire(node.callee)) check(node, specifierOf(node.arguments[0]))
-          },
-          Literal: (node) => {
-            const { type } = node.parent ?? {}
-            if (type === 'TSImportType' || type === 'TSExternalModuleReference') {
-              check(node, specifierOf(node))
-            }
-          },
-        }
+        return importVisitors(check)
       },
     },
     // bun:sqlite の transaction は同期で、async 関数を渡すと await の後の throw で rollback されない。
