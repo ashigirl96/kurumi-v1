@@ -5,8 +5,8 @@ import { join } from 'node:path'
 
 const repo = join(import.meta.dir, '..')
 
-// Built from repeat so that this file holds no marker line of its own.
-const markerLine = `^(${'<'.repeat(7)}|${'>'.repeat(7)})( |$)|^${'='.repeat(7)}$`
+const marker = (char: string) => char.repeat(7)
+const markerLine = `^(${marker('<')}|${marker('>')})( |$)|^${marker('=')}$`
 
 const dirs: string[] = []
 
@@ -26,13 +26,13 @@ test('the marker search finds each line of a conflict and nothing else', () => {
     join(dir, 'conflicted.md'),
     [
       'before',
-      `${'<'.repeat(7)} HEAD`,
+      `${marker('<')} HEAD`,
       'ours',
-      '='.repeat(7),
+      marker('='),
       'theirs',
-      `${'>'.repeat(7)} topic`,
+      `${marker('>')} topic`,
       '='.repeat(8),
-      `${'<'.repeat(7)}x`,
+      `${marker('<')}x`,
       '',
     ].join('\n'),
   )
@@ -40,9 +40,9 @@ test('the marker search finds each line of a conflict and nothing else', () => {
   expect(grep(dir, ['--no-index'], ['conflicted.md'])).toEqual({
     exitCode: 0,
     stdout: [
-      `conflicted.md:2:${'<'.repeat(7)} HEAD`,
-      `conflicted.md:4:${'='.repeat(7)}`,
-      `conflicted.md:6:${'>'.repeat(7)} topic`,
+      `conflicted.md:2:${marker('<')} HEAD`,
+      `conflicted.md:4:${marker('=')}`,
+      `conflicted.md:6:${marker('>')} topic`,
       '',
     ].join('\n'),
   })
