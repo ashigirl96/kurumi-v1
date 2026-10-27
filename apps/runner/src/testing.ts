@@ -66,7 +66,10 @@ export const sdk = {
   }),
 }
 
+const realSdk = await import('@anthropic-ai/claude-agent-sdk')
+
 await mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+  ...realSdk,
   query({
     prompt,
     options,

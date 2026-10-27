@@ -482,6 +482,45 @@ const failure = async (call: Promise<unknown>) => {
 }
 
 describe('the account router', () => {
+  test('mine returns only the caller group grants, defaults and selectors without credentials or ids', async () => {
+    seedGroups()
+    addKey({ autoGrant: true })
+    const mine = await client({ kind: 'agent', agentGroupId: 'g2', sessionId: 's2' }).mine()
+    expect(mine.accounts).toEqual([
+      {
+        handle: 'anthropic/main',
+        service: 'anthropic-api',
+        isDefault: false,
+        status: 'active',
+        selector: 'sk-ant-kurumi-YW50aHJvcGljL21haW4',
+      },
+      {
+        handle: handleB,
+        service: 'gmail',
+        isDefault: true,
+        status: 'active',
+        selector: `kurumi:${handleB}`,
+      },
+      {
+        handle: handleA,
+        service: 'google-calendar',
+        isDefault: false,
+        status: 'active',
+        selector: `kurumi:${handleA}`,
+      },
+    ])
+    expect(JSON.stringify(mine)).not.toContain(secret)
+    expect(JSON.stringify(mine)).not.toContain('acc-')
+    expect(JSON.stringify(mine)).not.toContain('c@work.example')
+    expect(
+      await client({ kind: 'agent', agentGroupId: 'no-grants', sessionId: 's3' }).mine(),
+    ).toEqual({ accounts: [] })
+    expect((await failure(client().mine())).code).toBe('FORBIDDEN')
+    expect((await failure(client({ kind: 'human', userId: 'owner' }).mine())).code).toBe(
+      'FORBIDDEN',
+    )
+  })
+
   test('add-key returns the handle and records its grants as auto-grant', async () => {
     expect(
       await client({ kind: 'human', userId: 'u1' }).addKey([

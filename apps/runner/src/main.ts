@@ -7,6 +7,7 @@ import { RPCLink } from '@orpc/client/fetch'
 import type { ContractRouterClient } from '@orpc/contract'
 
 import { runTurn } from './claude.ts'
+import { createKurumiServer } from './tools.ts'
 
 type Host = ContractRouterClient<{ session: typeof contract }>
 
@@ -29,12 +30,11 @@ export async function runRunner(options: {
   onRetry?(entry: { kind: 'runner.retry'; delayMs: number }): void
 }): Promise<void> {
   const { signal } = options
-  const host: Host = createORPCClient(
-    new RPCLink({
-      url: `${options.url.replace(/\/$/, '')}/rpc`,
-      headers: { authorization: `Bearer ${options.token}` },
-    }),
-  )
+  const link = new RPCLink({
+    url: `${options.url.replace(/\/$/, '')}/rpc`,
+    headers: { authorization: `Bearer ${options.token}` },
+  })
+  const host: Host = createORPCClient(link)
   async function retry<T>(operation: () => Promise<T>): Promise<T> {
     let delayMs = 100
     while (true) {
@@ -77,6 +77,7 @@ export async function runRunner(options: {
     try {
       await runTurn({
         prompt: message.content,
+        mcpServers: { kurumi: createKurumiServer(link, signal) },
         continuation: saved.value,
         signal,
         async reply(text) {

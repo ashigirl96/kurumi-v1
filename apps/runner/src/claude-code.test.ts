@@ -18,17 +18,17 @@ function sse(events: ({ type: string } & Record<string, unknown>)[]): string {
   return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('')
 }
 
-type Block = { type: 'text'; text: string } | { type: 'tool_use'; name: 'Bash'; command: string }
+type Block = { type: 'text'; text: string } | { type: 'tool_use'; name: string; input: object }
 
 function stream(block: Block): Response {
   const start =
     block.type === 'text'
       ? { type: 'text', text: '' }
-      : { type: 'tool_use', id: 'toolu_probe', name: block.name, input: {} }
+      : { type: 'tool_use', id: `toolu_${block.name}`, name: block.name, input: {} }
   const delta =
     block.type === 'text'
       ? { type: 'text_delta', text: block.text }
-      : { type: 'input_json_delta', partial_json: JSON.stringify({ command: block.command }) }
+      : { type: 'input_json_delta', partial_json: JSON.stringify(block.input) }
   const message = {
     id: 'msg_probe',
     type: 'message',
@@ -69,30 +69,57 @@ function toolResults(request: MessagesRequest): string[] {
   )
 }
 
-function startUpstream(command: string) {
+function startUpstream(command: string, toolName = 'Bash') {
   const toolOutputs: string[] = []
   let requests = 0
+  let mineCalls = 0
+  let toolNames: string[] = []
   const server = Bun.serve({
     port: 0,
     hostname: '127.0.0.1',
     async fetch(request) {
       requests++
       const { pathname } = new URL(request.url)
+      if (pathname === '/rpc/account/mine') {
+        if (request.headers.get('authorization') !== 'Bearer kurumi-session-token-probe')
+          return new Response('unauthorized', { status: 401 })
+        mineCalls++
+        return Response.json({
+          json: { accounts: [{ handle: 'anthropic/main', selector: 'kurumi:anthropic/main' }] },
+        })
+      }
       if (request.method !== 'POST' || pathname !== '/v1/messages')
         return Response.json({ data: [] })
       const body: MessagesRequest = await request.json()
+      toolNames = (body.tools ?? []).map((tool) => tool.name)
       const results = toolResults(body)
       toolOutputs.push(...results)
-      const canRunBash = (body.tools ?? []).some((tool) => tool.name === 'Bash')
-      return stream(
-        canRunBash && results.length === 0
-          ? { type: 'tool_use', name: 'Bash', command }
-          : { type: 'text', text: 'probe done' },
-      )
+      const canRunTool = (body.tools ?? []).some((tool) => tool.name === toolName)
+      if (canRunTool && (toolName === 'Bash' ? results.length === 0 : mineCalls === 0)) {
+        return stream({
+          type: 'tool_use',
+          name: toolName,
+          input: toolName === 'Bash' ? { command } : {},
+        })
+      }
+      if (toolName !== 'Bash' && mineCalls === 0) {
+        return stream({
+          type: 'tool_use',
+          name: 'ToolSearch',
+          input: { query: `select:${toolName}`, max_results: 1 },
+        })
+      }
+      return stream({ type: 'text', text: 'probe done' })
     },
   })
   cleanups.push(() => server.stop(true))
-  return { url: server.url.href.replace(/\/$/, ''), toolOutputs, requests: () => requests }
+  return {
+    url: server.url.href.replace(/\/$/, ''),
+    toolOutputs,
+    requests: () => requests,
+    mineCalls: () => mineCalls,
+    toolNames: () => toolNames,
+  }
 }
 
 const sessionProxy = 'http://s:kurumi-session-token-probe@127.0.0.1:9'
@@ -103,9 +130,12 @@ async function runTurnInContainerEnv(
 ): Promise<string[]> {
   const script = `
     import { runTurn } from ${JSON.stringify(join(import.meta.dir, 'claude.ts'))}
+    import { createKurumiServer } from ${JSON.stringify(join(import.meta.dir, 'tools.ts'))}
+    import { RPCLink } from ${JSON.stringify(import.meta.resolve('@orpc/client/fetch'))}
     const replies = []
     await runTurn({
       prompt: 'run the probe',
+      mcpServers: { kurumi: createKurumiServer(new RPCLink({ url: ${JSON.stringify(upstream.url)} + '/rpc', headers: { authorization: 'Bearer ' + process.env.KURUMI_TOKEN } }), AbortSignal.timeout(45_000)) },
       continuation: null,
       signal: AbortSignal.timeout(45_000),
       reply: async (text) => { replies.push(text) },
@@ -186,4 +216,13 @@ test('settings written into the group folder do not configure the next turn', as
   expect(existsSync(hookRan)).toBe(false)
   expect(existsSync(mcpRan)).toBe(false)
   expect(upstream.toolOutputs).toHaveLength(1)
+}, 60_000)
+
+test('the in-process kurumi tool calls the host and returns its result without the runner token', async () => {
+  const upstream = startUpstream('', 'mcp__kurumi__list_accounts')
+  expect(await runTurnInContainerEnv(directory(), upstream)).toEqual(['probe done'])
+  expect(upstream.toolNames()).toContain('mcp__kurumi__list_accounts')
+  expect(upstream.mineCalls()).toBe(1)
+  expect(upstream.toolOutputs.join('')).toContain('anthropic/main')
+  expect(upstream.toolOutputs.join('')).not.toContain('kurumi-session-token-probe')
 }, 60_000)

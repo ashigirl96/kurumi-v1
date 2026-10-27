@@ -31,7 +31,25 @@ export const AccountViewSchema = z.object({
   autoGrant: z.boolean(),
 })
 
+export const MyAccountSchema = z.object({
+  handle: HandleSchema,
+  selector: z.string(),
+  service: ServiceIdSchema,
+  isDefault: z.boolean(),
+  status: z.enum(['active', 'needs_reauth']),
+})
+
 export const contract = {
+  mine: kc
+    .meta({
+      agent: 'own-group',
+      tool: {
+        name: 'list_accounts',
+        instructions:
+          'Lists the accounts you may use, per service. To pick one, put its selector where the token goes; with none, the only or default account is used.',
+      },
+    })
+    .output(z.object({ accounts: z.array(MyAccountSchema) })),
   addKey: kc
     .meta({ cli: true, description: 'Add a key account, reading the key from stdin' })
     .input(
