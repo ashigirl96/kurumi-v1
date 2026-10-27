@@ -26,7 +26,7 @@ import {
   type ContractRouterClient,
 } from '@orpc/contract'
 import { ORPCError, os, type AnyProcedure } from '@orpc/server'
-import { CliValidationError, createCli, FailedToExitError } from 'trpc-cli'
+import { CliValidationError, createCli, FailedToExitError, kebabCase } from 'trpc-cli'
 import { z } from 'zod'
 
 type ForwardingRouter = { [key: string]: ForwardingRouter | AnyProcedure }
@@ -81,7 +81,7 @@ export async function runCommand(
 ): Promise<number> {
   let router: ForwardingRouter
   try {
-    router = forward(contract, link, stdin)
+    router = forward(contract, link, stdin, argv)
   } catch (error) {
     if (!(error instanceof StdinRouteError)) throw error
     process.stderr.write(`${error.message}\n`)
@@ -199,23 +199,26 @@ function forward(
   contract: AnyContractRouter,
   link: Link,
   stdin: Stdin,
+  argv: string[],
   path: string[] = [],
 ): ForwardingRouter {
   const router: ForwardingRouter = {}
   for (const [key, child] of Object.entries(contract)) {
     const childPath = [...path, key]
     if (!isContractProcedure(child)) {
-      const children = forward(child, link, stdin, childPath)
+      const children = forward(child, link, stdin, argv, childPath)
       if (Object.keys(children).length > 0) router[key] = children
       continue
     }
     const { inputSchema, outputSchema } = child['~orpc']
     const meta: Meta = child['~orpc'].meta
     if (meta.cli !== true) continue
-    const command = childPath
-      .map((name) => name.replaceAll(/[A-Z]/g, (c) => `-${c.toLowerCase()}`))
-      .join(' ')
-    const piped = stdinFieldOf(command, inputSchema)
+    const names = childPath.map(kebabCase)
+    const command = names.join(' ')
+    // Commander runs a command only when argv holds each of its names, so skipping the others never skips the run one.
+    const piped = names.every((name) => argv.includes(name))
+      ? stdinFieldOf(command, inputSchema)
+      : null
     const render = renderers[childPath.join('.')] ?? json
     router[key] = os
       .meta(meta)

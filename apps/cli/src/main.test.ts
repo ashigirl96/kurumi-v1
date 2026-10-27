@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 
 import { kc } from '@kurumi/rpc/contract'
-import type { AnyContractRouter } from '@orpc/contract'
+import { isContractProcedure, type AnyContractRouter } from '@orpc/contract'
 import { z } from 'zod'
 import * as zm from 'zod/mini'
 
@@ -209,6 +209,18 @@ describe('a contract field marked stdin', () => {
     expect(stdout).not.toContain('--secret')
   })
 
+  test('is read from stdin when the command name holds an acronym', async () => {
+    const contract = { putDB: put(z.object({ secret: secret.meta({ stdin: true }) })) }
+
+    expect(await run(['put-db', 'n'], piped('s3cret'), contract)).toBe(0)
+    expect(calls).toEqual([{ path: ['putDB'], input: ['n', { secret: 's3cret' }] }])
+
+    calls = []
+    expect(await run(['put-db', 'n', '--secret', 'ARGV'], piped(''), contract)).toBe(1)
+    expect(stderr).toContain("unknown option '--secret'")
+    expect(calls).toEqual([])
+  })
+
   test('is read from stdin beside a recursive schema', async () => {
     type Tree = { children: Tree[] }
     const tree: z.ZodType<Tree> = z.lazy(() => z.object({ children: z.array(tree) }))
@@ -380,17 +392,39 @@ describe('a contract field marked stdin', () => {
       'input[1].secret needs a maximum length',
     ],
   ])(
-    'in %s refuses every command with one line instead of becoming a flag',
+    'in %s refuses that command with one line instead of becoming a flag',
     async (_, procedure, why) => {
       const contract = { ...cliContract, put: procedure }
 
-      expect(await run(['status'], piped(''), contract)).toBe(1)
+      expect(await run(['put'], piped(''), contract)).toBe(1)
 
       expect(stderr).toBe(`kurumi put cannot read stdin: ${why}\n`)
       expect(calls).toEqual([])
+
+      stderr = ''
+      expect(await run(['status'], piped(''), contract)).toBe(0)
+      expect(stderr).toBe('')
+      expect(calls).toEqual([{ path: ['status'], input: undefined }])
     },
   )
 })
+
+const commandsOf = (contract: AnyContractRouter, path: string[] = []): string[][] =>
+  Object.entries(contract).flatMap(([key, child]) => {
+    const command = [...path, key.replaceAll(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)]
+    if (!isContractProcedure(child)) return commandsOf(child, command)
+    return child['~orpc'].meta.cli === true ? [command] : []
+  })
+
+test.each(commandsOf(cliContract).map((command) => [command.join(' '), command]))(
+  'kurumi %s --help builds the command from the host contract',
+  async (_, command) => {
+    expect(await run([...command, '--help'], piped(''))).toBe(0)
+
+    expect(stderr).toBe('')
+    expect(calls).toEqual([])
+  },
+)
 
 function answering(output: unknown) {
   return {
