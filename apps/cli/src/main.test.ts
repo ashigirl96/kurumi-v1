@@ -426,6 +426,68 @@ test.each(commandsOf(cliContract).map((command) => [command.join(' '), command])
   },
 )
 
+// Commander exits the process itself for a group's help and unknown commands, so these run the CLI as a child.
+function kurumi(argv: string[]) {
+  const child = Bun.spawnSync([process.execPath, `${import.meta.dir}/main.ts`, ...argv], {
+    env: { ...process.env, KURUMI_HOME: `${import.meta.dir}/no-host` },
+    stdin: 'ignore',
+  })
+  return { code: child.exitCode, stdout: child.stdout.toString(), stderr: child.stderr.toString() }
+}
+
+function helpOf(command: string[]): string {
+  const { code, stdout: help, stderr: error } = kurumi([...command, '--help'])
+  expect({ code, error }).toEqual({ code: 0, error: '' })
+  return help
+}
+
+test('kurumi --help names every command', () => {
+  const help = helpOf([])
+
+  for (const name of new Set(commandsOf(cliContract).flat())) expect(help).toContain(name)
+})
+
+test.each(commandsOf(cliContract).map((command) => [command.join(' '), command]))(
+  'kurumi %s is listed in its group help with the arguments and options of its own help',
+  (_, command) => {
+    const own = helpOf(command)
+    const args = own.split('\n')[0]!.replace(`Usage: kurumi ${command.join(' ')} [options]`, '')
+    const options = /^ {2}--/m.test(own) ? ' [options]' : ''
+    const term = `  ${command.at(-1)}${options}${args}`
+
+    const terms = helpOf(command.slice(0, -1))
+      .split('\n')
+      .map((line) => line.slice(0, term.length + 1).trimEnd())
+
+    expect(terms).toContain(term)
+  },
+)
+
+test.each([
+  [['nope'], "error: unknown command 'nope'", []],
+  [['account', 'nope'], "error: unknown command 'nope'", ['account']],
+  [['approval', 'show'], "error: missing required argument 'approval id'", ['approval', 'show']],
+  [
+    ['account', 'add-key', 'anthropic'],
+    "error: required option '--label <string>' not specified",
+    ['account', 'add-key'],
+  ],
+])('kurumi %p exits 1 with one error line and then the help', (argv, error, command) => {
+  const { code, stdout: output, stderr: printed } = kurumi(argv)
+
+  expect({ code, output }).toEqual({ code: 1, output: '' })
+  expect(printed).toBe(`${error}\n\n${helpOf(command)}`)
+})
+
+test('a flag value the input schema refuses exits 1 with a BAD_REQUEST line', async () => {
+  expect(await run(['gateway', 'log', '--limit', 'abc'], piped(''))).toBe(1)
+
+  expect(stderr).toBe(
+    "BAD_REQUEST: error: option '--limit [integer]' argument 'abc' is invalid. Invalid input: expected number, received string\n",
+  )
+  expect(calls).toEqual([])
+})
+
 function answering(output: unknown) {
   return {
     async call(path: readonly string[], input: unknown) {
