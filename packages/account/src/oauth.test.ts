@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 
 import { catalog, IdentifyError, servicesCovered, type ServiceId } from './catalog.ts'
 import { refreshFull, tokenFull, tokenGmailOnly } from './fixtures/google/token-responses.ts'
@@ -337,4 +337,42 @@ describe('Google identify', () => {
   test('refuses an id_token that is not a JWT', () => {
     expect(() => identify({ ...tokenFull, id_token: 'not-a-jwt' })).toThrow(IdentifyError)
   })
+})
+
+test('code exchange and refresh share a thirty-second deadline for a stalled token endpoint', async () => {
+  const timeout = AbortSignal.timeout.bind(AbortSignal)
+  const deadline = spyOn(AbortSignal, 'timeout').mockImplementation((ms) => {
+    expect(ms).toBe(30_000)
+    return timeout(5)
+  })
+  const fetchImpl: typeof fetch = Object.assign(
+    (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        if (!signal) throw new Error('missing token request deadline')
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      }),
+    { preconnect: fetch.preconnect },
+  )
+  try {
+    const exchangeError = await exchangeCode({
+      vendor: 'google',
+      client,
+      code: 'code',
+      verifier: 'verifier',
+      redirectUri,
+      fetch: fetchImpl,
+    }).catch((error: unknown) => error)
+    expect(exchangeError).toMatchObject({ name: 'TimeoutError' })
+    const refreshError = await refresh({
+      vendor: 'google',
+      client,
+      refreshToken: 'refresh',
+      fetch: fetchImpl,
+    }).catch((error: unknown) => error)
+    expect(refreshError).toMatchObject({ name: 'TimeoutError' })
+    expect(deadline).toHaveBeenCalledTimes(2)
+  } finally {
+    deadline.mockRestore()
+  }
 })

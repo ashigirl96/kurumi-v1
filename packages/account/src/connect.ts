@@ -70,6 +70,11 @@ export type ConnectionOptions = {
   fetch?: typeof fetch
   log?: (
     event:
+      | {
+          kind: 'account.refresh'
+          accountId: string
+          outcome: 'fresh' | 'needs_reauth' | 'transient_failure' | 'superseded'
+        }
       | { kind: 'account.connect.completed'; requestId: string; transactionMs: number }
       | { kind: 'account.connect.failed'; requestId: string; reason: string },
   ) => void

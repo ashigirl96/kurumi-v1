@@ -21,7 +21,7 @@ import {
   type ConnectionOptions,
   type Connections,
 } from './connect.ts'
-import { contract } from './contract.ts'
+import { contract, GoogleClientSchema } from './contract.ts'
 import {
   grant,
   type GrantKey,
@@ -30,7 +30,8 @@ import {
   type GrantRefusal,
 } from './grant.ts'
 import { accountMaterial, type AccountMaterial } from './material.ts'
-import { account, accountGrant, defaultAccount } from './schema.ts'
+import { OAuthError, refresh } from './oauth.ts'
+import { account, accountGrant, defaultAccount, oauthClient } from './schema.ts'
 import {
   accountHandle,
   groupSelector,
@@ -87,6 +88,7 @@ export type AccountView = {
   kind: 'oauth' | 'key'
   services: ServiceId[]
   autoGrant: boolean
+  status: 'active' | 'needs_reauth'
 }
 
 export type EgressRequest = {
@@ -98,7 +100,14 @@ export type EgressRequest = {
 }
 
 export type CredentialRefusal =
-  | SelectionRefusal
+  | Exclude<SelectionRefusal, { code: 'account_needs_reauth' }>
+  | {
+      code: 'account_needs_reauth'
+      service: ServiceId
+      handle: AccountHandle
+      agentGroupId: string
+    }
+  | { code: 'account_refresh_failed'; service: ServiceId; handle: AccountHandle }
   | { code: 'duplicate_slot'; service: ServiceId; header: string }
   | { code: 'method_not_allowed'; service: ServiceId; method: string; allowed: readonly string[] }
 
@@ -130,11 +139,11 @@ export type AccountLedger = {
   setDefault(tx: Tx, input: GrantKey): SetDefaultResult
   clearDefault(tx: Tx, input: { agentGroupId: string; service: ServiceId }): void
   candidates(agentGroupId: string, service: ServiceId): GrantedCandidate[]
-  credentialFor(principal: CredentialPrincipal, request: EgressRequest): CredentialDecision
+  credentialFor(principal: CredentialPrincipal, request: EgressRequest): Promise<CredentialDecision>
   containerEnv(): Record<string, string>
 }
 
-type GrantRow = GrantedCandidate & Pick<typeof account.$inferSelect, 'material'>
+type GrantRow = GrantedCandidate & Pick<typeof account.$inferSelect, 'material' | 'accessExpiresAt'>
 
 function slotHeadersOf(service: ServiceId): string[] {
   const { slot, otherCredentialHeaders = [] } = serviceSpec(service)
@@ -199,7 +208,7 @@ function setRequiredBeta(headers: Headers, { header, token }: RequiredBeta) {
   headers.set(header, [...betas].join(','))
 }
 
-function keyOf(vaultKey: Uint8Array, row: GrantRow): string | null {
+function materialOf(vaultKey: Uint8Array, row: GrantRow): AccountMaterial | null {
   let plaintext: unknown
   try {
     plaintext = JSON.parse(open(vaultKey, row.accountId, row.material))
@@ -209,7 +218,7 @@ function keyOf(vaultKey: Uint8Array, row: GrantRow): string | null {
   }
   const material = accountMaterial.safeParse(plaintext)
   if (!material.success) return null
-  return material.data.kind === 'key' ? material.data.key : material.data.accessToken
+  return material.data
 }
 
 const pathWithoutQuery = (path: string): string => {
@@ -332,6 +341,7 @@ export function createAccountLedger(
       label: account.label,
       status: account.status,
       material: account.material,
+      accessExpiresAt: account.accessExpiresAt,
       defaultAccountId: defaultAccount.accountId,
     })
     .from(accountGrant)
@@ -363,7 +373,105 @@ export function createAccountLedger(
       isDefault: row.defaultAccountId !== null,
       status: row.status,
       material: row.material,
+      accessExpiresAt: row.accessExpiresAt,
     }))
+
+  type RefreshResult =
+    | {
+        kind: 'fresh'
+        material: Extract<AccountMaterial, { kind: 'oauth' }>
+        accessExpiresAt: Date
+      }
+    | { kind: 'needs_reauth' }
+    | { kind: 'transient_failure' }
+  const refreshing = new Map<string, Promise<RefreshResult>>()
+
+  async function refreshAccount(
+    row: GrantRow,
+    material: Extract<AccountMaterial, { kind: 'oauth' }>,
+  ): Promise<RefreshResult> {
+    const clientRow = deps.db
+      .select()
+      .from(oauthClient)
+      .where(eq(oauthClient.vendor, 'google'))
+      .get()
+    let result: RefreshResult
+    if (!clientRow || material.refreshToken === null) result = { kind: 'needs_reauth' }
+    else {
+      try {
+        const client = GoogleClientSchema.parse(
+          JSON.parse(open(deps.vaultKey, 'oauth-client:google', clientRow.material)),
+        )
+        const tokens = await refresh({
+          vendor: 'google',
+          client,
+          refreshToken: material.refreshToken,
+          fetch: deps.fetch,
+        })
+        const accessExpiresAt = new Date(Date.now() + tokens.expiresIn * 1000)
+        if (
+          tokens.tokenType.toLowerCase() !== 'bearer' ||
+          tokens.expiresIn <= 0 ||
+          !Number.isFinite(accessExpiresAt.getTime())
+        )
+          throw new OAuthError('invalid OAuth token lifetime or type', 'unexpected_response', 200)
+        const renewed = accountMaterial.parse({
+          ...material,
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken ?? material.refreshToken,
+          grantedScopes:
+            tokens.scope === null
+              ? material.grantedScopes
+              : tokens.scope.split(/\s+/).filter(Boolean),
+        })
+        if (renewed.kind !== 'oauth') throw new Error('refresh returned key material')
+        result = { kind: 'fresh', material: renewed, accessExpiresAt }
+      } catch (error) {
+        result =
+          error instanceof OAuthError &&
+          error.status < 500 &&
+          ['invalid_grant', 'invalid_client'].includes(error.code)
+            ? { kind: 'needs_reauth' }
+            : { kind: 'transient_failure' }
+      }
+    }
+    const applied = transaction(deps.db, (tx) => {
+      const current = tx.select().from(account).where(eq(account.id, row.accountId)).get()
+      const currentClient = tx
+        .select()
+        .from(oauthClient)
+        .where(eq(oauthClient.vendor, 'google'))
+        .get()
+      if (
+        !current ||
+        !current.material.equals(row.material) ||
+        !(currentClient
+          ? clientRow && currentClient.material.equals(clientRow.material)
+          : !clientRow)
+      )
+        return false
+      if (result.kind === 'fresh')
+        tx.update(account)
+          .set({
+            material: seal(deps.vaultKey, row.accountId, JSON.stringify(result.material)),
+            accessExpiresAt: result.accessExpiresAt,
+          })
+          .where(eq(account.id, row.accountId))
+          .run()
+      else if (result.kind === 'needs_reauth')
+        tx.update(account)
+          .set({ status: 'needs_reauth' })
+          .where(eq(account.id, row.accountId))
+          .run()
+      return true
+    })
+    deps.log?.({
+      kind: 'account.refresh',
+      accountId: row.accountId,
+      outcome: applied ? result.kind : 'superseded',
+    })
+    return applied ? result : { kind: 'transient_failure' }
+  }
 
   return {
     connections: createConnections(deps),
@@ -418,6 +526,7 @@ export function createAccountLedger(
           kind: account.kind,
           services: account.services,
           autoGrant: account.autoGrant,
+          status: account.status,
         })
         .from(account)
         .all()
@@ -492,7 +601,7 @@ export function createAccountLedger(
       }))
     },
 
-    credentialFor({ agentGroupId }, request) {
+    async credentialFor({ agentGroupId }, request) {
       const located = serviceFor(request.host, request.path)
       if (!located) return { kind: 'pass' }
       const { vendor, service } = located
@@ -522,14 +631,50 @@ export function createAccountLedger(
       )
       const rows = grantRows(agentGroupId, service)
       const selection = selectAccount(service, rows, unnamedIfGroupSelector(vendor, selector))
-      if (!selection.ok) return { kind: 'refuse', refusal: selection.refusal }
-      const row = rows.find(({ accountId }) => accountId === selection.accountId)
-      if (!row) throw new Error(`${selection.handle} was chosen from outside the grant rows`)
-      const secret = keyOf(deps.vaultKey, row)
-      if (secret === null) {
+      if (!selection.ok)
         return {
           kind: 'refuse',
-          refusal: { code: 'account_needs_reauth', service, handle: row.handle },
+          refusal:
+            selection.refusal.code === 'account_needs_reauth'
+              ? { ...selection.refusal, agentGroupId }
+              : selection.refusal,
+        }
+      const row = rows.find(({ accountId }) => accountId === selection.accountId)
+      if (!row) throw new Error(`${selection.handle} was chosen from outside the grant rows`)
+      let material = materialOf(deps.vaultKey, row)
+      if (
+        material?.kind === 'oauth' &&
+        (row.accessExpiresAt?.getTime() ?? 0) <= Date.now() + 60_000
+      ) {
+        let pending = refreshing.get(row.accountId)
+        if (!pending) {
+          pending = refreshAccount(row, material).finally(() => refreshing.delete(row.accountId))
+          refreshing.set(row.accountId, pending)
+        }
+        const result = await pending
+        const currentRows = grantRows(agentGroupId, service)
+        const current = selectAccount(service, currentRows, { kind: 'handle', handle: row.handle })
+        if (!current.ok)
+          return {
+            kind: 'refuse',
+            refusal:
+              current.refusal.code === 'account_needs_reauth'
+                ? { ...current.refusal, agentGroupId }
+                : current.refusal,
+          }
+        const held = currentRows.find(({ accountId }) => accountId === row.accountId)
+        if (!held) throw new Error('selected account disappeared without an await')
+        if (result.kind === 'transient_failure')
+          return {
+            kind: 'refuse',
+            refusal: { code: 'account_refresh_failed', service, handle: row.handle },
+          }
+        material = materialOf(deps.vaultKey, held)
+      }
+      if (material === null) {
+        return {
+          kind: 'refuse',
+          refusal: { code: 'account_needs_reauth', service, handle: row.handle, agentGroupId },
         }
       }
       return {
@@ -538,7 +683,7 @@ export function createAccountLedger(
           service,
           slotHeaders,
           row,
-          secret,
+          secret: material.kind === 'key' ? material.key : material.accessToken,
           stripped,
           requested: { path: request.path, url },
         }),

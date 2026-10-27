@@ -342,7 +342,7 @@ test('completion seals tokens, grants covered requested services, injects the ac
       .map(({ service }) => service),
   ).toEqual(['gmail', 'google-calendar'])
   expect(upstream.ledger.candidates('work', 'gmail')).toHaveLength(1)
-  const credential = upstream.ledger.credentialFor(
+  const credential = await upstream.ledger.credentialFor(
     { agentGroupId: 'work' },
     {
       host: 'gmail.googleapis.com',

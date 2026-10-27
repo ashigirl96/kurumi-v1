@@ -24,7 +24,6 @@
     "apps/*/vite.config.ts",
     "packages/*/src",
     "packages/*/migrations",
-    "packages/*/scripts",
     "packages/*/drizzle.config.ts",
     "scripts",
     ".agents/skills/verify/**/*.ts"

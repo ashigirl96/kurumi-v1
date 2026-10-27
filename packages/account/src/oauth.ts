@@ -136,6 +136,7 @@ async function requestToken(
 ): Promise<TokenResponse> {
   const response = await fetchImpl(oauthOf(vendor).tokenUrl, {
     method: 'POST',
+    signal: AbortSignal.timeout(30_000),
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ grant_type: grant, ...form }),
   })

@@ -144,9 +144,15 @@ async function pinPublicUpstream(
 export function credentialInject(
   ledger: Pick<AccountLedger, 'credentialFor'>,
 ): ForwardDeps<CredentialPrincipal>['inject'] {
-  return ({ principal, host, port, method, path, headers, rawHeaders }) => {
+  return async ({ principal, host, port, method, path, headers, rawHeaders }) => {
     if (port !== 443) return { refusal: { code: 'port_not_allowed', host, port } }
-    const decision = ledger.credentialFor(principal, { host, method, path, headers, rawHeaders })
+    const decision = await ledger.credentialFor(principal, {
+      host,
+      method,
+      path,
+      headers,
+      rawHeaders,
+    })
     switch (decision.kind) {
       case 'inject':
         return {

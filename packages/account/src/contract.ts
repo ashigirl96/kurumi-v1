@@ -69,6 +69,7 @@ export const AccountViewSchema = z.object({
   kind: z.enum(['oauth', 'key']),
   services: z.array(ServiceIdSchema),
   autoGrant: z.boolean(),
+  status: z.enum(['active', 'needs_reauth']),
 })
 
 export const MyAccountSchema = z.object({

@@ -28,6 +28,7 @@ export const REFUSAL_STATUS = {
   account_ambiguous: 409,
   account_not_granted: 403,
   account_needs_reauth: 403,
+  account_refresh_failed: 503,
   selector_unreadable: 400,
   duplicate_slot: 400,
   method_not_allowed: 405,
@@ -54,7 +55,11 @@ export function nextStep(refusal: GatewayRefusal): string {
         ? `${refusal.named} is not granted ${refusal.service} for this agent group; put kurumi:<handle> for one of ${refusal.granted.join(', ')} where the token goes`
         : `${refusal.named} is not granted ${refusal.service} for this agent group, and no account is; ${askToAdd}`
     case 'account_needs_reauth':
-      return `ask the owner to add ${refusal.handle} again`
+      return refusal.handle.startsWith('google/')
+        ? `ask the owner to reconnect ${refusal.handle}: kurumi account connect --services ${refusal.service} --agent-group-id ${refusal.agentGroupId}`
+        : `ask the owner to add ${refusal.handle} again`
+    case 'account_refresh_failed':
+      return `could not refresh ${refusal.handle}; try again shortly`
     case 'selector_unreadable':
       return refusal.accepted.length > 0
         ? `kurumi cannot read the account named where the token goes; put one of ${refusal.accepted.join(', ')} there`

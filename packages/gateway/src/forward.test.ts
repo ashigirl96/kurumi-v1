@@ -459,7 +459,7 @@ test('a container selector follows a later default and keeps the OAuth beta', as
   expect(upstream.requests[0]?.headers['anthropic-beta']).toBe('oauth-2025-04-20')
 })
 
-test('credential injection refuses a non-443 port before choosing an account', () => {
+test('credential injection refuses a non-443 port before choosing an account', async () => {
   const inject = credentialInject({
     credentialFor: () => {
       throw new Error('no account should be chosen')
@@ -467,7 +467,7 @@ test('credential injection refuses a non-443 port before choosing an account', (
   })
 
   expect(
-    inject({
+    await inject({
       principal: { agentGroupId: 'g1' },
       host: 'api.anthropic.com',
       port: 8443,
@@ -1092,10 +1092,10 @@ test('a passthrough CONNECT to a non-public address is logged as refused', async
   ])
 })
 
-test('an injected request names the service of the injection the ledger chose', () => {
+test('an injected request names the service of the injection the ledger chose', async () => {
   const handle = accountHandle('anthropic', 'main')
   const inject = credentialInject({
-    credentialFor: (_principal, egress) => ({
+    credentialFor: async (_principal, egress) => ({
       kind: 'inject',
       injection: {
         service: 'anthropic-api',
@@ -1109,7 +1109,7 @@ test('an injected request names the service of the injection the ledger chose', 
     }),
   })
   expect(
-    inject({
+    await inject({
       principal: { agentGroupId: 'g1' },
       host: 'api.anthropic.com',
       port: 443,
