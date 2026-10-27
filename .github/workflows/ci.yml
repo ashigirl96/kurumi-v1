@@ -32,8 +32,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # PR の途中の commit で入れて後の commit で消した secret も、履歴には残るので全履歴を見る。
+      # 後の commit で消した secret も履歴に残るので、対象の全 commit を走査する。
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - run: docker run --rm -v "$PWD:/repo" --workdir /repo zricethezav/gitleaks:v8.30.1 git --redact --no-banner
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Scan event commits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          range="$HEAD_SHA"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            range="$BASE_SHA..$HEAD_SHA"
+          elif [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            if git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null ||
+               git fetch --no-tags origin "$BASE_SHA"; then
+              range="$BASE_SHA..$HEAD_SHA"
+            else
+              echo "::warning::Previous push commit unavailable; scanning all history reachable from the pushed head."
+            fi
+          fi
+          docker run --rm -v "$PWD:/repo" --workdir /repo zricethezav/gitleaks:v8.30.1 git --redact --no-banner --log-opts="-m $range"
