@@ -15,7 +15,6 @@ export type ContainerSpec = {
 export type ContainerDriver = {
   run(spec: ContainerSpec): Promise<{ ok: true } | { ok: false; reason: string }>
   kill(containerId: string, graceMs: number): Promise<void>
-  list(): Promise<{ containerId: string; running: boolean }[]>
   onExit(listener: (containerId: string, code: number) => void): () => void
 }
 
@@ -985,33 +984,6 @@ export function createDockerDriver(options: {
         watcher = undefined
         endWatch()
       }
-    },
-    list() {
-      if (shutdown.signal.aborted) return Promise.reject(error('driver stopped'))
-      return track(
-        (async () => {
-          const exit = await agentCommand([
-            'ps',
-            '-a',
-            '--filter',
-            `label=kurumi.install=${options.install}`,
-            '--filter',
-            'label=kurumi.role=agent',
-            '--format',
-            '{{.Label "kurumi.container"}}|{{.State}}',
-          ])
-          return requireSuccess(exit, 'list')
-            .trim()
-            .split('\n')
-            .filter(Boolean)
-            .map((line) => {
-              const [containerId, state, extra] = line.split('|')
-              if (!containerId || !state || extra !== undefined)
-                throw error('invalid container listing')
-              return { containerId, running: state === 'running' }
-            })
-        })(),
-      )
     },
     onExit(listener) {
       listeners.add(listener)

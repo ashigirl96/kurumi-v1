@@ -709,24 +709,6 @@ test('uncertain agent cleanup prevents replacement until exact absence is confir
   await driver.stop()
 })
 
-test('list scopes to this install and agent role and returns logical ids with honest state', async () => {
-  const { cli, driver } = setup()
-  cli.responses.push({
-    match: /^ps /,
-    result: { stdout: 'ctr-one|running\nctr-two|exited\nctr-three|created\n' },
-  })
-  expect(await driver.list()).toEqual([
-    { containerId: 'ctr-one', running: true },
-    { containerId: 'ctr-two', running: false },
-    { containerId: 'ctr-three', running: false },
-  ])
-  const args = (await call(cli, 0)).args
-  expect(args).toContain('label=kurumi.install=test-install')
-  expect(args).toContain('label=kurumi.role=agent')
-  expect(args).toContain('-a')
-  await driver.stop()
-})
-
 test('stop drains the wait process, removes containers and rejects subsequent starts', async () => {
   const { cli, driver } = setup()
   cli.responses.push({ match: /^(create|start) /, result: {} })
@@ -1045,7 +1027,7 @@ test('docker CLI children run in their own process group', async () => {
   process.env.PATH = `${dir}:${path}`
   try {
     const driver = createDockerDriver({ install: 'test-install', image })
-    expect(await driver.list()).toEqual([])
+    expect(await driver.sweep()).toEqual([])
     await driver.stop()
     const own = (await Bun.$`ps -o pgid= -p ${process.pid}`.text()).trim()
     expect(readFileSync(record, 'utf8').trim()).not.toBe(own)

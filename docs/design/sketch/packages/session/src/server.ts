@@ -125,7 +125,7 @@ export function createSessionLedger(deps: {
   //       delete container row  ⇒ token revoked for proxy and RPC at once
   //   driver.kill (after commit)
   //
-  // start(): adopt — driver.list() by label kurumi.container=<id>; rows without a docker container → reap;
+  // start(): adopt — driver inventory by label kurumi.container=<id>; rows without a docker container → reap;
   //   docker containers without a row → kill. Survivors keep their tokens (hash in DB) and reconnect.
   throw new Error('not implemented')
 }
