@@ -99,6 +99,7 @@ async function attempt(turn: Turn, continuation: string | null): Promise<string 
   turn.signal.addEventListener('abort', abort, { once: true })
   const messages = query({ prompt: turn.prompt, options: options(continuation, abortController) })
   let failed: SDKResultMessage | null = null
+  let background = false
   try {
     while (true) {
       let next: IteratorResult<SDKMessage, void>
@@ -121,7 +122,21 @@ async function attempt(turn: Turn, continuation: string | null): Promise<string 
         const text = textOf(message)
         if (text) await turn.reply(text)
       }
+      if (
+        message.type === 'system' &&
+        message.subtype === 'background_tasks_changed' &&
+        message.tasks.length > 0
+      )
+        background = true
       if (message.type === 'result' && message.is_error) failed = message
+      // Claude Code exits seconds after its last result, yet background work, even finished, wakes it for
+      // another turn, and a resumed process first closes a leftover notification without a model turn.
+      if (
+        message.type === 'result' &&
+        !background &&
+        !(message.subtype === 'success' && message.num_turns === 0 && message.result === '')
+      )
+        break
     }
   } catch (error) {
     abort()

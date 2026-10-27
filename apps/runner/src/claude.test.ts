@@ -80,6 +80,85 @@ test('a lost transcript starts a fresh conversation instead of failing every tur
   }
 })
 
+test('a line completes and the next one runs while Claude Code is still exiting', async () => {
+  const host = await startHost()
+  const answer = sdk.respond
+  sdk.respond = (call) =>
+    (async function* () {
+      yield* answer(call)
+      yield { type: 'system', subtype: 'init', session_id: 'ses-stale' }
+      await untilAborted(call)
+    })()
+  const controller = new AbortController()
+  const running = runRunner({ url: host.url, token: host.token, signal: controller.signal })
+  try {
+    expect(await host.reply()).toBe('model heard: hello')
+    await waitFor(allCompleted(host), 'the line to complete before Claude Code exits')
+    await host.send('next')
+    expect(await host.reply()).toBe('model heard: hello | next')
+  } finally {
+    controller.abort()
+    await running
+    await host.stop()
+  }
+})
+
+test('a turn that started background work posts the follow-up reply before the next line runs', async () => {
+  const host = await startHost()
+  sdk.respond = (call) =>
+    (async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'ses-bg' }
+      if (call.prompt === 'hello') {
+        yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'bg1' }] }
+        yield sdk.assistant('started')
+        yield sdk.success('ses-bg')
+        yield { type: 'system', subtype: 'task_notification', task_id: 'bg1' }
+        yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] }
+        yield sdk.assistant('the background command finished')
+      } else yield sdk.assistant(`answer to ${call.prompt}`)
+      yield sdk.success('ses-bg')
+    })()
+  const controller = new AbortController()
+  const running = runRunner({ url: host.url, token: host.token, signal: controller.signal })
+  try {
+    expect(await host.reply()).toBe('started')
+    await host.send('next')
+    expect(await host.reply()).toBe('the background command finished')
+    expect(await host.reply()).toBe('answer to next')
+  } finally {
+    controller.abort()
+    await running
+    await host.stop()
+  }
+})
+
+test('a resumed turn that first closes a leftover notification still posts its reply', async () => {
+  const host = await startHost()
+  sdk.respond = (call) =>
+    (async function* () {
+      if (call.prompt === 'next') {
+        yield { type: 'system', subtype: 'task_notification', task_id: 'bg1' }
+        yield { ...sdk.success('ses-left'), num_turns: 0 }
+      }
+      yield { type: 'system', subtype: 'init', session_id: 'ses-left' }
+      yield sdk.assistant(`answer to ${call.prompt}`)
+      yield sdk.success('ses-left')
+    })()
+  const controller = new AbortController()
+  const running = runRunner({ url: host.url, token: host.token, signal: controller.signal })
+  try {
+    expect(await host.reply()).toBe('answer to hello')
+    await host.send('next')
+    await host.send('last')
+    expect(await host.reply()).toBe('answer to next')
+    expect(await host.reply()).toBe('answer to last')
+  } finally {
+    controller.abort()
+    await running
+    await host.stop()
+  }
+})
+
 test('runner heartbeats while a turn runs and stops when it ends', async () => {
   const host = await startHost()
   const release = Promise.withResolvers<void>()
