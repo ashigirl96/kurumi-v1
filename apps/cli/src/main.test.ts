@@ -209,6 +209,18 @@ describe('a contract field marked stdin', () => {
     expect(stdout).not.toContain('--secret')
   })
 
+  test('is read from stdin when the command name holds an acronym', async () => {
+    const contract = { putDB: put(z.object({ secret: secret.meta({ stdin: true }) })) }
+
+    expect(await run(['put-db', 'n'], piped('s3cret'), contract)).toBe(0)
+    expect(calls).toEqual([{ path: ['putDB'], input: ['n', { secret: 's3cret' }] }])
+
+    calls = []
+    expect(await run(['put-db', 'n', '--secret', 'ARGV'], piped(''), contract)).toBe(1)
+    expect(stderr).toContain("unknown option '--secret'")
+    expect(calls).toEqual([])
+  })
+
   test('is read from stdin beside a recursive schema', async () => {
     type Tree = { children: Tree[] }
     const tree: z.ZodType<Tree> = z.lazy(() => z.object({ children: z.array(tree) }))
