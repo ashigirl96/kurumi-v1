@@ -578,3 +578,47 @@ test('an agent that posts the notice id first cannot keep the notice from the bo
   expect(shown).toEqual({ kind: 'reply', outboundId: expect.any(String), text })
   await stream.return()
 })
+
+test('an auth revision change replays claimed and queued inbound and leaves other groups running', async () => {
+  const driver = createFakeDriver()
+  const configured = runtime(driver)
+  let changed = false
+  configured.revision = (group) => (group === agentId && changed ? 'api-key' : 'oauth-token')
+  configured.egress.contribution = ({ agentGroupId: group }) => ({
+    env: {
+      [group === agentId && changed ? 'ANTHROPIC_API_KEY' : 'CLAUDE_CODE_OAUTH_TOKEN']: 'selector',
+    },
+    mounts: [],
+    network: { kind: 'default' },
+  })
+  ledger = createSessionLedger({ db, agentLedger: agents, chatLedger: chat, runtime: configured })
+  await ledger.start()
+  const first = await ledger.routeInbound(event('claimed'))
+  const old = ledger.authenticate(driver.runs[0]?.env.KURUMI_TOKEN ?? '')
+  if (!old) throw new Error('missing first container')
+  await ledger.channel.pull(old, { waitMs: 0 })
+  const queued = await ledger.routeInbound(event('queued'))
+  const other = agents.create({ name: 'other' }).id
+  await ledger.routeInbound(event('other group', other))
+  const otherToken = driver.runs[1]?.env.KURUMI_TOKEN ?? ''
+  const otherPrincipal = ledger.authenticate(otherToken)
+  changed = true
+  const newest = await ledger.routeInbound(event('after switch'))
+  const deadline = performance.now() + 1500
+  while (driver.runs.length < 3 && performance.now() < deadline) await Bun.sleep(10)
+  expect(driver.runs).toHaveLength(3)
+  const token = driver.runs[2]?.env.KURUMI_TOKEN ?? ''
+  const current = ledger.authenticate(token)
+  if (!current) throw new Error('missing replacement container')
+  expect(driver.runs[2]?.env).toHaveProperty('ANTHROPIC_API_KEY')
+  expect(driver.runs[2]?.env).not.toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN')
+  expect(ledger.authenticate(driver.runs[0]?.env.KURUMI_TOKEN ?? '')).toBeNull()
+  expect(ledger.authenticate(otherToken)).toEqual(otherPrincipal)
+  for (const receipt of [first, queued, newest]) {
+    const { messages } = await ledger.channel.pull(current, { waitMs: 0 })
+    expect(messages.map((message) => message.id)).toEqual([receipt.inboundId])
+    await ledger.channel.complete(current, { ids: [receipt.inboundId] })
+  }
+  await ledger.routeInbound(event('unchanged auth mode'))
+  expect(driver.runs).toHaveLength(3)
+})

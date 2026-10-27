@@ -228,18 +228,23 @@ export async function startHost(config: HostConfig) {
       ...egress,
       env: { ...egress.env, ...proxyEnv({ port: config.agentPort.port, sessionToken }) },
     })
+    const baseRevision = containerRevision({
+      image: environment.KURUMI_AGENT_IMAGE,
+      contribution: revisionedEgress,
+      runner: readRunner(runner),
+    })
+    const accountLedger = createAccountLedger({ db, vaultKey })
+    const revision = (agentGroupId: string) =>
+      createHash('sha256')
+        .update(JSON.stringify([baseRevision, accountLedger.containerEnv(agentGroupId)]))
+        .digest('hex')
+        .slice(0, 16)
     const docker = createDockerDriver({
       install,
-      revision: containerRevision({
-        image: environment.KURUMI_AGENT_IMAGE,
-        contribution: revisionedEgress,
-        runner: readRunner(runner),
-      }),
       image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
       network: environment.KURUMI_DOCKER_NETWORK,
     })
     driver = docker
-    const accountLedger = createAccountLedger({ db, vaultKey })
     const agentLedger = createAgentLedger({
       db,
       home: config.home,
@@ -268,6 +273,7 @@ export async function startHost(config: HostConfig) {
       runtime: {
         driver: docker,
         image: environment.KURUMI_AGENT_IMAGE,
+        revision,
         egress: {
           admission() {
             const state = admission?.status().state

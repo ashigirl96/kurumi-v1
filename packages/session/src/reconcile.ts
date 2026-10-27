@@ -5,6 +5,7 @@ export type ContainerRow = {
   id: string
   name: string
   sessionId: string
+  revision?: string
   status: 'starting' | 'running' | 'stopping'
   sessionActive: boolean
   liveness: LivenessView | null
@@ -201,7 +202,7 @@ export function createSupervisor(deps: {
       case 'adopt': {
         const { row, container } = decision
         deps.accept(row)
-        const result = inventory.adopt(container)
+        const result = inventory.adopt(container, row.revision)
         if (!result.ok) {
           deps.reap(row.id, `adoption failed: ${result.reason}`, row.name)
           return 'reap'

@@ -7,6 +7,7 @@ export type ContainerSpec = {
   sessionId: string
   containerId: string
   image: string
+  revision?: string
   env: Record<string, string>
   mounts: { hostPath: string; containerPath: string; readonly: boolean }[]
   network: { kind: 'default' } | { kind: 'lockdown'; dockerNetwork: string }
@@ -34,7 +35,7 @@ export type InventoryChange =
   | { kind: 'event' }
 export type ContainerInventory = {
   sweep(): Promise<ListedContainer[]>
-  adopt(container: ListedContainer): RunResult
+  adopt(container: ListedContainer, revision?: string): RunResult
   remove(container: ListedContainer): Promise<void>
   nameOf(containerId: string): string
   watch(listener: (change: InventoryChange) => void): () => void
@@ -543,6 +544,7 @@ export function createDockerDriver(options: {
     try {
       if (agent.cancelled || shutdown.signal.aborted)
         return { ok: false, reason: error('run cancelled').message }
+      const agentRevision = spec.revision ?? revision
       const exit = await agentCommand(
         [
           'create',
@@ -556,7 +558,7 @@ export function createDockerDriver(options: {
           'kurumi.role=agent',
           '--label',
           `kurumi.container=${spec.containerId}`,
-          ...(revision === null ? [] : ['--label', `kurumi.revision=${revision}`]),
+          ...(agentRevision === null ? [] : ['--label', `kurumi.revision=${agentRevision}`]),
           '--init',
           '--cap-drop=ALL',
           '--security-opt',
@@ -946,12 +948,12 @@ export function createDockerDriver(options: {
         })(),
       )
     },
-    adopt(container) {
+    adopt(container, expectedRevision) {
       const { name, sessionId, containerId } = container
       if (shutdown.signal.aborted) return { ok: false, reason: error('driver stopped').message }
       if (sessionId === null || containerId === null || name !== agentName(containerId))
         return { ok: false, reason: error('container name does not match its labels').message }
-      if (container.revision !== revision)
+      if (container.revision !== (expectedRevision ?? revision))
         return { ok: false, reason: error('container was created for another runtime').message }
       if (agents.has(sessionId))
         return { ok: false, reason: error('session already has a container').message }

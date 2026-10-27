@@ -54,6 +54,7 @@ export type Admission =
     }
 export type SessionRuntime = {
   image: string
+  revision?: (agentGroupId: string) => string
   egress: {
     admission(): Admission
     contribution(input: { agentGroupId: string; sessionToken: string }): ContainerEgress
@@ -168,6 +169,7 @@ export function createSessionLedger({
   log,
   runtimeLog,
 }: SessionDeps): SessionLedger {
+  const revisions = new Map<string, string>()
   const spawning = new Map<string, Promise<void>>()
   const cleanups = new Map<string, Promise<void>>()
   const deliveries = new Map<string, Promise<void>>()
@@ -209,6 +211,7 @@ export function createSessionLedger({
   }
 
   function retire(id: string) {
+    revisions.delete(id)
     liveness.end(id)
     const retired = transaction(db, (tx) => {
       const row = tx.select().from(container).where(eq(container.id, id)).get()
@@ -282,7 +285,17 @@ export function createSessionLedger({
     if (!runtime || stopped) return
     const rows = db.select().from(container).where(eq(container.sessionId, id)).all()
     for (const row of rows) {
-      if (row.status !== 'stopping') return
+      if (row.status !== 'stopping') {
+        const previous = revisions.get(row.id)
+        if (previous === undefined) return
+        const current = db.select().from(session).where(eq(session.id, id)).get()
+        if (current && previous === runtime.revision?.(current.agentGroupId)) return
+        reap(
+          row.id,
+          'container configuration changed',
+          supervision?.inventory.nameOf(row.id) ?? null,
+        )
+      }
       try {
         await cleanup(row.id)
       } catch {
@@ -331,10 +344,13 @@ export function createSessionLedger({
     liveness.begin(containerId)
     try {
       const egress = runtime.egress.contribution({ agentGroupId: agent.id, sessionToken: token })
+      const revision = runtime.revision?.(agent.id)
+      if (revision !== undefined) revisions.set(containerId, revision)
       const result = await runtime.driver.run({
         containerId,
         sessionId: id,
         image: runtime.image,
+        revision,
         env: { ...egress.env, KURUMI_TOKEN: token, KURUMI_SESSION_ID: id },
         mounts: [
           { hostPath: agent.folder, containerPath: '/workspace/group', readonly: false },
@@ -385,6 +401,7 @@ export function createSessionLedger({
         sessionId: container.sessionId,
         status: container.status,
         sessionStatus: session.status,
+        agentGroupId: session.agentGroupId,
       })
       .from(container)
       .innerJoin(session, eq(session.id, container.sessionId))
@@ -393,6 +410,7 @@ export function createSessionLedger({
         id: row.id,
         name: nameOf(row.id),
         sessionId: row.sessionId,
+        revision: runtime?.revision?.(row.agentGroupId),
         status: row.status,
         sessionActive: row.sessionStatus === 'active',
         liveness: liveness.view(row.id),
@@ -405,6 +423,7 @@ export function createSessionLedger({
       ...supervision,
       rows: () => containerRows((id) => supervision.inventory.nameOf(id)),
       accept(row) {
+        if (row.revision !== undefined) revisions.set(row.id, row.revision)
         const deadline = transaction(db, (tx) => {
           tx.update(container)
             .set({ status: 'running' })
