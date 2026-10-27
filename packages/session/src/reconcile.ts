@@ -1,4 +1,5 @@
-import type { ContainerInventory, InventoryChange, ListedContainer } from './driver/docker.ts'
+import type { ContainerInventory, InventoryChange } from './driver/docker.ts'
+import type { ListedContainer } from './driver/listing.ts'
 
 export type LivenessView = { awakeSilentMs: number; toolPending: boolean }
 export type ContainerRow = {

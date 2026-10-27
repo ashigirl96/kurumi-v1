@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { createDockerDriver } from '../server.ts'
-import type { Cli } from './docker.ts'
+import type { Cli } from './cli.ts'
 import { FakeCli } from './fake-cli.ts'
 
 const image = 'kurumi-agent:test'

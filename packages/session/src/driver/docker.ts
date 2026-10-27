@@ -1,7 +1,16 @@
-import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { promisify } from 'node:util'
+
+import {
+  nativeCli,
+  endedBySignal,
+  outputLimit,
+  diagnosticLimit,
+  type Cli,
+  type CliProcess,
+  type CliResult,
+} from './cli.ts'
+import { endForeignWaits, listingFormat, parseListing, type ListedContainer } from './listing.ts'
 
 export type ContainerSpec = {
   sessionId: string
@@ -18,15 +27,6 @@ export type ContainerDriver = {
   onExit(listener: (containerId: string, code: number) => void): () => void
 }
 
-export type ListedContainer = {
-  dockerId: string
-  name: string
-  role: 'agent' | 'probe' | null
-  sessionId: string | null
-  containerId: string | null
-  revision: string | null
-  state: string
-}
 export type InventoryChange =
   | { kind: 'subscribed'; attempt: number }
   | { kind: 'lost'; code: number | null; retryMs: number }
@@ -65,132 +65,8 @@ type AgentOperation = AgentContainer & {
   watch: Promise<void> | undefined
 }
 
-export type CliResult = { code: number | null; stdout: string; stderr: string }
-export type CliProcess = { result: Promise<CliResult>; kill(): void }
-export type Cli = {
-  start(args: readonly string[], options?: { onLine?: (line: string) => void }): CliProcess
-}
-
-const outputLimit = 64 * 1024
-const diagnosticLimit = 16 * 1024
-
 class CleanupError extends Error {
   readonly cleanupFailed = true
-}
-
-const nativeCli: Cli = {
-  start(args, options = {}) {
-    // A signal to the host's process group must not end a create the daemon would still finish.
-    const child = spawn('docker', [...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    const stdout: Buffer[] = []
-    const stderr: Buffer[] = []
-    let stdoutBytes = 0
-    let stderrBytes = 0
-    let failure: Error | undefined
-    const overflow = () => {
-      failure ??= new Error(`stdout exceeds ${outputLimit} bytes`)
-      child.kill('SIGKILL')
-    }
-    const { onLine } = options
-    const result = new Promise<CliResult>((resolve, reject) => {
-      if (onLine) {
-        let partial = ''
-        child.stdout.setEncoding('utf8')
-        child.stdout.on('data', (chunk: string) => {
-          const lines = (partial + chunk).split('\n')
-          partial = lines.pop() ?? ''
-          if (partial.length > outputLimit) overflow()
-          for (const line of lines) onLine(line)
-        })
-      } else {
-        child.stdout.on('data', (chunk: Buffer) => {
-          if (stdoutBytes + chunk.length > outputLimit) {
-            overflow()
-            return
-          }
-          stdoutBytes += chunk.length
-          stdout.push(chunk)
-        })
-      }
-      child.stderr.on('data', (chunk: Buffer) => {
-        const remaining = diagnosticLimit - stderrBytes
-        if (remaining <= 0) return
-        const captured = chunk.subarray(0, remaining)
-        stderrBytes += captured.length
-        stderr.push(captured)
-      })
-      child.once('error', (error) => {
-        failure = error
-      })
-      child.once('close', (code) => {
-        if (failure) reject(failure)
-        else
-          resolve({
-            code,
-            stdout: Buffer.concat(stdout).toString(),
-            stderr: Buffer.concat(stderr).toString(),
-          })
-      })
-    })
-    return {
-      result,
-      kill: () => {
-        child.kill('SIGKILL')
-      },
-    }
-  },
-}
-
-function endedBySignal(exit: CliResult): boolean {
-  // The docker CLI is a Go program, and Go's runtime exits 2 on SIGQUIT and SIGABRT.
-  return exit.code === null || exit.code > 128 || exit.code === 2
-}
-
-async function endForeignWaits(names: ReadonlySet<string>): Promise<void> {
-  const { stdout } = await promisify(execFile)('ps', ['-e', '-o', 'pid=,ppid=,command='], {
-    maxBuffer: 8 * 1024 * 1024,
-  }).catch(() => ({ stdout: '' }))
-  for (const line of stdout.split('\n')) {
-    const [, pid, ppid, command = ''] = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line) ?? []
-    const waited = /(?:^|[\s/])docker wait (\S+)\s*$/.exec(command)?.[1]
-    if (!waited || !names.has(waited) || Number(ppid) === process.pid) continue
-    try {
-      process.kill(Number(pid), 'SIGTERM')
-    } catch {}
-  }
-}
-
-// Each field goes through json so that a label value cannot end its line, and .Labels is left out
-// because it joins labels with commas that a value can also contain.
-const listingFormat =
-  '[{{json .ID}},{{json .Names}},{{json .State}},{{json (.Label "kurumi.role")}},{{json (.Label "kurumi.session")}},{{json (.Label "kurumi.container")}},{{json (.Label "kurumi.revision")}}]'
-
-function parseListing(line: string): ListedContainer | null {
-  let fields: unknown
-  try {
-    fields = JSON.parse(line)
-  } catch {
-    return null
-  }
-  if (
-    !Array.isArray(fields) ||
-    fields.length !== 7 ||
-    !fields.every((field): field is string => typeof field === 'string')
-  )
-    return null
-  const [dockerId = '', names = '', state = '', role, sessionId, containerId, revision] = fields
-  // With --no-trunc, .Names also lists the "<linker>/<alias>" names of legacy links.
-  const [name, ...others] = names.split(',').filter((entry) => !entry.includes('/'))
-  if (!/^[0-9a-f]{64}$/.test(dockerId) || !name || others.length > 0) return null
-  return {
-    dockerId,
-    name,
-    role: role === 'agent' || role === 'probe' ? role : null,
-    sessionId: sessionId || null,
-    containerId: containerId || null,
-    revision: revision || null,
-    state,
-  }
 }
 
 function fetchProgram(timeoutMs: number): string {

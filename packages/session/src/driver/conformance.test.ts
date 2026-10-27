@@ -26,15 +26,10 @@ import {
   type RuntimeLog,
 } from '../server.ts'
 import { createFakeDriver } from '../testing.ts'
-import {
-  createDockerDriver,
-  type Cli,
-  type CliResult,
-  type ContainerSpec,
-  type InventoryChange,
-  type ListedContainer,
-} from './docker.ts'
+import type { Cli, CliResult } from './cli.ts'
+import { createDockerDriver, type ContainerSpec, type InventoryChange } from './docker.ts'
 import { FakeCli, type FakeProcess } from './fake-cli.ts'
+import type { ListedContainer } from './listing.ts'
 
 let sqlite: Database
 let db: Db
