@@ -345,7 +345,16 @@ test('the final lint configuration rejects voided Promises and the three sync-tr
       )
     }
     const result = Bun.spawn(
-      [join(repo, 'node_modules/.bin/oxlint'), '-f', 'json', 'probe.ts', ...Object.keys(rejected)],
+      [
+        process.execPath,
+        'run',
+        '--bun',
+        'oxlint',
+        '-f',
+        'json',
+        'probe.ts',
+        ...Object.keys(rejected),
+      ],
       {
         cwd: dir,
         env: { ...process.env, PATH: '' },
@@ -411,6 +420,7 @@ test('TypeScript rejects Promise returns through inline, imported, block, functi
     }
     const result = Bun.spawn(
       [
+        process.execPath,
         join(repo, 'node_modules/.bin/tsc'),
         '--noEmit',
         '--strict',

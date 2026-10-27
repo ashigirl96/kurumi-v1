@@ -32,7 +32,7 @@ export async function lintProbes(
     symlinkSync(target, join(dir, path))
   }
   const roots = [...new Set(Object.keys(files).map((path) => path.split('/')[0]!))]
-  const oxlint = Bun.spawn([join(repo, 'node_modules/.bin/oxlint'), '-f', 'json', ...roots], {
+  const oxlint = Bun.spawn([process.execPath, 'run', '--bun', 'oxlint', '-f', 'json', ...roots], {
     cwd: dir,
     env: { ...process.env, PATH: '' },
     stdout: 'pipe',
