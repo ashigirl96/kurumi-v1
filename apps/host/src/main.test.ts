@@ -355,7 +355,7 @@ test('a damaged account row under the right vault.key stops the host, names the 
   const db = join(home, 'kurumi.db')
   const quotedDb = `'${db.replaceAll("'", `'\\''`)}'`
   expect(stderr).toContain(
-    `${join(home, 'vault.key')} opens the gateway CA, so it is the right key, but it cannot open 1 account in ${db}, so the row is damaged: acc-a. With the host stopped, run sqlite3 ${quotedDb} 'PRAGMA foreign_keys = ON; DELETE FROM account WHERE id IN ('\\''acc-a'\\'');' and start the host, and add the key again.`,
+    `${join(home, 'vault.key')} opens the gateway CA but cannot open 1 account in ${db}: acc-a. If this row came from a backup made with another vault.key, put that key back and start the host again. Otherwise the row is damaged: with the host stopped, run sqlite3 ${quotedDb} 'PRAGMA foreign_keys = ON; DELETE FROM account WHERE id IN ('\\''acc-a'\\'');' and start the host. The command also removes the grants and defaults of this row: add the key again, then set those again with kurumi account grant and kurumi account set-default.`,
   )
   expect(stderr).not.toContain('does not match')
   const printed = / run (sqlite3 .+;') and start/.exec(stderr)?.[1]

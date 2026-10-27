@@ -145,6 +145,6 @@ test('rows the key cannot open are named as damaged when the key opens the gatew
   expect(() =>
     loadVaultKey(home, { count: 2, unopenedBy: () => ['acc-a', "acc-'b"] }, () => true),
   ).toThrow(
-    `${path} opens the gateway CA, so it is the right key, but it cannot open 2 accounts in ${db}, so the rows are damaged: acc-a, acc-'b. With the host stopped, run sqlite3 '${db}' 'PRAGMA foreign_keys = ON; DELETE FROM account WHERE id IN ('\\''acc-a'\\'', '\\''acc-'\\'''\\''b'\\'');' and start the host, and add the key again.`,
+    `${path} opens the gateway CA but cannot open 2 accounts in ${db}: acc-a, acc-'b. If these rows came from a backup made with another vault.key, put that key back and start the host again. Otherwise the rows are damaged: with the host stopped, run sqlite3 '${db}' 'PRAGMA foreign_keys = ON; DELETE FROM account WHERE id IN ('\\''acc-a'\\'', '\\''acc-'\\'''\\''b'\\'');' and start the host. The command also removes the grants and defaults of these rows: add the keys again, then set those again with kurumi account grant and kurumi account set-default.`,
   )
 })
