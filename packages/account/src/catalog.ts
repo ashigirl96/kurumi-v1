@@ -13,6 +13,8 @@ export type ServiceSpec = {
   displayName: string
   hosts: readonly HostRule[]
   slot: CredentialSlot
+  /** The gateway strips these upstream credential headers and reads a selector only when the value names one. */
+  otherCredentialHeaders?: readonly string[]
   scopes: readonly string[]
   containerEnv?: (selector: string) => Readonly<Record<string, string>>
 }
@@ -141,6 +143,7 @@ export const catalog = {
         hosts: [{ host: 'api.anthropic.com' }],
         scopes: [],
         slot: { kind: 'bearer' },
+        otherCredentialHeaders: ['x-api-key'],
         containerEnv: (selector: string) => ({ CLAUDE_CODE_OAUTH_TOKEN: selector }),
       },
     },

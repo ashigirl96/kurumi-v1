@@ -102,6 +102,7 @@ describe('whatever a slot holds', () => {
         const { selector } = readSelector(
           defaultSelectorShape,
           slot,
+          [],
           request({ [headerOf(slot)]: place(text) }),
         )
         for (const candidates of [several, single]) {

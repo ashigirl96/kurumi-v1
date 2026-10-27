@@ -138,7 +138,7 @@ agent がアカウントを指す名前は Account Handle `<vendor>/<label>`（�
 1 つの外向き request は次の順に処理される（`packages/account/src/select.ts`）。
 
 1. gateway が host と path から `(vendor, service)` を 1 つに決める（`serviceFor`。同じ host を共有する service は必ず pathPrefix で分かれていることを catalog を走査する test で保証する）。
-2. `readSelector` が、その service の credential slot（Bearer header、指定した header、basic の password、query param）から vendor の `selectorShape` で handle を読み、slot を空にする。名指しの手段はこれ 1 つで、header による選択は持たない。SDK や curl が token を設定できれば、custom header を付けられない client でもアカウントを選べる。SDK が token の形を検証する場合は `selectorShape` がその形に合わせる（fable から。Anthropic で要るかは unit 4 で確かめる）。
+2. `readSelector` が、その service の credential slot（Bearer header、指定した header、basic の password、query param）から vendor の `selectorShape` で handle を読み、slot を空にする。service は、upstream が credential を読む他の header（Anthropic の `x-api-key`）も指定でき、gateway はそれらを取り除き、selector を名指ししている値だけを読む。名指しの手段はこれ 1 つで、header による選択は持たない。SDK や curl が token を設定できれば、custom header を付けられない client でもアカウントを選べる。SDK が token の形を検証する場合は `selectorShape` がその形に合わせる（fable から。Anthropic で要るかは unit 4 で確かめる）。
 3. `credentialFor(principal, target)` が `account_grant ⋈ account WHERE agent_group_id = principal.agentGroupId AND service = ?` を毎回引き（同 process、index 付き、cache なし）、純粋関数 `selectAccount` に渡す。名指しがあればそれ、無ければ 1 件ならそれ、既定があればそれ、どれでもなければ `account_ambiguous`。名指しが候補に無ければ `account_not_granted`、候補が 0 件なら `account_not_connected`。
 4. 選ばれたものだけを復号する。期限切れなら account ごとの single-flight（`Map<accountId, Promise>`）で refresh し、network は transaction の外、書き戻しは行を読み直す同期 transaction で行う。Google の 1 行を複数の group と service が共有しても、refresh は 1 本にまとまる（why Risk 4）。
 

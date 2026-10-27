@@ -131,9 +131,15 @@ export type AccountLedger = {
 type GrantRow = GrantedCandidate & Pick<typeof account.$inferSelect, 'material'>
 
 function slotHeadersOf(service: ServiceId): string[] {
-  const { slot } = serviceSpec(service)
+  const { slot, otherCredentialHeaders = [] } = serviceSpec(service)
   return [
-    ...new Set(['authorization', ...(slot.kind === 'header' ? [slot.header.toLowerCase()] : [])]),
+    ...new Set(
+      [
+        'authorization',
+        ...(slot.kind === 'header' ? [slot.header] : []),
+        ...otherCredentialHeaders,
+      ].map((header) => header.toLowerCase()),
+    ),
   ]
 }
 
@@ -517,6 +523,7 @@ export function createAccountLedger(deps: { db: Db; vaultKey: Uint8Array }): Acc
       const { selector, stripped } = readSelector(
         selectorShapeOf(vendor),
         serviceSpec(service).slot,
+        serviceSpec(service).otherCredentialHeaders ?? [],
         { headers: withSlotNames(request.headers, slotHeaders), url },
       )
       const rows = grantRows(agentGroupId, service)

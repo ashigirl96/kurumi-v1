@@ -833,6 +833,39 @@ describe('the slot an Anthropic account is written to', () => {
     })
   })
 
+  test('x-api-key beside X_Api_Key is a duplicate slot', () => {
+    addKey({ autoGrant: true })
+
+    const request = anthropicApi([
+      ['x-api-key', anthropicGroupSelector],
+      ['X_Api_Key', 'sk-ant-other'],
+    ])
+
+    expect(decide('g1', request)).toEqual({
+      kind: 'refuse',
+      refusal: { code: 'duplicate_slot', service: 'anthropic-api', header: 'x-api-key' },
+    })
+  })
+
+  test('a selector in Authorization beside one in x-api-key is refused', () => {
+    addKey({ autoGrant: true })
+
+    const request = anthropicApi([
+      ['Authorization', 'Bearer kurumi:anthropic/main'],
+      ['x-api-key', anthropicGroupSelector],
+    ])
+
+    expect(decide('g1', request)).toEqual({
+      kind: 'refuse',
+      refusal: {
+        code: 'selector_unreadable',
+        service: 'anthropic-api',
+        written: `kurumi:anthropic/main | ${anthropicGroupSelector}`,
+        accepted: ['sk-ant-kurumi-YW50aHJvcGljL21haW4', 'kurumi:anthropic/main'],
+      },
+    })
+  })
+
   test.each([
     ['the Agent SDK with the OAuth beta', [['anthropic-beta', sdkOauthBetas]], sdkOauthBetas],
     [

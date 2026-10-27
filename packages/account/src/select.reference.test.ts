@@ -220,7 +220,7 @@ type Probe = ReturnType<typeof requestOf>
 type Outcome = { selector: string; decision: string; headers: [string, string][]; url: string }
 
 function observed({ vendor, service, slot }: Slot, c: Case, req: Probe): Outcome {
-  const { selector, stripped } = readSelector(selectorShapeOf(vendor), slot, req)
+  const { selector, stripped } = readSelector(selectorShapeOf(vendor), slot, [], req)
   const selection = selectAccount(service, c.candidates, selector)
   return {
     selector:

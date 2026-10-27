@@ -319,22 +319,31 @@ async function exchangeRaw(socket: TLSSocket, bytes: string) {
 const mentionsKurumi = (values: readonly string[]) =>
   values.filter((value) => /kurumi/i.test(value))
 
-test('an Anthropic account reaches the upstream as a bearer and is named on the response', async () => {
-  const { upstream, tunnel, addKey } = await setupCredentials()
-  addKey('main', secrets.main)
+test.each([
+  ['Authorization', { authorization: `Bearer ${groupSelector}` }],
+  ['x-api-key', { 'x-api-key': groupSelector }],
+] as const)(
+  'an Anthropic account named in %s reaches the upstream as a bearer and is named on the response',
+  async (_header, headers) => {
+    const { upstream, tunnel, addKey } = await setupCredentials()
+    addKey('main', secrets.main)
 
-  const response = await sendTestRequest(tunnel, {
-    path: '/v1/models',
-    headers: { authorization: `Bearer ${groupSelector}` },
-  })
+    const response = await sendTestRequest(tunnel, {
+      path: '/v1/models',
+      headers,
+    })
 
-  expect(response.status).toBe(200)
-  expect(response.headers['x-kurumi-account']).toBe('anthropic/main')
-  expect(upstream.requests).toHaveLength(1)
-  expect(upstream.requests[0]?.headers.authorization).toBe(`Bearer ${secrets.main}`)
-  expect(upstream.requests[0]?.headers['anthropic-beta']).toBe('oauth-2025-04-20')
-  expect(mentionsKurumi(upstream.requests[0]?.rawHeaders ?? [])).toEqual([])
-})
+    expect(response.status).toBe(200)
+    expect(response.headers['x-kurumi-account']).toBe('anthropic/main')
+    expect(upstream.requests).toHaveLength(1)
+    expect(upstream.requests[0]?.headers.authorization).toBe(`Bearer ${secrets.main}`)
+    expect(upstream.requests[0]?.headers['anthropic-beta']).toBe('oauth-2025-04-20')
+    expect(slotLines(upstream.requests[0]?.rawHeaders ?? [])).toEqual([
+      ['authorization', `Bearer ${secrets.main}`],
+    ])
+    expect(mentionsKurumi(upstream.requests[0]?.rawHeaders ?? [])).toEqual([])
+  },
+)
 
 test('the account the upstream names is replaced by the one the gateway chose', async () => {
   const { upstream, tunnel, addKey } = await setupCredentials()
@@ -373,23 +382,32 @@ test.each(['x-kurumi-account', 'X_Kurumi_Account'])(
   },
 )
 
-test('the container own Authorization is replaced by the account bearer', async () => {
+const slotLines = (rawHeaders: readonly string[]) =>
+  rawHeaders.flatMap((name, index) =>
+    index % 2 === 0 &&
+    ['authorization', 'x-api-key'].includes(name.toLowerCase().replaceAll('_', '-'))
+      ? [[name, rawHeaders[index + 1]]]
+      : [],
+  )
+
+test.each([
+  ['Authorization', 'Bearer sk-ant-oat01-client-own'],
+  ['x-api-key', 'sk-ant-api03-client-own'],
+  ['x_api_key', 'sk-ant-api03-client-own'],
+])('the container own %s is replaced by the account bearer', async (header, value) => {
   const { upstream, tunnel, addKey } = await setupCredentials()
   addKey('main', secrets.main)
 
   const response = await sendTestRequest(tunnel, {
     path: '/v1/models',
-    headers: { authorization: 'Bearer sk-ant-oat01-client-own' },
+    headers: { [header]: value },
   })
 
   expect(response.status).toBe(200)
-  const rawHeaders = upstream.requests[0]?.rawHeaders ?? []
-  const credentials = rawHeaders.flatMap((name, index) =>
-    index % 2 === 0 && name.toLowerCase() === 'authorization'
-      ? [[name, rawHeaders[index + 1]]]
-      : [],
-  )
-  expect(credentials).toEqual([['authorization', `Bearer ${secrets.main}`]])
+  expect(upstream.requests).toHaveLength(1)
+  expect(slotLines(upstream.requests[0]?.rawHeaders ?? [])).toEqual([
+    ['authorization', `Bearer ${secrets.main}`],
+  ])
 })
 
 test('a container spawned before its account is added reaches the upstream as an OAuth request', async () => {
