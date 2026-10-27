@@ -371,26 +371,35 @@ const pathOf = (at: readonly Step[]): string =>
 
 const SAME_VALUE_DEF_KEYS = new Set(['innerType', 'in', 'out', 'options', 'left', 'right'])
 
-function stdinMarkers(
-  schema: z.core.$ZodType,
-  memo = new Map<z.core.$ZodType, Marker[]>(),
-): Marker[] {
-  const cached = memo.get(schema)
-  if (cached) return cached
-  memo.set(schema, [])
-  const here: Marker[] = z.globalRegistry.get(schema)?.stdin === true ? [{ at: [], schema }] : []
-  const markers = [
-    ...new Set([
-      ...here,
-      ...childSchemas(schema).flatMap(([step, child]) =>
-        stdinMarkers(child, memo).map((marker) =>
-          step ? { at: [step, ...marker.at], schema: marker.schema } : marker,
+function stdinMarkers(root: z.core.$ZodType): Marker[] {
+  const memo = new Map<z.core.$ZodType, Marker[]>()
+  const open = new Map<z.core.$ZodType, number>()
+  // `low` is the shallowest node still on the walk that this node's subtree reached back to.
+  const walk = (schema: z.core.$ZodType): { markers: Marker[]; low: number } => {
+    const cached = memo.get(schema)
+    if (cached) return { markers: cached, low: Infinity }
+    const depth = open.get(schema)
+    if (depth !== undefined) return { markers: [], low: depth }
+    open.set(schema, open.size)
+    const children = childSchemas(schema).map(([step, child]) => ({ step, ...walk(child) }))
+    open.delete(schema)
+    const here: Marker[] = z.globalRegistry.get(schema)?.stdin === true ? [{ at: [], schema }] : []
+    const markers = [
+      ...new Set([
+        ...here,
+        ...children.flatMap(({ step, markers: found }) =>
+          found.map((marker) =>
+            step ? { at: [step, ...marker.at], schema: marker.schema } : marker,
+          ),
         ),
-      ),
-    ]),
-  ]
-  memo.set(schema, markers)
-  return markers
+      ]),
+    ]
+    const low = Math.min(...children.map((child) => child.low))
+    // A node that reached back above itself saw only part of its cycle, so its markers depend on the path.
+    if (low >= open.size) memo.set(schema, markers)
+    return { markers, low }
+  }
+  return walk(root).markers
 }
 
 function childSchemas(schema: z.core.$ZodType): [Step | null, z.core.$ZodType][] {
