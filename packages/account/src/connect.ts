@@ -4,12 +4,22 @@ import { agentGroup } from '@kurumi/agent/schema'
 import type { Caller } from '@kurumi/rpc/contract'
 import { transaction, type Db } from '@kurumi/rpc/server'
 import { ORPCError } from '@orpc/server'
-import { and, eq, gt, inArray } from 'drizzle-orm'
+import { and, eq, gt, inArray, notInArray } from 'drizzle-orm'
 import { z } from 'zod'
 
+import { catalog, servicesCovered, type ServiceId } from './catalog.ts'
 import { ConnectInputSchema, GoogleClientSchema } from './contract.ts'
-import { authorizeUrl, createPkce, createState, s256Challenge } from './oauth.ts'
-import { connectionRequest, connectLink, oauthClient } from './schema.ts'
+import { grant } from './grant.ts'
+import { accountMaterial } from './material.ts'
+import {
+  authorizeUrl,
+  createPkce,
+  createState,
+  exchangeCode,
+  readCallback,
+  s256Challenge,
+} from './oauth.ts'
+import { account, accountGrant, connectionRequest, connectLink, oauthClient } from './schema.ts'
 import { open, seal } from './vault.ts'
 
 type RequestRow = typeof connectionRequest.$inferSelect
@@ -56,19 +66,31 @@ const requestTtl = 30 * 60_000
 export type ConnectionOptions = {
   webPort?: number
   canApprove?: (caller: Caller, agentGroupId: string) => boolean
+  fetch?: typeof fetch
+  log?: (event: {
+    kind: 'account.connect.completed'
+    requestId: string
+    transactionMs: number
+  }) => void
 }
 
 type OpenLink = { kind: 'authorize'; url: URL } | { kind: 'unavailable' }
+type CallbackPage =
+  | { kind: 'completed'; granted: ServiceId[]; missing: ServiceId[] }
+  | { kind: 'cancelled' | 'unavailable' | 'failed' }
 
 export function createConnections({
   db,
   vaultKey,
   webPort = 4001,
   canApprove = (caller) => caller.kind === 'host',
+  fetch: fetchImpl = fetch,
+  log = () => {},
 }: {
   db: Db
   vaultKey: Uint8Array
 } & ConnectionOptions) {
+  const exchanges = new Map<string, ReturnType<typeof exchangeCode>>()
   const redirectUri = `http://127.0.0.1:${webPort}/oauth/callback`
   const clientOf = () => {
     const row = db.select().from(oauthClient).where(eq(oauthClient.vendor, 'google')).get()
@@ -81,6 +103,28 @@ export function createConnections({
         message: 'only an approver of this group may connect an account',
       })
     return caller.kind === 'host' ? 'host' : `human:${caller.userId}`
+  }
+  const requestForState = (state: string) => {
+    const row = db
+      .select()
+      .from(connectionRequest)
+      .where(eq(connectionRequest.oauthState, state))
+      .get()
+    return row ? parseConnectionRequest(row) : undefined
+  }
+  const pageFor = (request: ConnectionRequest | undefined): CallbackPage => {
+    if (!request || request.expiresAt <= new Date()) return { kind: 'unavailable' }
+    if (request.state !== 'completed') return { kind: 'unavailable' }
+    const held =
+      request.accountId === null
+        ? undefined
+        : db.select().from(account).where(eq(account.id, request.accountId)).get()
+    const granted = request.services.filter((service) => held?.services.includes(service))
+    return {
+      kind: 'completed',
+      granted,
+      missing: request.services.filter((service) => !granted.includes(service)),
+    }
   }
 
   const connections = {
@@ -219,6 +263,127 @@ export function createConnections({
           .run()
         return { kind: 'authorize', url }
       })
+    },
+    async callback(url: URL): Promise<CallbackPage> {
+      const state = url.searchParams.get('state')
+      if (!state || url.searchParams.getAll('state').length !== 1) return { kind: 'unavailable' }
+      const request = requestForState(state)
+      if (!request || request.expiresAt <= new Date()) return { kind: 'unavailable' }
+      if (request.state !== 'authorizing') return pageFor(request)
+      const callback = readCallback(url, request.oauthState)
+      if (callback.kind === 'invalid') return { kind: 'unavailable' }
+      if (callback.kind === 'denied') {
+        return transaction(db, (tx): CallbackPage => {
+          const current = requestForState(state)
+          if (current?.state !== 'authorizing' || current.expiresAt <= new Date())
+            return pageFor(current)
+          tx.update(connectionRequest)
+            .set({ state: 'cancelled', pkceVerifier: null })
+            .where(eq(connectionRequest.id, current.id))
+            .run()
+          return { kind: 'cancelled' }
+        })
+      }
+      const exchangeKey = JSON.stringify([state, callback.code])
+      try {
+        let pending = exchanges.get(exchangeKey)
+        if (!pending) {
+          pending = exchangeCode({
+            vendor: request.vendor,
+            client: clientOf(),
+            code: callback.code,
+            verifier: open(vaultKey, request.id, request.pkceVerifier),
+            redirectUri,
+            fetch: fetchImpl,
+          })
+          exchanges.set(exchangeKey, pending)
+        }
+        const tokens = await pending
+        const identity = catalog.google.connect.oauth.identify(tokens)
+        const services = servicesCovered(request.vendor, identity.grantedScopes)
+        const material = accountMaterial.parse({
+          kind: 'oauth',
+          accessToken: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+          grantedScopes: identity.grantedScopes,
+        })
+        const expiresAt = new Date(Date.now() + tokens.expiresIn * 1000)
+        if (
+          tokens.tokenType.toLowerCase() !== 'bearer' ||
+          tokens.expiresIn <= 0 ||
+          !Number.isFinite(expiresAt.getTime())
+        )
+          throw new Error('invalid OAuth token lifetime or type')
+        const started = performance.now()
+        const result = transaction(db, (tx): { page: CallbackPage; committed: boolean } => {
+          const current = requestForState(state)
+          if (current?.state !== 'authorizing' || current.expiresAt <= new Date())
+            return { page: pageFor(current), committed: false }
+          const previous = tx
+            .select()
+            .from(account)
+            .where(and(eq(account.vendor, request.vendor), eq(account.subject, identity.subject)))
+            .get()
+          const id = previous?.id ?? `acc-${Bun.randomUUIDv7()}`
+          const values = {
+            label: identity.label,
+            services,
+            material: seal(vaultKey, id, JSON.stringify(material)),
+            accessExpiresAt: expiresAt,
+            status: 'active',
+          } satisfies Partial<typeof account.$inferInsert>
+          tx.insert(account)
+            .values({
+              id,
+              vendor: request.vendor,
+              subject: identity.subject,
+              kind: 'oauth',
+              ...values,
+              createdAt: new Date(),
+            })
+            .onConflictDoUpdate({ target: [account.vendor, account.subject], set: values })
+            .run()
+          tx.delete(accountGrant)
+            .where(and(eq(accountGrant.accountId, id), notInArray(accountGrant.service, services)))
+            .run()
+          for (const service of current.services) {
+            if (!services.includes(service)) continue
+            const granted = grant(tx, {
+              agentGroupId: current.agentGroupId,
+              accountId: id,
+              service,
+              grantedBy: current.requestedBy,
+            })
+            if (!granted.ok)
+              throw new Error(`unable to grant connected account: ${granted.refusal}`)
+          }
+          tx.update(connectionRequest)
+            .set({ state: 'completed', accountId: id, pkceVerifier: null })
+            .where(eq(connectionRequest.id, current.id))
+            .run()
+          return { page: pageFor(requestForState(state)), committed: true }
+        })
+        if (result.committed)
+          log({
+            kind: 'account.connect.completed',
+            requestId: request.id,
+            transactionMs: performance.now() - started,
+          })
+        return result.page
+      } catch {
+        return transaction(db, (tx): CallbackPage => {
+          const current = requestForState(state)
+          if (current?.state !== 'authorizing' || current.expiresAt <= new Date())
+            return pageFor(current)
+          tx.update(connectionRequest)
+            .set({ state: 'open', oauthState: null, pkceVerifier: null })
+            .where(eq(connectionRequest.id, current.id))
+            .run()
+          return { kind: 'failed' }
+        })
+      } finally {
+        exchanges.delete(exchangeKey)
+      }
     },
   }
   return connections

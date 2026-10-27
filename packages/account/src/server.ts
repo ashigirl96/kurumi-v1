@@ -3,7 +3,6 @@ import type { Caller } from '@kurumi/rpc/contract'
 import { transaction, type Db, type KurumiContext, type Tx } from '@kurumi/rpc/server'
 import { implement, ORPCError } from '@orpc/server'
 import { and, eq, sql } from 'drizzle-orm'
-import { z } from 'zod'
 
 import {
   selectorShapeOf,
@@ -23,6 +22,14 @@ import {
   type Connections,
 } from './connect.ts'
 import { contract } from './contract.ts'
+import {
+  grant,
+  type GrantKey,
+  type GrantInput,
+  type GrantResult,
+  type GrantRefusal,
+} from './grant.ts'
+import { accountMaterial, type AccountMaterial } from './material.ts'
 import { account, accountGrant, defaultAccount } from './schema.ts'
 import {
   accountHandle,
@@ -50,19 +57,11 @@ export type {
 } from './select.ts'
 export type { KeyVendorId, ServiceId, VendorId }
 
-export type GrantKey = { agentGroupId: string; accountId: string; service: ServiceId }
-
-export type GrantInput = GrantKey & { grantedBy: string }
-
-export type GrantRefusal = 'agent_group_not_found' | 'account_not_found' | 'service_not_covered'
-
-export type GrantResult = { ok: true } | { ok: false; refusal: GrantRefusal }
+export type { GrantKey, GrantInput, GrantRefusal, GrantResult } from './grant.ts'
 
 export type SetDefaultResult = { ok: true } | { ok: false; refusal: 'grant_not_found' }
 
-const accountMaterial = z.object({ kind: z.literal('key'), key: z.string() })
-
-export type AccountMaterial = z.infer<typeof accountMaterial>
+export type { AccountMaterial } from './material.ts'
 
 export type AddKeyInput = {
   vendor: KeyVendorId
@@ -209,7 +208,8 @@ function keyOf(vaultKey: Uint8Array, row: GrantRow): string | null {
     throw error
   }
   const material = accountMaterial.safeParse(plaintext)
-  return material.success ? material.data.key : null
+  if (!material.success) return null
+  return material.data.kind === 'key' ? material.data.key : material.data.accessToken
 }
 
 const pathWithoutQuery = (path: string): string => {
@@ -287,34 +287,6 @@ function accountIdOf(tx: Tx, handle: string): AccountLookup {
     .where(and(eq(account.vendor, parsed.vendor), eq(account.label, parsed.label)))
     .get()
   return found ? { ok: true, accountId: found.id } : { ok: false, refusal: 'account_not_found' }
-}
-
-function grant(tx: Tx, { agentGroupId, accountId, service, grantedBy }: GrantInput): GrantResult {
-  const group = tx
-    .select({ id: agentGroup.id })
-    .from(agentGroup)
-    .where(eq(agentGroup.id, agentGroupId))
-    .get()
-  if (!group) return { ok: false, refusal: 'agent_group_not_found' }
-  const held = tx
-    .select({ vendor: account.vendor, services: account.services })
-    .from(account)
-    .where(eq(account.id, accountId))
-    .get()
-  if (!held) return { ok: false, refusal: 'account_not_found' }
-  if (!held.services.includes(service)) return { ok: false, refusal: 'service_not_covered' }
-  tx.insert(accountGrant)
-    .values({
-      agentGroupId,
-      accountId,
-      vendor: held.vendor,
-      service,
-      grantedBy,
-      grantedAt: new Date(),
-    })
-    .onConflictDoNothing()
-    .run()
-  return { ok: true }
 }
 
 export type StoredAccounts = { count: number; unopenedBy: (vaultKey: Uint8Array) => string[] }

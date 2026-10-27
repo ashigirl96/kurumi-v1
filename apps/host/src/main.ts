@@ -254,6 +254,7 @@ export async function startHost(config: HostConfig) {
       db,
       vaultKey,
       webPort: config.web.port,
+      log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
       canApprove: (caller, group) =>
         accessLedger.isApprover(caller, accessLedger.approverChain(group)),
     })

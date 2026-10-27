@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto'
 
 import { connectionRequest } from '@kurumi/account/schema'
 import { createAccountLedger } from '@kurumi/account/server'
-import { inMemoryDb, insertAgentGroup } from '@kurumi/account/testing'
+import { inMemoryDb, insertAgentGroup, tokenGmailOnly } from '@kurumi/account/testing'
 import { eq } from 'drizzle-orm'
 
 import { startWeb } from './web.ts'
@@ -36,7 +36,7 @@ test('GET connects with a 302 and a second GET gives the used-link page', async 
   const second = await fetch(local)
   expect(second.status).toBe(410)
   expect(await second.text()).toContain('run account connect again')
-  expect((await fetch(new URL('/oauth/callback', web.url))).status).toBe(404)
+  expect((await fetch(new URL('/oauth/callback', web.url))).status).toBe(410)
   expect((await fetch(new URL('/rpc/status', web.url))).status).toBe(404)
   expect((await fetch(local, { method: 'POST' })).status).toBe(404)
 })
@@ -67,4 +67,50 @@ test('a second link is refused after the client is configured again', async () =
   expect(db.select().from(connectionRequest).where(eq(connectionRequest.id, id)).get()!.state).toBe(
     'cancelled',
   )
+})
+
+test('the callback grants OAuth services and reloads the same uncached success page without exchanging again', async () => {
+  insertAgentGroup(db, 'callback-work')
+  let exchanges = 0
+  const fetchImpl: typeof fetch = Object.assign(
+    async () => {
+      exchanges++
+      return Response.json(tokenGmailOnly)
+    },
+    { preconnect: fetch.preconnect },
+  )
+  const callbackLedger = createAccountLedger({ db, vaultKey: randomBytes(32), fetch: fetchImpl })
+  callbackLedger.connections.setClient({ clientId: 'client', clientSecret: 'secret' })
+  const { url } = callbackLedger.connections.connect(
+    { agentGroupId: 'callback-work', services: ['gmail', 'google-calendar'] },
+    { kind: 'host' },
+  )
+  web = startWeb({ host: '127.0.0.1', port: 0 }, callbackLedger)
+  const redirect = await fetch(new URL(new URL(url).pathname, web.url), { redirect: 'manual' })
+  const state = new URL(redirect.headers.get('location')!).searchParams.get('state')!
+  const callback = new URL(`/oauth/callback?state=${state}&code=fixture-code`, web.url)
+  const first = await fetch(callback)
+  expect(first.status).toBe(200)
+  expect(first.headers.get('cache-control')).toBe('no-store')
+  expect(first.headers.get('referrer-policy')).toBe('no-referrer')
+  expect(first.headers.get('content-type')).toContain('text/plain')
+  const text = await first.text()
+  expect(text).toContain('Connected. Granted: gmail.')
+  expect(text).toContain('Not granted: google-calendar.')
+  expect(await (await fetch(callback)).text()).toBe(text)
+  expect(exchanges).toBe(1)
+  expect((await fetch(callback, { method: 'POST' })).status).toBe(404)
+})
+
+test('invalid callback states all return the same refusal without reflecting query parameters', async () => {
+  web = startWeb({ host: '127.0.0.1', port: 0 }, ledger)
+  for (const query of [
+    '',
+    '?state=unknown&code=private-code',
+    '?state=unknown&error=private-error',
+  ]) {
+    const response = await fetch(new URL(`/oauth/callback${query}`, web.url))
+    expect(response.status).toBe(410)
+    expect(await response.text()).toBe('This callback is unavailable. Run account connect again.')
+  }
 })

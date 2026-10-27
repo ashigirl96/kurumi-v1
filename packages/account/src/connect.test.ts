@@ -1,13 +1,22 @@
 import { afterEach, beforeEach, expect, setSystemTime, test } from 'bun:test'
 import { randomBytes } from 'node:crypto'
 
+import { transaction } from '@kurumi/rpc/server'
 import { eq } from 'drizzle-orm'
 
 import { serviceIds, vendorOf } from './catalog.ts'
-import { createConnections, parseConnectionRequest } from './connect.ts'
+import { parseConnectionRequest, type createConnections } from './connect.ts'
 import { ConnectInputSchema } from './contract.ts'
-import { account, connectionRequest, connectLink, oauthClient } from './schema.ts'
-import { storedAccounts, storedConnections } from './server.ts'
+import { tokenFull, tokenGmailOnly } from './fixtures/google/token-responses.ts'
+import {
+  account,
+  accountGrant,
+  connectionRequest,
+  connectLink,
+  defaultAccount,
+  oauthClient,
+} from './schema.ts'
+import { createAccountLedger, storedAccounts, storedConnections } from './server.ts'
 import { inMemoryDb, insertAccount, insertAgentGroup } from './testing.ts'
 import { open } from './vault.ts'
 
@@ -23,7 +32,7 @@ const input = {
 beforeEach(() => {
   db = inMemoryDb()
   insertAgentGroup(db, 'work')
-  connections = createConnections({ db, vaultKey, webPort: 42331 })
+  connections = makeConnections({ db, vaultKey, webPort: 42331 })
   connections.setClient({ clientId: 'test-client', clientSecret: 'test-secret' })
 })
 
@@ -31,6 +40,9 @@ afterEach(() => {
   setSystemTime()
   db.$client.close()
 })
+
+const makeConnections = (deps: Parameters<typeof createAccountLedger>[0]) =>
+  createAccountLedger(deps).connections
 
 const create = () => connections.createRequest(input, caller)
 function authorize(token: string): URL {
@@ -81,7 +93,7 @@ test('two links share the full authorize URL, persisted state and sealed verifie
   const first = connections.issueLink(id, caller)
   const second = connections.issueLink(id, caller)
   const url = authorize(first)
-  connections = createConnections({ db, vaultKey, webPort: 42331 })
+  connections = makeConnections({ db, vaultKey, webPort: 42331 })
   expect(authorize(second).href).toBe(url.href)
   const row = db.select().from(connectionRequest).get()!
   const request = parseConnectionRequest(row)
@@ -121,7 +133,7 @@ test('the partial unique index admits only one live request per session and vend
 
 test('only group approvers may create requests or mint links, and agents never may', () => {
   const id = create()
-  connections = createConnections({
+  connections = makeConnections({
     db,
     vaultKey,
     canApprove: (who, group) => who.kind === 'human' && who.userId === 'owner' && group === 'work',
@@ -272,4 +284,248 @@ test('a failed cancellation rolls back the client replacement', () => {
   ).toThrow('cannot cancel')
 
   expect(authorize(second).href).toBe(original.href)
+})
+
+function tokenEndpoint(reply: (form: URLSearchParams) => Response | Promise<Response>) {
+  let exchanges = 0
+  const fetchImpl: typeof fetch = Object.assign(
+    async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      expect(db.$client.inTransaction).toBe(false)
+      exchanges++
+      expect(init?.body).toBeInstanceOf(URLSearchParams)
+      return reply(new URLSearchParams(await new Request(_url, init).text()))
+    },
+    { preconnect: fetch.preconnect },
+  )
+  const ledger = createAccountLedger({ db, vaultKey, webPort: 42331, fetch: fetchImpl })
+  connections = ledger.connections
+  return { ledger, exchanges: () => exchanges }
+}
+
+function callbackUrl(id = create(), query = 'code=fixture-code'): URL {
+  const url = authorize(connections.issueLink(id, caller))
+  return new URL(
+    `http://127.0.0.1:42331/oauth/callback?state=${url.searchParams.get('state')}&${query}`,
+  )
+}
+
+test('completion seals tokens, grants covered requested services, injects the access token and survives reload', async () => {
+  const upstream = tokenEndpoint((form) => {
+    expect(form.get('code')).toBe('fixture-code')
+    expect(form.get('client_id')).toBe('test-client')
+    expect(form.get('redirect_uri')).toBe('http://127.0.0.1:42331/oauth/callback')
+    expect(form.get('code_verifier')).toHaveLength(43)
+    return Response.json(tokenFull)
+  })
+  const url = callbackUrl()
+  const page = await connections.callback(url)
+  expect(page).toEqual({ kind: 'completed', granted: ['gmail', 'google-calendar'], missing: [] })
+  const held = db.select().from(account).get()!
+  expect(held.kind).toBe('oauth')
+  expect(held.subject).toBe('100000000000000000001')
+  expect(held.accessExpiresAt!.getTime()).toBeGreaterThan(Date.now())
+  expect(held.material.toString()).not.toContain(tokenFull.access_token)
+  expect(held.material.toString()).not.toContain(tokenFull.refresh_token)
+  expect(JSON.parse(open(vaultKey, held.id, held.material))).toMatchObject({
+    kind: 'oauth',
+    accessToken: tokenFull.access_token,
+    refreshToken: tokenFull.refresh_token,
+  })
+  expect(
+    db
+      .select()
+      .from(accountGrant)
+      .all()
+      .map(({ service }) => service),
+  ).toEqual(['gmail', 'google-calendar'])
+  expect(upstream.ledger.candidates('work', 'gmail')).toHaveLength(1)
+  const credential = upstream.ledger.credentialFor(
+    { agentGroupId: 'work' },
+    {
+      host: 'gmail.googleapis.com',
+      method: 'GET',
+      path: '/gmail/v1/users/me/profile',
+      headers: new Headers(),
+      rawHeaders: [],
+    },
+  )
+  expect(credential.kind).toBe('inject')
+  if (credential.kind !== 'inject') throw new Error('expected OAuth injection')
+  expect(credential.injection.apply().headers.get('authorization')).toBe(
+    `Bearer ${tokenFull.access_token}`,
+  )
+  expect(() => JSON.stringify(credential.injection)).toThrow('cannot be serialized')
+  connections = makeConnections({ db, vaultKey, webPort: 42331 })
+  expect(await connections.callback(url)).toEqual(page)
+  expect(upstream.exchanges()).toBe(1)
+  expect(db.select().from(connectionRequest).get()!.pkceVerifier).toBeNull()
+})
+
+test('a Gmail-only exchange reports missing Calendar and grants only Gmail', async () => {
+  const { ledger } = tokenEndpoint(() => Response.json(tokenGmailOnly))
+  expect(await connections.callback(callbackUrl())).toEqual({
+    kind: 'completed',
+    granted: ['gmail'],
+    missing: ['google-calendar'],
+  })
+  expect(db.select().from(account).get()!.services).toEqual(['gmail'])
+  expect(ledger.candidates('work', 'google-calendar')).toEqual([])
+})
+
+test('access_denied cancels without exchanging or opening a damaged verifier', async () => {
+  const endpoint = tokenEndpoint(() => {
+    throw new Error('must not exchange')
+  })
+  const id = create()
+  const url = callbackUrl(id, 'error=access_denied')
+  db.update(connectionRequest)
+    .set({ pkceVerifier: Buffer.of(0) })
+    .where(eq(connectionRequest.id, id))
+    .run()
+  expect(await connections.callback(url)).toEqual({ kind: 'cancelled' })
+  expect(db.select().from(connectionRequest).get()!.state).toBe('cancelled')
+  expect(db.select().from(account).all()).toEqual([])
+  expect(endpoint.exchanges()).toBe(0)
+  expect(await connections.callback(url)).toEqual({ kind: 'unavailable' })
+})
+
+test.each(['unknown', 'expired', 'cancelled', 'open', 'missing-code', 'duplicate-state'] as const)(
+  '%s callbacks refuse without opening the verifier, exchanging or revealing the request',
+  async (mode) => {
+    const endpoint = tokenEndpoint(() => {
+      throw new Error('must not exchange')
+    })
+    const id = create()
+    const url = callbackUrl(id)
+    if (mode === 'unknown') url.searchParams.set('state', 'unknown')
+    if (mode === 'expired')
+      db.update(connectionRequest)
+        .set({ expiresAt: new Date(0), pkceVerifier: Buffer.of(0) })
+        .run()
+    if (mode === 'cancelled')
+      db.update(connectionRequest)
+        .set({ state: 'cancelled', pkceVerifier: Buffer.of(0) })
+        .run()
+    if (mode === 'open')
+      db.update(connectionRequest)
+        .set({ state: 'open', oauthState: null, pkceVerifier: null })
+        .run()
+    if (mode === 'missing-code') url.searchParams.delete('code')
+    if (mode === 'duplicate-state') url.searchParams.append('state', url.searchParams.get('state')!)
+    expect(await connections.callback(url)).toEqual({ kind: 'unavailable' })
+    expect(endpoint.exchanges()).toBe(0)
+    expect(db.select().from(account).all()).toEqual([])
+  },
+)
+
+test.each(['success', 'failure'] as const)(
+  'the losing tab discards a late %s and shows the completed state',
+  async (outcome) => {
+    const delayed = Promise.withResolvers<Response>()
+    const endpoint = tokenEndpoint((form) =>
+      form.get('code') === 'late-code' ? delayed.promise : Response.json(tokenFull),
+    )
+    const url = callbackUrl()
+    const lateUrl = new URL(url)
+    lateUrl.searchParams.set('code', 'late-code')
+    const late = connections.callback(lateUrl)
+    const winner = await connections.callback(url)
+    delayed.resolve(
+      outcome === 'success'
+        ? Response.json(tokenGmailOnly)
+        : Response.json({ error: 'invalid_grant' }, { status: 400 }),
+    )
+    expect(await late).toEqual(winner)
+    expect(db.select().from(account).get()!.services).toEqual(['gmail', 'google-calendar'])
+    expect(db.select().from(account).all()).toHaveLength(1)
+    expect(endpoint.exchanges()).toBe(2)
+  },
+)
+
+test.each(['client-change', 'expires'] as const)(
+  'an exchange in flight cannot complete after %s',
+  async (mode) => {
+    const delayed = Promise.withResolvers<Response>()
+    tokenEndpoint(() => delayed.promise)
+    const pending = connections.callback(callbackUrl())
+    if (mode === 'client-change')
+      connections.setClient({ clientId: 'changed', clientSecret: 'changed' })
+    else
+      db.update(connectionRequest)
+        .set({ expiresAt: new Date(0) })
+        .run()
+    delayed.resolve(Response.json(tokenFull))
+    expect(await pending).toEqual({ kind: 'unavailable' })
+    expect(db.select().from(account).all()).toEqual([])
+    expect(db.select().from(accountGrant).all()).toEqual([])
+  },
+)
+
+test('reconnecting upserts the same subject and removes grants/defaults no longer covered', async () => {
+  let response = tokenFull
+  const { ledger } = tokenEndpoint(() => Response.json(response))
+  await connections.callback(callbackUrl())
+  const id = db.select().from(account).get()!.id
+  transaction(db, (tx) =>
+    ledger.setDefault(tx, { agentGroupId: 'work', accountId: id, service: 'google-calendar' }),
+  )
+  response = tokenGmailOnly
+  await connections.callback(callbackUrl())
+  expect(db.select().from(account).all()).toHaveLength(1)
+  expect(db.select().from(account).get()!.id).toBe(id)
+  expect(
+    db
+      .select()
+      .from(accountGrant)
+      .all()
+      .map(({ service }) => service),
+  ).toEqual(['gmail'])
+  expect(db.select().from(defaultAccount).all()).toEqual([])
+})
+
+test.each(['exchange', 'identity', 'transaction'] as const)(
+  'a failed %s resets to a parseable open request without partial writes',
+  async (failure) => {
+    tokenEndpoint(() =>
+      failure === 'exchange'
+        ? Response.json({ error: 'invalid_grant' }, { status: 400 })
+        : Response.json({ ...tokenFull, ...(failure === 'identity' ? { id_token: null } : {}) }),
+    )
+    if (failure === 'transaction')
+      db.$client.run(
+        `CREATE TRIGGER refuse_complete BEFORE UPDATE ON connection_request WHEN NEW.state = 'completed' BEGIN SELECT RAISE(ABORT, 'cannot complete'); END`,
+      )
+    const url = callbackUrl()
+    expect(await connections.callback(url)).toEqual({ kind: 'failed' })
+    const request = parseConnectionRequest(db.select().from(connectionRequest).get()!)
+    expect(request.state).toBe('open')
+    expect(request.oauthState).toBeNull()
+    expect(request.pkceVerifier).toBeNull()
+    expect(db.select().from(account).all()).toEqual([])
+    expect(db.select().from(accountGrant).all()).toEqual([])
+    expect(await connections.callback(url)).toEqual({ kind: 'unavailable' })
+    authorize(connections.issueLink(request.id, caller))
+  },
+)
+
+test('reloading during exchange shares the single-use code instead of racing invalid_grant', async () => {
+  const delayed = Promise.withResolvers<Response>()
+  const endpoint = tokenEndpoint(() =>
+    endpoint.exchanges() === 1
+      ? delayed.promise
+      : Response.json({ error: 'invalid_grant' }, { status: 400 }),
+  )
+  const url = callbackUrl()
+  const original = connections.callback(url)
+  const reloaded = connections.callback(url)
+  expect(endpoint.exchanges()).toBe(1)
+  delayed.resolve(Response.json(tokenFull))
+  expect(await original).toEqual({
+    kind: 'completed',
+    granted: ['gmail', 'google-calendar'],
+    missing: [],
+  })
+  expect(await reloaded).toEqual(await original)
+  expect(db.select().from(account).all()).toHaveLength(1)
+  expect(db.select().from(connectionRequest).get()!.state).toBe('completed')
 })
