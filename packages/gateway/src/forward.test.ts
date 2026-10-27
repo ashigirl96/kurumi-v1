@@ -23,12 +23,12 @@ import { inMemoryDb, insertAgentGroup } from '@kurumi/account/testing'
 import { eq } from 'drizzle-orm'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 
+import { pinnedLookup } from './address.ts'
 import type { EgressPrincipal } from './egress-log.ts'
 import {
   credentialInject,
   forward,
   forwardUpgrade,
-  pinnedLookup,
   type ConnectTarget,
   type EgressEvent,
   type ForwardDeps,

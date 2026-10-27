@@ -13,7 +13,7 @@ import {
   type ServiceId,
 } from '@kurumi/account/server'
 
-import { addressRefusal, hostAddresses } from './address.ts'
+import { addressRefusal, hostAddresses, pinnedLookup, resolvedAddressRefusal } from './address.ts'
 import {
   REFUSAL_STATUS,
   refusalHttp,
@@ -115,15 +115,6 @@ const REQUEST_BODY_DEADLINE_MS = 30_000
 
 const resolveAll = (host: string) => lookup(host, { all: true })
 
-export function pinnedLookup(addresses: LookupAddress[]): LookupFunction {
-  return (hostname, options, callback) => {
-    const [first] = addresses
-    if (!first) callback(new Error(`${hostname} resolved to no address`), '')
-    else if (options.all) callback(null, addresses)
-    else callback(null, first.address, first.family)
-  }
-}
-
 type Pinned =
   | { kind: 'pinned'; lookup: LookupFunction }
   | { kind: 'refused'; refusal: GatewayRefusal }
@@ -145,7 +136,7 @@ async function pinPublicUpstream(
   }
   if (addresses.length === 0) return { kind: 'unreachable' }
   const refusal = refusalOf(readHostAddresses())
-  const reason = addresses.map(({ address }) => refusal(address)).find((found) => found !== null)
+  const reason = resolvedAddressRefusal(addresses, refusal)
   if (reason) return { kind: 'refused', refusal: { code: 'upstream_not_public', host, reason } }
   return { kind: 'pinned', lookup: pinnedLookup(addresses) }
 }
