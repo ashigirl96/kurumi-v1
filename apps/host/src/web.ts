@@ -19,11 +19,18 @@ export function startWeb(
             ? `Connected. Granted: ${result.granted.join(', ') || 'none'}.${result.missing.length ? ` Not granted: ${result.missing.join(', ')}.` : ''} You can close this tab.`
             : result.kind === 'cancelled'
               ? 'Google consent was cancelled. Run account connect again.'
-              : result.kind === 'failed'
-                ? 'Unable to complete Google consent. Run account connect again.'
-                : 'This callback is unavailable. Run account connect again.'
+              : result.kind === 'nothing-granted'
+                ? 'Nothing was granted. Run account connect again. Select a requested service when Google asks.'
+                : result.kind === 'failed'
+                  ? 'Google connection failed. Run account connect again.'
+                  : 'This callback is unavailable. Run account connect again.'
         return new Response(body, {
-          status: result.kind === 'unavailable' ? 410 : result.kind === 'failed' ? 502 : 200,
+          status:
+            result.kind === 'unavailable'
+              ? 410
+              : result.kind === 'failed' || result.kind === 'nothing-granted'
+                ? 502
+                : 200,
           headers: { ...headers, 'content-type': 'text/plain; charset=utf-8' },
         })
       }

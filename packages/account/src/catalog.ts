@@ -34,7 +34,20 @@ export type Identity = Readonly<{
   grantedScopes: readonly string[]
 }>
 
-export class IdentifyError extends Error {}
+export class IdentifyError extends Error {
+  readonly kind:
+    | 'invalid_id_token'
+    | 'missing_scope'
+    | 'missing_id_token'
+    | 'missing_subject'
+    | 'missing_email'
+    | 'unsupported_vendor'
+
+  constructor(kind: IdentifyError['kind'], message: string) {
+    super(message)
+    this.kind = kind
+  }
+}
 
 export type OAuthSpec = {
   authorizeUrl: string
@@ -94,26 +107,32 @@ function parseJsonOrNull(text: string): unknown {
 function unverifiedJwtClaims(jwt: string): Readonly<Record<string, unknown>> {
   const [, payload, signature, ...rest] = jwt.split('.')
   if (payload === undefined || signature === undefined || rest.length > 0) {
-    throw new IdentifyError('Google sent an id_token that is not a JWT')
+    throw new IdentifyError('invalid_id_token', 'Google sent an id_token that is not a JWT')
   }
   const claims = parseJsonOrNull(Buffer.from(payload, 'base64url').toString())
   if (isRecord(claims)) return claims
-  throw new IdentifyError('Google sent an id_token whose payload is not a JSON object')
+  throw new IdentifyError(
+    'invalid_id_token',
+    'Google sent an id_token whose payload is not a JSON object',
+  )
 }
 
 function googleIdentify(tokens: TokenResponse): Identity {
   if (tokens.scope === null) {
-    throw new IdentifyError('Google sent no scope, so the grant is unknown')
+    throw new IdentifyError('missing_scope', 'Google sent no scope, so the grant is unknown')
   }
   if (tokens.idToken === null) {
-    throw new IdentifyError('Google sent no id_token, so the account cannot be named')
+    throw new IdentifyError(
+      'missing_id_token',
+      'Google sent no id_token, so the account cannot be named',
+    )
   }
   const { sub, email } = unverifiedJwtClaims(tokens.idToken)
   if (typeof sub !== 'string' || sub === '') {
-    throw new IdentifyError('The Google id_token has no sub claim')
+    throw new IdentifyError('missing_subject', 'The Google id_token has no sub claim')
   }
   if (typeof email !== 'string' || email === '') {
-    throw new IdentifyError('The Google id_token has no email claim')
+    throw new IdentifyError('missing_email', 'The Google id_token has no email claim')
   }
   return {
     subject: sub,
@@ -201,7 +220,7 @@ export const catalog = {
         pkce: false,
         identityScopes: [],
         identify: () => {
-          throw new IdentifyError('Notion accounts cannot be identified yet')
+          throw new IdentifyError('unsupported_vendor', 'Notion accounts cannot be identified yet')
         },
       },
     },

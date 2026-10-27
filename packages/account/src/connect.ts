@@ -7,7 +7,7 @@ import { ORPCError } from '@orpc/server'
 import { and, eq, gt, inArray, notInArray } from 'drizzle-orm'
 import { z } from 'zod'
 
-import { catalog, servicesCovered, type ServiceId } from './catalog.ts'
+import { catalog, IdentifyError, servicesCovered, type ServiceId } from './catalog.ts'
 import { ConnectInputSchema, GoogleClientSchema } from './contract.ts'
 import { grant } from './grant.ts'
 import { accountMaterial } from './material.ts'
@@ -16,6 +16,7 @@ import {
   createPkce,
   createState,
   exchangeCode,
+  OAuthError,
   readCallback,
   s256Challenge,
 } from './oauth.ts'
@@ -67,17 +68,17 @@ export type ConnectionOptions = {
   webPort?: number
   canApprove?: (caller: Caller, agentGroupId: string) => boolean
   fetch?: typeof fetch
-  log?: (event: {
-    kind: 'account.connect.completed'
-    requestId: string
-    transactionMs: number
-  }) => void
+  log?: (
+    event:
+      | { kind: 'account.connect.completed'; requestId: string; transactionMs: number }
+      | { kind: 'account.connect.failed'; requestId: string; reason: string },
+  ) => void
 }
 
 type OpenLink = { kind: 'authorize'; url: URL } | { kind: 'unavailable' }
 type CallbackPage =
   | { kind: 'completed'; granted: ServiceId[]; missing: ServiceId[] }
-  | { kind: 'cancelled' | 'unavailable' | 'failed' }
+  | { kind: 'cancelled' | 'unavailable' | 'failed' | 'nothing-granted' }
 
 export function createConnections({
   db,
@@ -91,6 +92,7 @@ export function createConnections({
   vaultKey: Uint8Array
 } & ConnectionOptions) {
   const exchanges = new Map<string, ReturnType<typeof exchangeCode>>()
+  const attempts = new Map<string, number>()
   const redirectUri = `http://127.0.0.1:${webPort}/oauth/callback`
   const clientOf = () => {
     const row = db.select().from(oauthClient).where(eq(oauthClient.vendor, 'google')).get()
@@ -114,6 +116,7 @@ export function createConnections({
   }
   const pageFor = (request: ConnectionRequest | undefined): CallbackPage => {
     if (!request || request.expiresAt <= new Date()) return { kind: 'unavailable' }
+    if (request.state === 'cancelled') return { kind: 'cancelled' }
     if (request.state !== 'completed') return { kind: 'unavailable' }
     const held =
       request.accountId === null
@@ -272,7 +275,7 @@ export function createConnections({
       if (request.state !== 'authorizing') return pageFor(request)
       const callback = readCallback(url, request.oauthState)
       if (callback.kind === 'invalid') return { kind: 'unavailable' }
-      if (callback.kind === 'denied') {
+      if (callback.kind === 'denied' && callback.error === 'access_denied') {
         return transaction(db, (tx): CallbackPage => {
           const current = requestForState(state)
           if (current?.state !== 'authorizing' || current.expiresAt <= new Date())
@@ -284,8 +287,11 @@ export function createConnections({
           return { kind: 'cancelled' }
         })
       }
-      const exchangeKey = JSON.stringify([state, callback.code])
+      const exchangeKey = JSON.stringify([state, callback.kind === 'code' ? callback.code : null])
+      attempts.set(state, (attempts.get(state) ?? 0) + 1)
       try {
+        if (callback.kind === 'denied')
+          throw new OAuthError('Google consent failed', callback.error, 502)
         let pending = exchanges.get(exchangeKey)
         if (!pending) {
           pending = exchangeCode({
@@ -301,6 +307,8 @@ export function createConnections({
         const tokens = await pending
         const identity = catalog.google.connect.oauth.identify(tokens)
         const services = servicesCovered(request.vendor, identity.grantedScopes)
+        if (!request.services.some((service) => services.includes(service)))
+          throw new OAuthError('Nothing was granted', 'nothing_granted', 502)
         const material = accountMaterial.parse({
           kind: 'oauth',
           accessToken: tokens.accessToken,
@@ -313,7 +321,7 @@ export function createConnections({
           tokens.expiresIn <= 0 ||
           !Number.isFinite(expiresAt.getTime())
         )
-          throw new Error('invalid OAuth token lifetime or type')
+          throw new OAuthError('invalid OAuth token lifetime or type', 'unexpected_response', 200)
         const started = performance.now()
         const result = transaction(db, (tx): { page: CallbackPage; committed: boolean } => {
           const current = requestForState(state)
@@ -325,6 +333,10 @@ export function createConnections({
             .where(and(eq(account.vendor, request.vendor), eq(account.subject, identity.subject)))
             .get()
           const id = previous?.id ?? `acc-${Bun.randomUUIDv7()}`
+          if (material.kind === 'oauth' && material.refreshToken === null && previous) {
+            const stored = accountMaterial.parse(JSON.parse(open(vaultKey, id, previous.material)))
+            if (stored.kind === 'oauth') material.refreshToken = stored.refreshToken
+          }
           const values = {
             label: identity.label,
             services,
@@ -370,19 +382,48 @@ export function createConnections({
             transactionMs: performance.now() - started,
           })
         return result.page
-      } catch {
+      } catch (error) {
+        log({
+          kind: 'account.connect.failed',
+          requestId: request.id,
+          reason:
+            error instanceof OAuthError
+              ? error.code
+              : error instanceof IdentifyError
+                ? error.kind
+                : error instanceof Error
+                  ? error.name
+                  : 'UnknownError',
+        })
+        if (
+          !(
+            error instanceof OAuthError ||
+            error instanceof IdentifyError ||
+            error instanceof z.ZodError
+          )
+        )
+          throw error
         return transaction(db, (tx): CallbackPage => {
           const current = requestForState(state)
           if (current?.state !== 'authorizing' || current.expiresAt <= new Date())
             return pageFor(current)
-          tx.update(connectionRequest)
-            .set({ state: 'open', oauthState: null, pkceVerifier: null })
-            .where(eq(connectionRequest.id, current.id))
-            .run()
-          return { kind: 'failed' }
+          if (attempts.get(state) === 1)
+            tx.update(connectionRequest)
+              .set({ state: 'open', oauthState: null, pkceVerifier: null })
+              .where(eq(connectionRequest.id, current.id))
+              .run()
+          return {
+            kind:
+              error instanceof OAuthError && error.code === 'nothing_granted'
+                ? 'nothing-granted'
+                : 'failed',
+          }
         })
       } finally {
         exchanges.delete(exchangeKey)
+        const remaining = (attempts.get(state) ?? 1) - 1
+        if (remaining === 0) attempts.delete(state)
+        else attempts.set(state, remaining)
       }
     },
   }

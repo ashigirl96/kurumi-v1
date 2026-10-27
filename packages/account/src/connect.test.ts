@@ -286,7 +286,10 @@ test('a failed cancellation rolls back the client replacement', () => {
   expect(authorize(second).href).toBe(original.href)
 })
 
-function tokenEndpoint(reply: (form: URLSearchParams) => Response | Promise<Response>) {
+function tokenEndpoint(
+  reply: (form: URLSearchParams) => Response | Promise<Response>,
+  log?: Parameters<typeof createAccountLedger>[0]['log'],
+) {
   let exchanges = 0
   const fetchImpl: typeof fetch = Object.assign(
     async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
@@ -297,7 +300,7 @@ function tokenEndpoint(reply: (form: URLSearchParams) => Response | Promise<Resp
     },
     { preconnect: fetch.preconnect },
   )
-  const ledger = createAccountLedger({ db, vaultKey, webPort: 42331, fetch: fetchImpl })
+  const ledger = createAccountLedger({ db, vaultKey, webPort: 42331, fetch: fetchImpl, log })
   connections = ledger.connections
   return { ledger, exchanges: () => exchanges }
 }
@@ -386,34 +389,33 @@ test('access_denied cancels without exchanging or opening a damaged verifier', a
   expect(db.select().from(connectionRequest).get()!.state).toBe('cancelled')
   expect(db.select().from(account).all()).toEqual([])
   expect(endpoint.exchanges()).toBe(0)
-  expect(await connections.callback(url)).toEqual({ kind: 'unavailable' })
+  expect(await connections.callback(url)).toEqual({ kind: 'cancelled' })
 })
 
 test.each(['unknown', 'expired', 'cancelled', 'open', 'missing-code', 'duplicate-state'] as const)(
-  '%s callbacks refuse without opening the verifier, exchanging or revealing the request',
+  '%s callbacks do not exchange a code',
   async (mode) => {
-    const endpoint = tokenEndpoint(() => {
-      throw new Error('must not exchange')
-    })
+    const endpoint = tokenEndpoint(() => Response.json(tokenFull))
     const id = create()
     const url = callbackUrl(id)
     if (mode === 'unknown') url.searchParams.set('state', 'unknown')
     if (mode === 'expired')
       db.update(connectionRequest)
-        .set({ expiresAt: new Date(0), pkceVerifier: Buffer.of(0) })
+        .set({ expiresAt: new Date(0) })
         .run()
     if (mode === 'cancelled')
-      db.update(connectionRequest)
-        .set({ state: 'cancelled', pkceVerifier: Buffer.of(0) })
-        .run()
+      connections.setClient({ clientId: 'changed', clientSecret: 'changed' })
     if (mode === 'open')
       db.update(connectionRequest)
         .set({ state: 'open', oauthState: null, pkceVerifier: null })
         .run()
     if (mode === 'missing-code') url.searchParams.delete('code')
     if (mode === 'duplicate-state') url.searchParams.append('state', url.searchParams.get('state')!)
-    expect(await connections.callback(url)).toEqual({ kind: 'unavailable' })
+    const page = await connections.callback(url)
     expect(endpoint.exchanges()).toBe(0)
+    expect(page).toEqual({
+      kind: mode === 'cancelled' ? 'cancelled' : 'unavailable',
+    })
     expect(db.select().from(account).all()).toEqual([])
   },
 )
@@ -455,7 +457,9 @@ test.each(['client-change', 'expires'] as const)(
         .set({ expiresAt: new Date(0) })
         .run()
     delayed.resolve(Response.json(tokenFull))
-    expect(await pending).toEqual({ kind: 'unavailable' })
+    expect(await pending).toEqual({
+      kind: mode === 'client-change' ? 'cancelled' : 'unavailable',
+    })
     expect(db.select().from(account).all()).toEqual([])
     expect(db.select().from(accountGrant).all()).toEqual([])
   },
@@ -483,18 +487,18 @@ test('reconnecting upserts the same subject and removes grants/defaults no longe
   expect(db.select().from(defaultAccount).all()).toEqual([])
 })
 
-test.each(['exchange', 'identity', 'transaction'] as const)(
+test.each(['exchange', 'identity', 'validation'] as const)(
   'a failed %s resets to a parseable open request without partial writes',
   async (failure) => {
     tokenEndpoint(() =>
       failure === 'exchange'
         ? Response.json({ error: 'invalid_grant' }, { status: 400 })
-        : Response.json({ ...tokenFull, ...(failure === 'identity' ? { id_token: null } : {}) }),
+        : Response.json({
+            ...tokenFull,
+            ...(failure === 'identity' ? { id_token: null } : {}),
+            ...(failure === 'validation' ? { access_token: '' } : {}),
+          }),
     )
-    if (failure === 'transaction')
-      db.$client.run(
-        `CREATE TRIGGER refuse_complete BEFORE UPDATE ON connection_request WHEN NEW.state = 'completed' BEGIN SELECT RAISE(ABORT, 'cannot complete'); END`,
-      )
     const url = callbackUrl()
     expect(await connections.callback(url)).toEqual({ kind: 'failed' })
     const request = parseConnectionRequest(db.select().from(connectionRequest).get()!)
@@ -528,4 +532,181 @@ test('reloading during exchange shares the single-use code instead of racing inv
   expect(await reloaded).toEqual(await original)
   expect(db.select().from(account).all()).toHaveLength(1)
   expect(db.select().from(connectionRequest).get()!.state).toBe('completed')
+})
+
+test.each(['success', 'failure'] as const)(
+  'a failed tab leaves a second exchange to settle with %s',
+  async (outcome) => {
+    const first = Promise.withResolvers<Response>()
+    const second = Promise.withResolvers<Response>()
+    tokenEndpoint((form) => (form.get('code') === 'fixture-code' ? first.promise : second.promise))
+    const id = create()
+    const url = callbackUrl(id)
+    const otherUrl = callbackUrl(id, 'code=second-code')
+    expect(otherUrl.searchParams.get('state')).toBe(url.searchParams.get('state'))
+    const tabA = connections.callback(url)
+    const tabB = connections.callback(otherUrl)
+    first.resolve(Response.json({ error: 'invalid_grant' }, { status: 400 }))
+    expect(await tabA).toEqual({ kind: 'failed' })
+    expect(db.select().from(connectionRequest).get()!.state).toBe('authorizing')
+    second.resolve(
+      outcome === 'success'
+        ? Response.json(tokenFull)
+        : Response.json({ error: 'server_error' }, { status: 500 }),
+    )
+    expect(await tabB).toEqual(
+      outcome === 'success'
+        ? { kind: 'completed', granted: ['gmail', 'google-calendar'], missing: [] }
+        : { kind: 'failed' },
+    )
+    expect(db.select().from(account).all()).toHaveLength(outcome === 'success' ? 1 : 0)
+    expect(db.select().from(connectionRequest).get()!.state).toBe(
+      outcome === 'success' ? 'completed' : 'open',
+    )
+  },
+)
+
+test.each(['admin_policy_enforced', 'server_error', 'temporarily_unavailable', ''])(
+  'provider error %s fails without cancelling or exchanging',
+  async (error) => {
+    const endpoint = tokenEndpoint(() => Response.json(tokenFull))
+    expect(await connections.callback(callbackUrl(create(), `error=${error}`))).toEqual({
+      kind: 'failed',
+    })
+    expect(db.select().from(connectionRequest).get()!.state).toBe('open')
+    expect(db.select().from(account).all()).toEqual([])
+    expect(endpoint.exchanges()).toBe(0)
+  },
+)
+
+test.each(['success', 'failure'] as const)(
+  'a losing tab after cancellation shows the cancel page for a late %s',
+  async (outcome) => {
+    const delayed = Promise.withResolvers<Response>()
+    const endpoint = tokenEndpoint(() => delayed.promise)
+    const url = callbackUrl()
+    const pending = connections.callback(url)
+    const cancel = new URL(url)
+    cancel.search = new URLSearchParams({
+      state: url.searchParams.get('state')!,
+      error: 'access_denied',
+    }).toString()
+    const page = await connections.callback(cancel)
+    expect(page).toEqual({ kind: 'cancelled' })
+    delayed.resolve(
+      outcome === 'success'
+        ? Response.json(tokenFull)
+        : Response.json({ error: 'invalid_grant' }, { status: 400 }),
+    )
+    expect(await pending).toEqual(page)
+    expect(await connections.callback(cancel)).toEqual(page)
+    expect(endpoint.exchanges()).toBe(1)
+    expect(db.select().from(account).all()).toEqual([])
+    db.update(connectionRequest)
+      .set({ expiresAt: new Date(0) })
+      .run()
+    expect(await connections.callback(cancel)).toEqual({ kind: 'unavailable' })
+  },
+)
+
+test.each(['new', 'reconnect'] as const)(
+  'consent covering no requested services leaves a %s account untouched and the request retryable',
+  async (mode) => {
+    let response = tokenFull
+    const { ledger } = tokenEndpoint(() => Response.json(response))
+    if (mode === 'reconnect') await connections.callback(callbackUrl())
+    const before = db.select().from(account).all()
+    const grants = db.select().from(accountGrant).all()
+    response = { ...tokenFull, scope: 'openid https://www.googleapis.com/auth/calendar' }
+    const id = connections.createRequest({ agentGroupId: 'work', services: ['gmail'] }, caller)
+    expect(await connections.callback(callbackUrl(id))).toEqual({ kind: 'nothing-granted' })
+    expect(db.select().from(account).all()).toEqual(before)
+    expect(db.select().from(accountGrant).all()).toEqual(grants)
+    expect(ledger.candidates('work', 'gmail')).toHaveLength(mode === 'reconnect' ? 1 : 0)
+    expect(
+      db.select().from(connectionRequest).where(eq(connectionRequest.id, id)).get()!.state,
+    ).toBe('open')
+  },
+)
+
+test('reconnecting without a new refresh token keeps the stored refresh token', async () => {
+  let response: Omit<typeof tokenFull, 'refresh_token'> & { refresh_token?: string } = tokenFull
+  tokenEndpoint(() => Response.json(response))
+  await connections.callback(callbackUrl())
+  const { refresh_token: _refreshToken, ...withoutRefreshToken } = tokenGmailOnly
+  response = withoutRefreshToken
+  expect(await connections.callback(callbackUrl())).toEqual({
+    kind: 'completed',
+    granted: ['gmail'],
+    missing: ['google-calendar'],
+  })
+  const held = db.select().from(account).get()!
+  expect(JSON.parse(open(vaultKey, held.id, held.material))).toMatchObject({
+    accessToken: tokenGmailOnly.access_token,
+    refreshToken: tokenFull.refresh_token,
+  })
+})
+
+test.each([
+  ['exchange', 'invalid_grant'],
+  ['identity', 'missing_id_token'],
+  ['validation', 'ZodError'],
+] as const)('a failed %s logs only the request id and reason', async (failure, reason) => {
+  const events: unknown[] = []
+  tokenEndpoint(
+    () =>
+      failure === 'exchange'
+        ? Response.json(
+            { error: 'invalid_grant', error_description: 'private-code' },
+            { status: 400 },
+          )
+        : Response.json({
+            ...tokenFull,
+            ...(failure === 'identity' ? { id_token: null } : { access_token: '' }),
+          }),
+    (event) => events.push(event),
+  )
+  const id = create()
+  expect(await connections.callback(callbackUrl(id))).toEqual({ kind: 'failed' })
+  expect(events).toEqual([{ kind: 'account.connect.failed', requestId: id, reason }])
+})
+
+test('a conflicting account label logs the error name and propagates without partial writes', async () => {
+  const events: unknown[] = []
+  tokenEndpoint(
+    () => Response.json(tokenFull),
+    (event) => events.push(event),
+  )
+  insertAccount(db, {
+    id: 'other',
+    vendor: 'google',
+    label: 'alice@example.com',
+    services: ['gmail'],
+  })
+  db.update(account).set({ subject: 'different-subject' }).run()
+  const before = db.select().from(account).all()
+  const id = create()
+  const failure = await connections.callback(callbackUrl(id)).catch((error: unknown) => error)
+  expect(failure).toMatchObject({
+    name: 'SQLiteError',
+    message: expect.stringContaining('UNIQUE constraint failed'),
+  })
+  expect(events).toEqual([{ kind: 'account.connect.failed', requestId: id, reason: 'SQLiteError' }])
+  expect(db.select().from(account).all()).toEqual(before)
+  expect(db.select().from(accountGrant).all()).toEqual([])
+  expect(db.select().from(connectionRequest).get()!.state).toBe('authorizing')
+})
+
+test('a code bug is logged by name and is not converted to the retryable failure page', async () => {
+  const events: unknown[] = []
+  tokenEndpoint(
+    () => {
+      throw new TypeError('private detail')
+    },
+    (event) => events.push(event),
+  )
+  const id = create()
+  const failure = await connections.callback(callbackUrl(id)).catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(TypeError)
+  expect(events).toEqual([{ kind: 'account.connect.failed', requestId: id, reason: 'TypeError' }])
 })

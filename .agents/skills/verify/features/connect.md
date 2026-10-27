@@ -10,7 +10,7 @@ Google の認可 URL を開き、指定した account で同意かキャンセ�
 - `google-client` は keychain の client id と secret を `account set-client google` に渡す。clientId と clientSecret を持つ JSON を stdin で渡す。
 - `account connect` は5分・1回限りの接続リンクを発行する。使用済み・期限切れのリンクは再実行を案内する。
 - callbackはGoogleのcodeを交換し、暗号化したOAuth accountと、要求したserviceのうち許可された分のgrantを保存する。部分同意では許可されなかったserviceもページに表示する。
-- callbackの再読込はcodeを交換せず同じ結果を表示する。キャンセルは`cancelled`、交換失敗は再試行できる`open`になる。
+- 完了・キャンセル後のcallbackの再読込はcodeを交換せず、それぞれ成功・キャンセルを表示する。`access_denied`だけがキャンセルになり、ほかのOAuthエラーは接続失敗を表示する。交換失敗や、要求したserviceが一つも許可されなかった場合は`open`に戻る。利用者は`account connect`をもう一度実行し、新しい接続リンクからやり直す。
 
 ## How to get to it (user POV)
 
@@ -42,7 +42,7 @@ docker exec <container-id> curl -sS -D - -o /dev/null https://gmail.googleapis.c
 
 200と`x-kurumi-account: google/<test-account>`を確認する。Gmail本文にはアドレスが入るため保存せず、headerと`account list`の出力もアドレスを伏せてからevidenceに保存する。callbackの再読込後も`host.log`の`account.connect.completed`は1行で、`transactionMs`にGoogleとの通信を除いた保存時間が残る。Calendarを許可しなかった場合はページに`Not granted: google-calendar`が出て、Calendarへのprobeは`account_not_connected`になる。
 
-使用済みリンクや不明・期限切れのstateは410で再実行を案内する。`--cancel`ではcallbackがキャンセルを表示し、requestは`cancelled`になりaccountは作られない。検証後は`L down <n>`を実行する。
+使用済みリンクや不明・期限切れのstateは410で再実行を案内する。`--cancel`ではcallbackがキャンセルを表示し、requestは`cancelled`になりaccountは作られない。期限内なら、別のtabの遅い応答や再読込でもキャンセルを表示する。何も許可されなかった場合は`Nothing was granted`を表示し、既存accountも変更しない。失敗後は同じcallbackを再読込せず、`L kurumi <n> account connect --services gmail --agent-group-id <group-id>`で新しいrequestとリンクを作る。検証後は`L down <n>`を実行する。
 
 OAuth helperだけを検証する場合は、次のscriptを使う。
 

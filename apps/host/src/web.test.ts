@@ -114,3 +114,52 @@ test('invalid callback states all return the same refusal without reflecting que
     expect(await response.text()).toBe('This callback is unavailable. Run account connect again.')
   }
 })
+
+test.each(['access_denied', 'server_error', 'empty-grant'])(
+  'the %s callback page names the outcome and retry action',
+  async (outcome) => {
+    const localDb = inMemoryDb()
+    insertAgentGroup(localDb, 'work')
+    const fetchImpl: typeof fetch = Object.assign(
+      async () => Response.json({ ...tokenGmailOnly, scope: 'openid email' }),
+      { preconnect: fetch.preconnect },
+    )
+    const localLedger = createAccountLedger({
+      db: localDb,
+      vaultKey: randomBytes(32),
+      fetch: fetchImpl,
+    })
+    localLedger.connections.setClient({ clientId: 'client', clientSecret: 'secret' })
+    const { url } = localLedger.connections.connect(
+      { agentGroupId: 'work', services: ['gmail'] },
+      { kind: 'host' },
+    )
+    web = startWeb({ host: '127.0.0.1', port: 0 }, localLedger)
+    try {
+      const redirect = await fetch(new URL(new URL(url).pathname, web.url), { redirect: 'manual' })
+      const state = new URL(redirect.headers.get('location')!).searchParams.get('state')!
+      const callback = new URL('/oauth/callback', web.url)
+      callback.search = new URLSearchParams({
+        state,
+        ...(outcome === 'empty-grant' ? { code: 'fixture-code' } : { error: outcome }),
+      }).toString()
+      const response = await fetch(callback)
+      const body = await response.text()
+      expect(response.status).toBe(outcome === 'access_denied' ? 200 : 502)
+      expect(body).toContain(
+        outcome === 'access_denied'
+          ? 'cancelled'
+          : outcome === 'empty-grant'
+            ? 'Nothing was granted'
+            : 'connection failed',
+      )
+      expect(body).toContain('Run account connect again.')
+      if (outcome !== 'access_denied') expect(body).not.toContain('cancelled')
+      if (outcome === 'access_denied') expect(await (await fetch(callback)).text()).toBe(body)
+    } finally {
+      await web.stop(true)
+      web = undefined
+      localDb.$client.close()
+    }
+  },
+)
