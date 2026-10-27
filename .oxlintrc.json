@@ -11,6 +11,7 @@
   "rules": {
     "kurumi/disable-reason": "error",
     "kurumi/no-relative-package-import": "error",
+    "kurumi/workspace-dependencies": "error",
     "kurumi/sync-transaction": "error",
     "typescript/no-floating-promises": ["error", { "ignoreVoid": false }],
     // 指定しないと oxlint は import type だけでできた循環を見逃す。
