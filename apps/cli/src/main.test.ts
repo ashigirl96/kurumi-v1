@@ -268,6 +268,22 @@ describe('a contract field marked stdin', () => {
     expect(visits).toBeLessThan(1000)
   })
 
+  test('walks a cyclic chain without exponential schema visits', async () => {
+    let chain: z.ZodType = z.lazy(() => chain)
+    for (let depth = 0; depth < 20; depth++) chain = z.object({ a: chain, b: chain })
+    const contract = { put: put(z.object({ chain: chain.optional(), secret: marked })) }
+    const getMetadata = z.globalRegistry.get.bind(z.globalRegistry)
+    let visits = 0
+    spyOn(z.globalRegistry, 'get').mockImplementation((schema) => {
+      if (++visits > 1000) throw new Error('stdin marker walk exceeded 1000 schema visits')
+      return getMetadata(schema)
+    })
+
+    expect(await run(['put', 'n'], piped('s3cret'), contract)).toBe(0)
+    expect(calls).toEqual([{ path: ['put'], input: ['n', { secret: 's3cret' }] }])
+    expect(visits).toBeLessThan(1000)
+  })
+
   test.each(
     Object.entries({
       object: z.object({ inner: marked }),
@@ -347,6 +363,11 @@ describe('a contract field marked stdin', () => {
       'a cycle the walk first enters halfway',
       kc.meta({ cli: true }).input(z.tuple([z.string(), cyclic.options], cyclic.back)),
       'input[1].s and input<rest>.back.s are each marked stdin, but only one field can be',
+    ],
+    [
+      'a cycle through the options object',
+      put(cyclic.options),
+      'input[1].s is marked stdin, but a recursive schema reaches it again',
     ],
     [
       'an object input',
