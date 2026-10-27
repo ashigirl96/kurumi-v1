@@ -102,7 +102,7 @@ test.each([
     code: 'plain_http_not_allowed',
     body: JSON.stringify({
       error: 'plain_http_not_allowed',
-      next: 'use https:// instead of http://; kurumi only tunnels HTTPS through CONNECT',
+      next: 'use https:// instead of http://; kurumi does not forward plain HTTP proxy requests',
     }),
   })
   expect(rpcCalls).toBe(0)
