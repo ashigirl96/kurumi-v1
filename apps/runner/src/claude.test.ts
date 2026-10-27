@@ -80,6 +80,29 @@ test('a lost transcript starts a fresh conversation instead of failing every tur
   }
 })
 
+test('a line completes and the next one runs while Claude Code is still exiting', async () => {
+  const host = await startHost()
+  const answer = sdk.respond
+  sdk.respond = (call) =>
+    (async function* () {
+      yield* answer(call)
+      yield { type: 'system', subtype: 'init', session_id: 'ses-stale' }
+      await untilAborted(call)
+    })()
+  const controller = new AbortController()
+  const running = runRunner({ url: host.url, token: host.token, signal: controller.signal })
+  try {
+    expect(await host.reply()).toBe('model heard: hello')
+    await waitFor(allCompleted(host), 'the line to complete before Claude Code exits')
+    await host.send('next')
+    expect(await host.reply()).toBe('model heard: hello | next')
+  } finally {
+    controller.abort()
+    await running
+    await host.stop()
+  }
+})
+
 test('runner heartbeats while a turn runs and stops when it ends', async () => {
   const host = await startHost()
   const release = Promise.withResolvers<void>()
