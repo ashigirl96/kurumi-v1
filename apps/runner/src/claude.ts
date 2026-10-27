@@ -99,6 +99,7 @@ async function attempt(turn: Turn, continuation: string | null): Promise<string 
   turn.signal.addEventListener('abort', abort, { once: true })
   const messages = query({ prompt: turn.prompt, options: options(continuation, abortController) })
   let failed: SDKResultMessage | null = null
+  let background = false
   try {
     while (true) {
       let next: IteratorResult<SDKMessage, void>
@@ -106,6 +107,7 @@ async function attempt(turn: Turn, continuation: string | null): Promise<string 
         next = await messages.next()
       } catch (error) {
         turn.signal.throwIfAborted()
+        if (failed) break
         return `Provider error: ${error instanceof Error ? error.message : String(error)}`
       }
       if (next.done) break
@@ -120,11 +122,21 @@ async function attempt(turn: Turn, continuation: string | null): Promise<string 
         const text = textOf(message)
         if (text) await turn.reply(text)
       }
-      // Claude Code can take seconds to exit after the result, and nothing after it changes the turn.
-      if (message.type === 'result') {
-        if (message.is_error) failed = message
+      if (
+        message.type === 'system' &&
+        message.subtype === 'background_tasks_changed' &&
+        message.tasks.length > 0
+      )
+        background = true
+      if (message.type === 'result' && message.is_error) failed = message
+      // Claude Code exits seconds after its last result, yet background work, even finished, wakes it for
+      // another turn, and a resumed process first closes a leftover notification without a model turn.
+      if (
+        message.type === 'result' &&
+        !background &&
+        !(message.subtype === 'success' && message.num_turns === 0 && message.result === '')
+      )
         break
-      }
     }
   } catch (error) {
     abort()
