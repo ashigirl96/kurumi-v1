@@ -308,6 +308,20 @@ describe('a contract field marked stdin', () => {
     expect(JSON.stringify(calls)).not.toContain('ARGV')
   })
 
+  const cyclic = {
+    options: z.object({
+      s: marked,
+      get loop() {
+        return cyclic.back
+      },
+    }),
+    back: z.object({
+      get back() {
+        return cyclic.options
+      },
+    }),
+  }
+
   test.each([
     [
       'a positional',
@@ -328,6 +342,11 @@ describe('a contract field marked stdin', () => {
       'two fields',
       put(z.object({ a: marked, b: marked })),
       'input[1].a and input[1].b are each marked stdin, but only one field can be',
+    ],
+    [
+      'a cycle the walk first enters halfway',
+      kc.meta({ cli: true }).input(z.tuple([z.string(), cyclic.options], cyclic.back)),
+      'input[1].s and input<rest>.back.s are each marked stdin, but only one field can be',
     ],
     [
       'an object input',
