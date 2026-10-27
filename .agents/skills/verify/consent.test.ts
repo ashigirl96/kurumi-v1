@@ -1,46 +1,87 @@
 import { describe, expect, test } from 'bun:test'
 
-import { accountAddress, consentUrl, controls, maskScreenshot, omitService } from './consent.ts'
+import { catalog } from '../../../packages/account/src/catalog.ts'
+import {
+  accountAddress,
+  consentUrl,
+  controls,
+  maskScreenshot,
+  browserProfile,
+  requireRequestedService,
+  authorizationUrl,
+} from './consent.ts'
+
+function element(
+  textContent = '',
+  children: Parameters<typeof maskScreenshot>[0]['children'] = [],
+) {
+  return { ...leaf(textContent), children }
+}
+function leaf(textContent = '') {
+  return {
+    textContent,
+    tagName: 'DIV',
+    children: [],
+    value: '',
+    shadowRoot: null,
+    getAttribute: (_name: string): string | null => null,
+    style: { filter: '' },
+  }
+}
 
 describe('screenshot masking before capture', () => {
-  test('blurs an address in visible text', () => {
-    const element = {
-      text: 'Selected person@example.test',
-      value: '',
-      frame: false,
-      style: { filter: '' },
-    }
-    maskScreenshot([element])
-    expect(element.style.filter).toBe('blur(16px)')
+  test.each(['person@example.test', 'https://example.test/callback?code=private'])(
+    'blurs text and input values: %s',
+    (sensitive) => {
+      const text = element(sensitive)
+      const input = { ...element(), value: sensitive }
+      maskScreenshot({ children: [text, input] })
+      expect(text.style.filter).toBe('blur(16px)')
+      expect(input.style.filter).toBe('blur(16px)')
+    },
+  )
+  test('keeps a page without addresses readable', () => {
+    const text = element('Gmail permission')
+    maskScreenshot({ children: [text] })
+    expect(text.style.filter).toBe('')
   })
-
-  test('blurs an address in an input value', () => {
-    const input = { text: '', value: 'person@example.test', frame: false, style: { filter: '' } }
-    maskScreenshot([input])
+  test('masks an address split across elements at its common parent', () => {
+    const text = element('person@example.test', [leaf('person'), leaf('@'), leaf('example.test')])
+    const body = element('person@example.test', [text])
+    maskScreenshot({ children: [body] })
+    expect(text.style.filter).toBe('blur(16px)')
+    expect(body.style.filter).toBe('')
+  })
+  test('walks open shadow roots', () => {
+    const text = element('person@example.test')
+    const host = { ...element(), shadowRoot: { children: [text] } }
+    maskScreenshot({ children: [host] })
+    expect(text.style.filter).toBe('blur(16px)')
+  })
+  test('masks SVG text', () => {
+    const svg = { ...element('person@example.test'), tagName: 'text' }
+    maskScreenshot({ children: [svg] })
+    expect(svg.style.filter).toBe('blur(16px)')
+  })
+  test('masks input placeholders', () => {
+    const input = {
+      ...element(),
+      getAttribute: (name: string) => (name === 'placeholder' ? 'person@example.test' : null),
+    }
+    maskScreenshot({ children: [input] })
     expect(input.style.filter).toBe('blur(16px)')
   })
-
-  test('leaves a page without addresses readable', () => {
-    const element = { text: 'Gmail permission', value: '', frame: false, style: { filter: '' } }
-    maskScreenshot([element])
-    expect(element.style.filter).toBe('')
-  })
-
-  test('blurs an iframe whose contents cannot be inspected', () => {
-    const frame = { text: '', value: '', frame: true, style: { filter: '' } }
-    maskScreenshot([frame])
+  test('masks inaccessible iframes', () => {
+    const frame = { ...element(), tagName: 'IFRAME' }
+    maskScreenshot({ children: [frame] })
     expect(frame.style.filter).toBe('blur(16px)')
   })
-
-  test('blurs a URL field containing an OAuth callback', () => {
-    const input = {
-      text: '',
-      value: 'http://127.0.0.1:42311/oauth/callback?code=private',
-      frame: false,
-      style: { filter: '' },
-    }
-    maskScreenshot([input])
-    expect(input.style.filter).toBe('blur(16px)')
+  test('reapplies after the page replaces the masked content', () => {
+    const root = { children: [element('person@example.test')] }
+    maskScreenshot(root)
+    root.children = [element('replacement@example.test')]
+    maskScreenshot(root)
+    expect(root.children[0]?.style.filter).toBe('blur(16px)')
   })
 })
 
@@ -99,27 +140,45 @@ test('reads Google checkbox state and stable account labels from snapshots', () 
   ])
 })
 
-test('partial consent preserves state and PKCE while excluding the omitted service', () => {
+test('uncheck requires the catalog service scopes in the actual authorize URL', () => {
   const source = new URL('https://accounts.google.com/o/oauth2/v2/auth')
-  source.search = new URLSearchParams({
-    client_id: 'test-client',
-    redirect_uri: 'http://127.0.0.1:42311/oauth/callback',
-    state: 'test-state',
-    code_challenge: 'test-challenge',
-    scope: 'https://mail.google.com/ https://www.googleapis.com/auth/calendar openid email',
-    include_granted_scopes: 'true',
-  }).toString()
-  const result = omitService(source, 'google-calendar')
-  expect(result.searchParams.get('scope')).toBe('https://mail.google.com/ openid email')
-  expect(result.searchParams.get('include_granted_scopes')).toBe('false')
-  expect(result.searchParams.get('state')).toBe('test-state')
-  expect(result.searchParams.get('code_challenge')).toBe('test-challenge')
-  expect(result.searchParams.get('redirect_uri')).toBe(source.searchParams.get('redirect_uri'))
-  expect(source.searchParams.get('scope')).toContain('/auth/calendar')
-  expect(omitService(source, 'gmail').searchParams.get('scope')).toBe(
-    'https://www.googleapis.com/auth/calendar openid email',
-  )
-  expect(() =>
-    omitService(new URL('https://accounts.google.com/signin/oauth/consent'), 'gmail'),
-  ).toThrow('cannot safely apply --uncheck')
+  source.searchParams.set('scope', catalog.google.services.gmail.scopes.join(' '))
+  requireRequestedService(source, 'gmail')
+  expect(() => requireRequestedService(source, 'google-calendar')).toThrow('does not request')
+})
+
+test('checks nested authorize redirects and rejects duplicates', () => {
+  const source = new URL('https://accounts.google.com/o/oauth2/v2/auth')
+  source.searchParams.set('redirect_uri', 'https://example.test/oauth/callback')
+  const chooser = new URL('https://accounts.google.com/v3/signin/accountchooser')
+  chooser.searchParams.set('continue', source.href)
+  expect(() => consentUrl(chooser.href, 42311)).toThrow('redirect_uri must be a loopback')
+  source.searchParams.set('redirect_uri', 'http://127.0.0.1:42311/oauth/callback')
+  chooser.searchParams.set('continue', source.href)
+  expect(authorizationUrl(consentUrl(chooser.href, 42311)).href).toBe(source.href)
+  source.searchParams.append('redirect_uri', 'https://example.test/oauth/callback')
+  expect(() => consentUrl(source.href, 42311)).toThrow('duplicate redirect_uri')
+  chooser.searchParams.set('continue', source.href)
+  expect(() => consentUrl(chooser.href, 42311)).toThrow('duplicate redirect_uri')
+})
+
+test('resolves a display name and adds the executable only for Brave profiles', () => {
+  const rows = '\n  Default  (personal)\n  Profile 9  (test)'
+  expect(
+    browserProfile(
+      'Chrome profiles (~/Library/Application Support/BraveSoftware/Brave-Browser):' + rows,
+      'test',
+    ),
+  ).toEqual([
+    '--profile',
+    'Profile 9',
+    '--executable-path',
+    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+  ])
+  expect(browserProfile('Chrome profiles (~/Chrome):' + rows, 'test')).toEqual([
+    '--profile',
+    'Profile 9',
+  ])
+  expect(() => browserProfile('', undefined)).toThrow('KURUMI_VERIFY_BROWSER_PROFILE')
+  expect(() => browserProfile(rows, 'missing')).toThrow('not found')
 })

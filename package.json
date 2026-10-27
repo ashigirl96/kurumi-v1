@@ -26,7 +26,7 @@
   },
   "type": "module",
   "scripts": {
-    "check": "oxlint --no-error-on-unmatched-pattern --report-unused-disable-directives-severity=error && oxfmt --check && tsc --noEmit && bun test",
+    "check": "oxlint --no-error-on-unmatched-pattern --report-unused-disable-directives-severity=error && oxfmt --check && tsc --noEmit && bun test && bun test ./.agents/skills/verify",
     "generate": "bun run --filter './packages/*' --if-present generate"
   },
   "devDependencies": {

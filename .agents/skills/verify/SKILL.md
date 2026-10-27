@@ -22,7 +22,7 @@ kurumi は host process（`apps/host`）で、`$KURUMI_HOME/kurumi.sock` 越し�
 | `probe <n>` | lane にただ 1 つある agent container から、gateway 経由で `POST https://api.anthropic.com/v1/messages`（`max_tokens` 1）を送り、`x-kurumi-account` と `status=` を出力する。model は `KURUMI_VERIFY_PROBE_MODEL`、既定は `claude-haiku-4-5`。 |
 | `consent <n> <url> [flags]` | Google の同意画面を進める。`--account <n>`、`--uncheck <service>`、`--cancel` は [connect.md](features/connect.md) を参照。host は不要。 |
 | `google-client <n>` | keychain の Google client を `account set-client google` に渡す。CLI が未実装ならコマンド名を示して失敗する。 |
-| `down <n>` | lane の host に SIGTERM を送り、install label で container を `docker rm -f` し、home を消す。evidence は残す。 |
+| `down <n>` | lane の browser session を閉じ、host に SIGTERM を送り、install label で container を `docker rm -f` し、home を消す。evidence は残す。 |
 
 まず `smoke` を流す。通れば、この checkout で host・image・runner・key・chat の経路が動いている。そのうえで、変えた feature を個別のコマンドで動かす。
 

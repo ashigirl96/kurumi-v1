@@ -105,7 +105,7 @@ add_key() {
 
 google_client() {
   kurumi account --help 2>&1 | grep -Eq '^  set-client([[:space:]]|$)' ||
-    die "account set-client is unavailable; P3-3 must add it before google-client can run"
+    die "account set-client is unavailable; implement that command before google-client can run"
   client_id=$(security find-generic-password -s kurumi-live-google-client-id -w) ||
     die "keychain item kurumi-live-google-client-id is unavailable"
   client_secret=$(security find-generic-password -s kurumi-live-google-client-secret -w) ||
@@ -150,6 +150,7 @@ probe() {
 }
 
 down() {
+  agent-browser --session "kurumi-verify-$lane" close >/dev/null
   pid=$(host_pid)
   if [ -n "$pid" ]; then
     kill -TERM "$pid"
@@ -189,7 +190,7 @@ case $command in
   add-key) add_key ;;
   chat) chat "$@" ;;
   probe) probe ;;
-  consent) bun "$repo/.agents/skills/verify/consent.ts" "$lane" "$@" ;;
+  consent) exec bun "$repo/.agents/skills/verify/consent.ts" "$lane" "$@" ;;
   google-client) google_client ;;
   down) down ;;
   smoke) smoke ;;

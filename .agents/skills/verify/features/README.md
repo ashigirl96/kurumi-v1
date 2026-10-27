@@ -27,8 +27,7 @@ live の host で kurumi の利用者から見える振る舞いを確かめる�
 
 ## Features
 
-- [Google の同意画面](./connect.md): 指定したテストアカウントで同意、部分同意、キャンセルを行い、マスク済みの画像を残す。host を使わずに実行できる。
-
+- [Google の同意画面](./connect.md): 指定した account で同意、部分同意、キャンセルを行う。
 - [agent と chat する](./chat.md): agent を作り、`kurumi chat` で Claude の返事を受け取る。
 - [account と grant](./accounts.md): key を追加し、grant と revoke をして、grant の無い agent が受ける拒否を見る。
 - [gateway の log と status](./gateway-log.md): 横取りした request は account 付きの egress 行を 1 行ずつ残す。status は admission と CA を示す。
