@@ -203,15 +203,19 @@ const state = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, 'utf8')
 const mode = ${JSON.stringify(mode)}
 if (command === 'profiles') console.log('Chrome profiles (~/Chrome):\\n  Profile 9  (test)')
 else if (args.includes('open')) state.url = args.at(-1)
-else if (command === 'get' && args[3] === 'url') console.log(state.step === 2 ? 'http://127.0.0.1:42411/oauth/callback' : state.url)
+else if (command === 'get' && args[3] === 'url') {
+  if (mode.startsWith('submitted') && state.step === 2) state.polls = (state.polls ?? 0) + 1
+  console.log(state.step === 2 && (!mode.startsWith('submitted') || state.polls > 6) ? (mode.startsWith('submitted-') ? 'chrome-error://chromewebdata/' : 'http://127.0.0.1:42411/oauth/callback') : state.url)
+}
+else if (command === 'eval' && args.at(-1).includes("getEntriesByType('navigation')")) console.log(JSON.stringify(mode === 'submitted-wrong-callback' ? 'http://127.0.0.1:42421/oauth/callback' : 'http://127.0.0.1:42411/oauth/callback'))
 else if (command === 'get') console.log('Consent completed')
 else if (command === 'snapshot') {
   if (mode === 'signal') await new Promise(() => setInterval(() => {}, 1000))
   console.log(state.step === 0
     ? '- heading "Choose an account"\\n- link "second@example.test" [ref=e1]'
-    : '- heading "kurumi wants access to your account"\\n' + (mode === 'hidden' ? '' : '- checkbox "Read Gmail" [checked=' + state.gmail + ', ref=e2]\\n- checkbox "Read Calendar" [checked=' + state.calendar + ', ref=e3]\\n') + '- button "Continue" [ref=e4]')
+    : '- heading "kurumi wants access to your account"\\n' + ((mode === 'hidden' || mode.startsWith('submitted')) ? '' : '- checkbox "Read Gmail" [checked=' + state.gmail + ', ref=e2]\\n- checkbox "Read Calendar" [checked=' + state.calendar + ', ref=e3]\\n') + '- button "Continue" [ref=e4]')
 } else if (['click', 'check', 'uncheck'].includes(command)) {
-  if (mode === args[3] && !state.covered) {
+  if ((mode === args[3] && !state.covered) || (mode.startsWith('submitted') && state.step === 2)) {
     state.covered = true
     writeFileSync(stateFile, JSON.stringify(state))
     console.error("Element '" + args[3] + "' is covered by <div.r7fnGb>")
@@ -242,8 +246,7 @@ writeFileSync(stateFile, JSON.stringify(state))
       url.href,
       '--account',
       '2',
-      '--uncheck',
-      'google-calendar',
+      ...(mode.startsWith('submitted') ? [] : ['--uncheck', 'google-calendar']),
     ],
     {
       env: {
@@ -357,3 +360,34 @@ test('SIGTERM interrupts a browser command and closes the session', async () => 
     await fixture.cleanup()
   }
 })
+
+test.each(['submitted', 'submitted-no-listener'])(
+  'waits after short re-consent until the redirect without re-clicking: %s',
+  async (mode) => {
+    const fixture = await driverFixture(mode)
+    try {
+      expect(await fixture.child.exited).toBe(0)
+      expect(await fixture.error).toBe('')
+      const output = await fixture.output
+      expect(output).toContain('-callback.png')
+      expect(output).not.toContain('covered click')
+      const calls = await fixture.calls()
+      expect(calls.filter((args) => args[2] === 'click' && args[3] === '@e4')).toHaveLength(1)
+      expect(calls.at(-1)?.slice(2)).toEqual(['close'])
+    } finally {
+      await fixture.cleanup()
+    }
+  },
+  10_000,
+)
+
+test('rejects a failed callback navigation belonging to a different consent request', async () => {
+  const fixture = await driverFixture('submitted-wrong-callback')
+  try {
+    expect(await fixture.child.exited).toBe(1)
+    expect(await fixture.error).toContain('callback does not belong to the consent request')
+    expect((await fixture.calls()).at(-1)?.slice(2)).toEqual(['close'])
+  } finally {
+    await fixture.cleanup()
+  }
+}, 10_000)
