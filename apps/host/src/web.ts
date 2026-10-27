@@ -9,9 +9,31 @@ export function startWeb(
   return Bun.serve({
     hostname: bind.host,
     port: bind.port,
-    fetch(request) {
+    async fetch(request) {
       const url = new URL(request.url)
       const headers = { 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' }
+      if (request.method === 'GET' && url.pathname === '/oauth/callback') {
+        const result = await account.connections.callback(url)
+        const body =
+          result.kind === 'completed'
+            ? `Connected. Granted: ${result.granted.join(', ') || 'none'}.${result.missing.length ? ` Not granted: ${result.missing.join(', ')}.` : ''} You can close this tab.`
+            : result.kind === 'cancelled'
+              ? 'Google consent was cancelled. Run account connect again.'
+              : result.kind === 'nothing-granted'
+                ? 'Nothing was granted. Run account connect again. Select a requested service when Google asks.'
+                : result.kind === 'failed'
+                  ? 'Google connection failed. Run account connect again.'
+                  : 'This callback is unavailable. Run account connect again.'
+        return new Response(body, {
+          status:
+            result.kind === 'unavailable'
+              ? 410
+              : result.kind === 'failed' || result.kind === 'nothing-granted'
+                ? 502
+                : 200,
+          headers: { ...headers, 'content-type': 'text/plain; charset=utf-8' },
+        })
+      }
       if (request.method === 'GET' && url.pathname.startsWith('/connect/')) {
         const result = account.connections.openLink(url.pathname.slice('/connect/'.length))
         if (result.kind === 'authorize')

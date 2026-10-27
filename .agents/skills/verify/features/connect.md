@@ -9,6 +9,8 @@ Google の認可 URL を開き、指定した account で同意かキャンセ�
 - `--uncheck gmail` または `--uncheck google-calendar` は、その service のチェックを外して残りを選ぶ。`--cancel` は Google から `access_denied` が戻ると非ゼロで終わる。
 - `google-client` は keychain の client id と secret を `account set-client google` に渡す。clientId と clientSecret を持つ JSON を stdin で渡す。
 - `account connect` は5分・1回限りの接続リンクを発行する。使用済み・期限切れのリンクは再実行を案内する。
+- callbackはGoogleのcodeを交換し、暗号化したOAuth accountと、要求したserviceのうち許可された分のgrantを保存する。部分同意では許可されなかったserviceもページに表示する。
+- 完了・キャンセル後のcallbackの再読込はcodeを交換せず、それぞれ成功・キャンセルを表示する。`access_denied`だけがキャンセルになり、ほかのOAuthエラーは接続失敗を表示する。交換失敗や、要求したserviceが一つも許可されなかった場合は`open`に戻る。利用者は`account connect`をもう一度実行し、新しい接続リンクからやり直す。
 
 ## How to get to it (user POV)
 
@@ -24,10 +26,23 @@ L doctor <n>
 L google-client <n>
 L kurumi <n> agent create --name work
 L kurumi <n> account connect --services gmail --agent-group-id <group-id>
-L consent <n> '<connect-link>' --account 2
+L consent <n> '<connect-link>' --account 1
+L kurumi <n> account list
+L kurumi <n> db query 'select agent_group_id, service from account_grant'
 ```
 
-Googleの同意後、callbackが`Not found`を返す段階ではtoken交換は行われない。`L kurumi <n> db query 'select state from connection_request'`で`authorizing`を確認する。使用済みリンクを再度開くと410になり、`account connect`の再実行を案内する。検証後は`L down <n>`を実行する。
+Googleの同意後、callbackは`Connected. Granted: gmail.`を表示する。`L kurumi <n> db query 'select state from connection_request'`で`completed`を確認する。GmailとCalendarを要求する場合は`--services gmail google-calendar`と空白で区切る。`account list`のGoogle行は`oauth`になり、accountが持つserviceが並ぶ。groupへの付与は`account_grant`の読取queryで確認する。
+
+chatを1回流してcontainerを起動し、そのcontainerからgateway経由でGmailを読む。
+
+```sh
+L chat <n> work 'Reply with OK.'
+docker exec <container-id> curl -sS -D - -o /dev/null https://gmail.googleapis.com/gmail/v1/users/me/profile
+```
+
+200と`x-kurumi-account: google/<test-account>`を確認する。Gmail本文にはアドレスが入るため保存せず、headerと`account list`の出力もアドレスを伏せてからevidenceに保存する。callbackの再読込後も`host.log`の`account.connect.completed`は1行で、`transactionMs`にGoogleとの通信を除いた保存時間が残る。Calendarを許可しなかった場合はページに`Not granted: google-calendar`が出て、Calendarへのprobeは`account_not_connected`になる。
+
+使用済みリンクや不明・期限切れのstateは410で再実行を案内する。`--cancel`ではcallbackがキャンセルを表示し、requestは`cancelled`になりaccountは作られない。期限内なら、別のtabの遅い応答や再読込でもキャンセルを表示する。何も許可されなかった場合は`Nothing was granted`を表示し、既存accountも変更しない。失敗後は同じcallbackを再読込せず、`L kurumi <n> account connect --services gmail --agent-group-id <group-id>`で新しいrequestとリンクを作る。検証後は`L down <n>`を実行する。
 
 OAuth helperだけを検証する場合は、次のscriptを使う。
 
@@ -50,4 +65,7 @@ bun packages/account/scripts/google-consent.ts --services gmail --mask
 - account chooser は profile に複数の account が sign in しているため表示される。Google が chooser を省略した場合、driver は選択対象を確かめられないため失敗する。
 - `--uncheck` は認可 URL で要求した service に限る。Google が既存 grant のため checkbox を出さない場合は失敗する。その service をまだ許可していない account を使う。grant の revoke は他の lane の token も失効させるため実行しない。
 - `google-client` は `account set-client` がない head では、そのコマンド名を示して失敗する。
-- 同意回数を報告する。Google は account と client ごとの refresh token 数に上限がある。
+- `google-client`は進行中のGoogle requestをすべてキャンセルするため、必ず接続リンクの発行前に実行する。
+- `account list`に`--agent-group-id`はない。一覧のserviceはaccountが持つ範囲を示すため、groupへの付与は読取queryかagentの`list_accounts`で確認する。
+- access tokenのrefreshは未実装。期限を過ぎる前にprobeする。
+- 同意回数は完了したcode交換をaccountごとに報告する。Googleはaccountとclientごとのrefresh token数に上限がある。grantのrevokeは行わない。
