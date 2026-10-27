@@ -2,11 +2,11 @@ import type { LookupAddress } from 'node:dns'
 import { lookup } from 'node:dns/promises'
 import { once } from 'node:events'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { connect, type LookupFunction, type Server } from 'node:net'
+import { connect, type Server } from 'node:net'
 import { pipeline, type Duplex } from 'node:stream'
 import { createServer as createTlsServer } from 'node:tls'
 
-import { addressRefusal, hostAddresses } from './address.ts'
+import { addressRefusal, hostAddresses, pinnedLookup, resolvedAddressRefusal } from './address.ts'
 import {
   CaExpiredError,
   createCertificateAuthority,
@@ -78,15 +78,6 @@ function rejectConnect(socket: Duplex, status: 400 | 403 | 407 | 502, body = '')
     `HTTP/1.1 ${status} ${reason}\r\n${challenge}Connection: close\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
     () => socket.destroy(),
   )
-}
-
-function pinnedLookup(addresses: LookupAddress[]): LookupFunction {
-  return (hostname, options, callback) => {
-    const [first] = addresses
-    if (!first) callback(new Error(`${hostname} resolved to no address`), '')
-    else if (options.all) callback(null, addresses)
-    else callback(null, first.address, first.family)
-  }
 }
 
 // A lookup or injection that ignores the abort could otherwise hold stop, and the host's flush and lock release behind it, forever.
@@ -340,7 +331,7 @@ export async function startAgentPort<Principal extends object>(deps: {
     const listener = intercepted ? await listenerFor(target.host) : undefined
     const addresses = listener ? [] : await resolve(target.host)
     const refusal = refusalOf(listener ? [] : readHostAddresses())
-    const reason = addresses.map(({ address }) => refusal(address)).find((found) => found !== null)
+    const reason = resolvedAddressRefusal(addresses, refusal)
     if (reason) {
       rejectConnect(
         client,

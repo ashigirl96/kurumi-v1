@@ -1,4 +1,5 @@
-import { BlockList, isIP } from 'node:net'
+import type { LookupAddress } from 'node:dns'
+import { BlockList, isIP, type LookupFunction } from 'node:net'
 import { networkInterfaces } from 'node:os'
 
 type Range = [reason: string, network: string, prefix: number]
@@ -78,5 +79,21 @@ export function addressRefusal(host: readonly string[]): (address: string) => st
     const reason = refused.find(({ list }) => list.check(bare, type))?.reason
     if (reason) return reason
     return own.check(bare, type) ? 'host interface' : null
+  }
+}
+
+export function resolvedAddressRefusal(
+  addresses: readonly LookupAddress[],
+  refusal: (address: string) => string | null,
+): string | undefined {
+  return addresses.map(({ address }) => refusal(address)).find((found) => found !== null)
+}
+
+export function pinnedLookup(addresses: LookupAddress[]): LookupFunction {
+  return (hostname, options, callback) => {
+    const [first] = addresses
+    if (!first) callback(new Error(`${hostname} resolved to no address`), '')
+    else if (options.all) callback(null, addresses)
+    else callback(null, first.address, first.family)
   }
 }
