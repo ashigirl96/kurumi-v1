@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { createAccessLedger } from '@kurumi/access/server'
-import { seal } from '@kurumi/account/server'
+import { createAccountLedger, seal } from '@kurumi/account/server'
 import { createAgentLedger } from '@kurumi/agent/server'
 import { createApprovalLedger } from '@kurumi/approval/server'
 import { createRouterClient } from '@orpc/server'
@@ -60,6 +60,7 @@ function probeSocketBind(home: string, fail = false): string {
     const serve = Bun.serve
     process.umask(0o022)
     Bun.serve = (options) => {
+      if (!options.unix) return serve(options)
       try {
         if (${fail}) throw new Error('forced bind failure')
         const server = serve(options)
@@ -319,6 +320,67 @@ test('with no accounts stored, a host whose vault.key was deleted starts with a 
 
   expect(storedCa(home)).not.toBe(before)
   expect(stdout).toContain('"kind":"gateway.ca.replaced"')
+}, 5000)
+
+async function homeWithConnection() {
+  const home = homeForTest()
+  const host = spawnHost(home)
+  await waitForHost(home, host)
+  const group = z
+    .object({ id: z.string() })
+    .parse(JSON.parse(await cli(home, ['agent', 'create', '--name', 'work'])))
+  await cli(
+    home,
+    ['account', 'set-client', 'google'],
+    JSON.stringify({ clientId: 'test-client', clientSecret: 'test-secret' }),
+  )
+  const url = (
+    await cli(home, ['account', 'connect', '--services', 'gmail', '--agent-group-id', group.id])
+  ).trim()
+  expect((await fetch(url, { redirect: 'manual' })).status).toBe(302)
+  host.kill('SIGTERM')
+  expect(await host.exited).toBe(0)
+  const key = readFileSync(join(home, 'vault.key'))
+  return { home, key, ca: storedCa(home) }
+}
+
+test('saved connections with a missing vault key stop startup without generating a replacement', async () => {
+  const { home, ca } = await homeWithConnection()
+  rmSync(join(home, 'vault.key'))
+  const host = spawnHost(home)
+  expect(await host.exited).toBe(1)
+  const error = await new Response(host.stderr).text()
+  expect(error).toContain('vault.key is missing with a saved OAuth client or pending connection')
+  expect(error).toContain('reset kurumi.db with its -wal and -shm files')
+  expect(existsSync(join(home, 'vault.key'))).toBe(false)
+  expect(storedCa(home)).toBe(ca)
+}, 5000)
+
+test('saved connections with a wrong vault key stop before replacing the gateway CA', async () => {
+  const { home, ca } = await homeWithConnection()
+  const wrongKey = randomBytes(32)
+  writeFileSync(join(home, 'vault.key'), wrongKey)
+  const host = spawnHost(home)
+  expect(await host.exited).toBe(1)
+  expect(await new Response(host.stderr).text()).toContain(
+    'vault.key cannot open a saved OAuth client or pending connection',
+  )
+  expect(storedCa(home)).toBe(ca)
+  expect(readFileSync(join(home, 'vault.key')).equals(wrongKey)).toBe(true)
+}, 5000)
+
+test('a damaged pending verifier stops startup even when the client and CA open with the key', async () => {
+  const { home, key, ca } = await homeWithConnection()
+  const sqlite = new Database(join(home, 'kurumi.db'))
+  sqlite.query('UPDATE connection_request SET pkce_verifier = ?').run(Buffer.of(0))
+  sqlite.close()
+  const host = spawnHost(home)
+  expect(await host.exited).toBe(1)
+  expect(await new Response(host.stderr).text()).toContain(
+    'vault.key cannot open a saved OAuth client or pending connection',
+  )
+  expect(storedCa(home)).toBe(ca)
+  expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(true)
 }, 5000)
 
 test('after the start-over SQL deletes every account, a host without vault.key starts with a new gateway CA', async () => {
@@ -617,6 +679,50 @@ const outcome = (call: Promise<unknown>) =>
     () => 'answered',
     (error: unknown) => error,
   )
+
+test('connection links follow the real group approver chain and exclude other humans and agents', () => {
+  const home = homeForTest()
+  const db = openKurumiDb(join(home, 'kurumi.db'))
+  migrateAll(db, migrations)
+  try {
+    const access = createAccessLedger({ db })
+    const groups = createAgentLedger({ db, home })
+    const work = groups.create({ name: 'work' })
+    const other = groups.create({ name: 'other' })
+    access.createUser({ id: 'terminal:admin', displayName: 'admin' })
+    access.createUser({ id: 'terminal:member', displayName: 'member' })
+    db.$client
+      .query(
+        "INSERT INTO user_role (user_id, role, agent_group_id, granted_by, granted_at) VALUES ('terminal:admin', 'admin', ?, 'host', 0)",
+      )
+      .run(work.id)
+    const accounts = createAccountLedger({
+      db,
+      vaultKey: randomBytes(32),
+      canApprove: (caller, group) => access.isApprover(caller, access.approverChain(group)),
+    })
+    accounts.connections.setClient({ clientId: 'test-client', clientSecret: 'test-secret' })
+    const id = accounts.connections.createRequest(
+      { agentGroupId: work.id, services: ['gmail'] },
+      { kind: 'host' },
+    )
+    accounts.connections.issueLink(id, { kind: 'human', userId: 'terminal:admin' })
+    expect(() =>
+      accounts.connections.issueLink(id, { kind: 'human', userId: 'terminal:member' }),
+    ).toThrow('only an approver')
+    expect(() =>
+      accounts.connections.connect(
+        { agentGroupId: other.id, services: ['gmail'] },
+        { kind: 'human', userId: 'terminal:admin' },
+      ),
+    ).toThrow('only an approver')
+    expect(() =>
+      accounts.connections.issueLink(id, { kind: 'agent', agentGroupId: work.id, sessionId: 's' }),
+    ).toThrow('only an approver')
+  } finally {
+    db.$client.close()
+  }
+})
 
 test('the host router answers gateway status and log for the host and refuses them to an agent', async () => {
   const db = openKurumiDb(join(homeForTest(), 'kurumi.db'))

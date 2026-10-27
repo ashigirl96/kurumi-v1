@@ -8,6 +8,47 @@ export const HandleSchema = z.string().min(1).describe('handle')
 
 export const KEY_MAX_LENGTH = 4096
 
+export const GoogleClientSchema = z.object({
+  clientId: z
+    .string()
+    .min(1)
+    .max(4096)
+    .regex(/^[\x21-\x7e]+$/),
+  clientSecret: z
+    .string()
+    .min(1)
+    .max(4096)
+    .regex(/^[\x21-\x7e]+$/),
+})
+
+const ClientStdinSchema = z
+  .string()
+  .min(1)
+  .max(16384)
+  .transform((value, ctx) => {
+    try {
+      const parsed = GoogleClientSchema.safeParse(JSON.parse(value))
+      if (parsed.success) return parsed.data
+    } catch {}
+    ctx.addIssue({ code: 'custom', message: 'stdin must be JSON with clientId and clientSecret' })
+    return z.NEVER
+  })
+  .meta({ stdin: true })
+
+export const ConnectInputSchema = z.object({
+  services: z
+    .array(ServiceIdSchema)
+    .min(1)
+    .refine(
+      (services) =>
+        services.every((service) => service === 'gmail' || service === 'google-calendar'),
+      'only Google services are supported',
+    ),
+  agentGroupId: z.string().min(1),
+})
+
+export const ConnectOutputSchema = z.object({ url: z.url() })
+
 /** A key ends up in an HTTP header value, which carries only visible ASCII safely. */
 const KeyValueSchema = z
   .string()
@@ -40,6 +81,15 @@ export const MyAccountSchema = z.object({
 })
 
 export const contract = {
+  setClient: kc
+    .meta({ cli: true, description: 'Set the Google OAuth client, reading JSON from stdin' })
+    .input(
+      z.tuple([z.literal('google').describe('vendor'), z.object({ client: ClientStdinSchema })]),
+    ),
+  connect: kc
+    .meta({ cli: true, description: 'Issue a one-time Google account connection link' })
+    .input(ConnectInputSchema)
+    .output(ConnectOutputSchema),
   mine: kc
     .meta({
       agent: 'own-group',

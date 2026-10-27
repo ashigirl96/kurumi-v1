@@ -92,6 +92,7 @@ doctor() {
     check "host answers status" "$(kurumi status >/dev/null 2>&1 && echo yes)"
     check "gateway admission open" "$([ "$(admission)" = open ] && echo open)"
     check "agent port $KURUMI_AGENT_PORT owned by host" "$(lsof -nP -a -p "$pid" -iTCP:"$KURUMI_AGENT_PORT" -sTCP:LISTEN >/dev/null 2>&1 && echo "pid $pid")"
+    check "web port $KURUMI_WEB_PORT owned by host" "$(lsof -nP -a -p "$pid" -iTCP:"$KURUMI_WEB_PORT" -sTCP:LISTEN >/dev/null 2>&1 && echo "pid $pid")"
   fi
   check "image $KURUMI_AGENT_IMAGE" "$(docker image inspect -f '{{.Id}}' "$KURUMI_AGENT_IMAGE" 2>/dev/null | cut -c8-19)"
   [ -d "$home" ] && echo "info  containers: $(docker ps -a --filter "label=kurumi.install=$(install_label)" --format '{{.Names}}={{.Status}}' | tr '\n' ' ')"
