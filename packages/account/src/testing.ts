@@ -7,7 +7,7 @@ import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 
 import { migrations as accountMigrations } from '../migrations/index.ts'
-import { defaultAuthModeOf, type AuthMode, type ServiceId, type VendorId } from './catalog.ts'
+import { type ServiceId, type VendorId } from './catalog.ts'
 import { account } from './schema.ts'
 
 export function inMemoryDb() {
@@ -36,7 +36,6 @@ export function insertAccount(
     label: string
     services: ServiceId[]
     status?: 'active' | 'needs_reauth'
-    authMode?: AuthMode | null
   },
 ) {
   db.insert(account)
@@ -45,7 +44,6 @@ export function insertAccount(
       material: Buffer.alloc(0),
       status: 'active',
       createdAt: new Date(0),
-      authMode: defaultAuthModeOf(row.vendor),
       ...row,
     })
     .run()

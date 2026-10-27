@@ -16,7 +16,7 @@ test.each([
     403,
   ],
   [{ code: 'account_needs_reauth', service: 'anthropic-api', handle: main }, 403],
-  [{ code: 'duplicate_slot', service: 'anthropic-api', header: 'x-api-key' }, 400],
+  [{ code: 'duplicate_slot', service: 'anthropic-api', header: 'authorization' }, 400],
   [{ code: 'upstream_not_public', host: 'api.anthropic.com', reason: 'loopback' }, 403],
   [{ code: 'selector_unreadable', service: 'anthropic-api', written: 'x', accepted: [] }, 400],
   [

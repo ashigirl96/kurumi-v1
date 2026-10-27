@@ -146,7 +146,7 @@ const slots: Slot[] = [
   {
     vendor: 'anthropic',
     service: 'anthropic-api',
-    slot: { kind: 'header', header: 'x-api-key' },
+    slot: { kind: 'header', header: 'x-credential' },
     url: 'https://api.anthropic.com/v1/messages',
   },
   {
