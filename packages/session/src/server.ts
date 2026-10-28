@@ -319,22 +319,22 @@ export function createSessionLedger({
         .orderBy(inboundMessage.seq)
         .get()
       if (
-        !stopped &&
         message &&
         (message.status === 'processing'
           ? message.claimedBy === id
-          : !message.processAfter || message.processAfter.getTime() <= Date.now())
+          : !stopped && (!message.processAfter || message.processAfter.getTime() <= Date.now()))
       ) {
         const tries = message.tries + (message.status === 'pending' ? 1 : 0)
+        const exhausted = !stopped && tries >= MAX_INBOUND_TRIES
         tx.update(inboundMessage)
           .set({
-            status: tries >= MAX_INBOUND_TRIES ? 'failed' : 'pending',
+            status: exhausted ? 'failed' : 'pending',
             claimedBy: null,
             tries,
           })
           .where(eq(inboundMessage.id, message.id))
           .run()
-        if (tries >= MAX_INBOUND_TRIES)
+        if (exhausted)
           runtimeLog?.({
             kind: 'session.inbound.exhausted',
             sessionId: row.sessionId,
