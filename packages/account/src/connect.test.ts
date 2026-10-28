@@ -744,10 +744,10 @@ test('agent connect binds the authenticated group and session, reuses the reques
     { services: ['gmail'], agentGroupId: 'forged' },
     agentCaller,
   )
-  expect(await connections.connectAgent({ services: ['gmail', 'gmail'] }, agentCaller)).toEqual(
-    result,
-  )
-  expect(result.kind).toBe('card_posted')
+  const reused = await connections.connectAgent({ services: ['gmail', 'gmail'] }, agentCaller)
+  expect(reused).toEqual({ ...result, reused: true })
+  expect(result).toMatchObject({ kind: 'card_posted', reused: false })
+  expect(JSON.stringify(reused)).not.toContain('http')
   expect(JSON.stringify(result)).not.toContain('http')
   expect(proof.cards()).toHaveLength(1)
   expect(proof.cards()[0]?.content).toContain('work')
@@ -813,18 +813,22 @@ test('press refuses non-approvers, CLI-only refs, unknown refs, bad actions and 
     text: 'この group の承認者だけが接続できます',
   })
   expect(press(requestId, 'connect', agentCaller).kind).toBe('notice')
-  expect(press(create()).kind).toBe('notice')
-  expect(press('unknown').kind).toBe('notice')
-  expect(press(requestId, 'forged').kind).toBe('notice')
+  const unavailable = {
+    kind: 'notice',
+    text: 'このカードは利用できません。もう一度接続を頼んでください',
+  } satisfies ReturnType<typeof connections.press>
+  expect(press(create())).toEqual(unavailable)
+  expect(press('unknown')).toEqual(unavailable)
+  expect(press(requestId, 'forged')).toEqual(unavailable)
   for (const state of ['cancelled', 'completed', 'expired'] as const) {
     db.update(connectionRequest).set({ state }).where(eq(connectionRequest.id, requestId)).run()
-    expect(press(requestId).kind).toBe('notice')
+    expect(press(requestId)).toEqual(unavailable)
   }
   db.update(connectionRequest)
     .set({ state: 'open', expiresAt: new Date(0) })
     .where(eq(connectionRequest.id, requestId))
     .run()
-  expect(press(requestId).kind).toBe('notice')
+  expect(press(requestId)).toEqual(unavailable)
   expect(db.select().from(connectLink).all()).toEqual([])
 })
 
@@ -853,13 +857,46 @@ test('a human approver’s card link grants only to the card group and records t
   ])
 })
 
-test('an authorizing request cannot attribute a different approver’s consent to the first approver', () => {
-  const id = create()
-  connections = makeConnections({ db, vaultKey, canApprove: () => true })
-  const first = connections.issueLink(id, { kind: 'human', userId: 'first' })
-  const other = connections.issueLink(id, { kind: 'human', userId: 'other' })
-  authorize(first)
-  expect(connections.openLink(other)).toEqual({ kind: 'unavailable' })
+test('a second approver restarts consent, completes as themselves and invalidates the first state', async () => {
+  const exchanges: string[] = []
+  withCards({
+    canApprove: (who) => who.kind === 'human',
+    fetch: Object.assign(
+      async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        exchanges.push(new URLSearchParams(await new Request(_url, init).text()).get('code') ?? '')
+        return Response.json(tokenGmailOnly)
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  const { requestId } = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
+  const pressAs = (userId: string) => {
+    const reply = connections.press(
+      { ref: requestId, action: 'connect' },
+      { kind: 'human', userId },
+    )
+    if (reply.kind !== 'private-link') throw new Error('missing link')
+    return authorize(new URL(reply.url).pathname.split('/').at(-1)!)
+  }
+  const first = pressAs('a')
+  const other = pressAs('b')
+  expect(other.searchParams.get('state')).not.toBe(first.searchParams.get('state'))
+  expect(other.searchParams.get('code_challenge')).not.toBe(
+    first.searchParams.get('code_challenge'),
+  )
+  expect(pressAs('b').href).toBe(other.href)
+  const callback = (url: URL, code: string) =>
+    connections.callback(
+      new URL(
+        `http://127.0.0.1/oauth/callback?state=${url.searchParams.get('state')}&code=${code}`,
+      ),
+    )
+  expect(await callback(other, 'code-b')).toMatchObject({ kind: 'completed' })
+  expect(db.select().from(accountGrant).all()).toMatchObject([
+    { agentGroupId: 'work', service: 'gmail', grantedBy: 'human:b' },
+  ])
+  expect(await callback(first, 'late-code-a')).toEqual({ kind: 'unavailable' })
+  expect(exchanges).toEqual(['code-b'])
 })
 
 test('reconnect requests all held services but grants only the services asked for', async () => {
@@ -895,12 +932,13 @@ test('reconnect requests all held services but grants only the services asked fo
   ).toEqual(['gmail'])
 })
 
-test('narrow consent cannot delete another group’s grants or replace its account material', async () => {
+test('narrow consent explains the shared services and widens only OAuth for a successful retry', async () => {
   let reply = tokenFull
   tokenEndpoint(() => Response.json(reply))
   await connections.callback(callbackUrl())
   insertAgentGroup(db, 'home')
   const held = db.select().from(account).get()!
+  db.delete(accountGrant).run()
   db.insert(accountGrant)
     .values({
       accountId: held.id,
@@ -913,9 +951,51 @@ test('narrow consent cannot delete another group’s grants or replace its accou
     .run()
   const before = db.select().from(accountGrant).all()
   reply = tokenGmailOnly
-  expect(await connections.callback(callbackUrl())).toEqual({ kind: 'failed' })
+  const id = connections.createRequest({ services: ['gmail'], agentGroupId: 'work' }, caller)
+  expect(await connections.callback(callbackUrl(id))).toEqual({
+    kind: 'shared-services-missing',
+    services: ['google-calendar'],
+  })
   expect(db.select().from(accountGrant).all()).toEqual(before)
   expect(db.select().from(account).get()).toEqual(held)
+  expect(
+    db.select().from(connectionRequest).where(eq(connectionRequest.id, id)).get(),
+  ).toMatchObject({
+    state: 'open',
+    services: ['gmail'],
+    oauthServices: ['gmail', 'google-calendar'],
+    oauthState: null,
+    pkceVerifier: null,
+    authorizedBy: null,
+  })
+  const url = authorize(connections.issueLink(id, caller))
+  expect(url.searchParams.get('scope')).toContain('calendar')
+  reply = tokenFull
+  expect(
+    await connections.callback(
+      new URL(
+        `http://127.0.0.1/oauth/callback?state=${url.searchParams.get('state')}&code=full-code`,
+      ),
+    ),
+  ).toEqual({ kind: 'completed', granted: ['gmail'], missing: [] })
+  expect(db.select().from(accountGrant).all()).toMatchObject([
+    { agentGroupId: 'home', service: 'google-calendar' },
+    { agentGroupId: 'work', service: 'gmail' },
+  ])
+})
+
+test('reconnect includes a needs_reauth account held for a different service', async () => {
+  tokenEndpoint(() => Response.json(tokenFull))
+  await connections.callback(callbackUrl())
+  db.update(account).set({ status: 'needs_reauth' }).run()
+  db.delete(accountGrant).where(eq(accountGrant.service, 'gmail')).run()
+  const id = connections.createRequest({ services: ['gmail'], agentGroupId: 'work' }, caller)
+  expect(authorize(connections.issueLink(id, caller)).searchParams.get('scope')).toContain(
+    'calendar',
+  )
+  expect(
+    db.select().from(connectionRequest).where(eq(connectionRequest.id, id)).get()?.services,
+  ).toEqual(['gmail'])
 })
 
 test('a reconnect updates requested grant audit to the approver whose link completes it', async () => {

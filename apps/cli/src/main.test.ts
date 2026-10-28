@@ -637,6 +637,7 @@ describe('gateway', () => {
 test.each([
   { kind: 'private-link', url: 'http://127.0.0.1:42331/connect/test-token' },
   { kind: 'notice', text: 'この group の承認者だけが接続できます' },
+  { kind: 'notice', text: 'このカードは利用できません。もう一度接続を頼んでください' },
 ] as const)('chat press prints only its private reply: $kind', async (reply) => {
   expect(
     await chat(['press', 'cr-test', 'connect'], {
@@ -645,7 +646,7 @@ test.each([
         return reply
       },
     }),
-  ).toBe(0)
+  ).toBe(reply.kind === 'notice' ? 1 : 0)
   expect(calls).toEqual([{ path: ['chat', 'press'], input: { ref: 'cr-test', action: 'connect' } }])
   expect(stdout).toBe(`${reply.kind === 'private-link' ? reply.url : reply.text}\n`)
 })

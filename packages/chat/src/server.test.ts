@@ -379,3 +379,10 @@ test('guarded chat.press refuses agents even when the context guard allows the c
   })
   await rejects(rpc.chat.press({ ref: 'cr-test', action: 'connect' }), { code: 'FORBIDDEN' })
 })
+
+test('a card without an action handler returns the unavailable-card notice', async () => {
+  expect(await client().press({ ref: 'unknown', action: 'connect' })).toEqual({
+    kind: 'notice',
+    text: 'このカードは利用できません。もう一度接続を頼んでください',
+  })
+})

@@ -48,7 +48,7 @@ export function createChatLedger({
       return (
         sink().onCardAction?.(input, caller) ?? {
           kind: 'notice',
-          text: 'このカードは利用できません',
+          text: 'このカードは利用できません。もう一度接続を頼んでください',
         }
       )
     },

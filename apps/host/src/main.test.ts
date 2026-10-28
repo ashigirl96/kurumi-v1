@@ -19,6 +19,9 @@ import { createAccessLedger } from '@kurumi/access/server'
 import { createAccountLedger, seal } from '@kurumi/account/server'
 import { createAgentLedger } from '@kurumi/agent/server'
 import { createApprovalLedger } from '@kurumi/approval/server'
+import { createChatLedger } from '@kurumi/chat/server'
+import { outboundMessage } from '@kurumi/session/schema'
+import { createSessionLedger } from '@kurumi/session/server'
 import { createRouterClient } from '@orpc/server'
 import { z } from 'zod'
 
@@ -1112,3 +1115,59 @@ test('kurumi gateway rules adds, lists, and removes a rule through the host, and
   )
   expect(removed).toEqual({ removed: true })
 }, 10000)
+
+test.each(['listening', 'no-listener', 'stopped'] as const)(
+  'connectAgent settles committed card delivery before returning: %s',
+  async (surface) => {
+    const home = homeForTest()
+    const db = openKurumiDb(join(home, 'kurumi.db'))
+    migrateAll(db, migrations)
+    const agents = createAgentLedger({ db, home })
+    const group = agents.create({ name: 'work' })
+    const chat = createChatLedger({
+      db,
+      agentLedger: agents,
+      sink: () => ({
+        onInbound: (event) => sessions.routeInbound(event),
+      }),
+    })
+    const sessions = createSessionLedger({ db, agentLedger: agents, chatLedger: chat })
+    const connections = createAccountLedger({
+      db,
+      vaultKey: randomBytes(32),
+      cards: {
+        post: (tx, sessionId, card) => sessions.postCard(tx, sessionId, card),
+        deliver: (id) => sessions.deliverCard(id),
+      },
+    }).connections
+    connections.setClient({ clientId: 'fixture', clientSecret: 'fixture' })
+    const stream = chat.terminal({ agentGroupId: group.id, text: 'connect', follow: true })
+    try {
+      const receipt = (await stream.next()).value
+      if (!receipt || receipt.kind !== 'queued') throw new Error('missing receipt')
+      if (surface === 'no-listener') await stream.return()
+      if (surface === 'stopped') await sessions.stop()
+      expect(
+        await connections.connectAgent(
+          { services: ['gmail'] },
+          {
+            kind: 'agent',
+            agentGroupId: group.id,
+            sessionId: receipt.sessionId,
+          },
+        ),
+      ).toMatchObject({ kind: 'card_posted' })
+      expect(db.select().from(outboundMessage).get()).toMatchObject({
+        kind: 'card',
+        status: surface === 'listening' ? 'delivered' : surface === 'stopped' ? 'queued' : 'failed',
+      })
+      if (surface === 'listening')
+        expect((await stream.next()).value).toMatchObject({ kind: 'reply' })
+    } finally {
+      await stream.return()
+      await sessions.stop()
+      chat.stop()
+      db.$client.close()
+    }
+  },
+)

@@ -42,7 +42,7 @@ export const ConnectInputSchema = z.object({
 
 export const ConnectOutputSchema = z.union([
   z.object({ url: z.url() }),
-  z.object({ kind: z.literal('card_posted'), requestId: z.string() }),
+  z.object({ kind: z.literal('card_posted'), requestId: z.string(), reused: z.boolean() }),
 ])
 
 /** A key ends up in an HTTP header value, which carries only visible ASCII safely. */
@@ -91,7 +91,7 @@ export const contract = {
       tool: {
         name: 'connect_account',
         instructions:
-          'Ask an approver to connect Google services (gmail or google-calendar) to your group. Posts a Connect Card in this chat; the approver presses it to connect. Returns card_posted and a requestId, never a link. Omit agentGroupId.',
+          'Ask an approver to connect Google services (gmail or google-calendar) to your group. Posts a Connect Card in this chat; the approver presses it to connect. Returns card_posted, requestId, and reused, never a link. When reused is true, the existing card was reused and no new card was posted. Omit agentGroupId.',
       },
     })
     .input(ConnectInputSchema)

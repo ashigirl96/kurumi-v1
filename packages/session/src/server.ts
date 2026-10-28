@@ -746,7 +746,7 @@ export function createSessionLedger({
       return id
     },
     async deliverCard(id) {
-      if (stopped) throw new ORPCError('SERVICE_UNAVAILABLE')
+      if (stopped) return
       try {
         await deliverStored(id)
       } catch (error) {

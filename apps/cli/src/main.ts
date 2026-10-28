@@ -131,7 +131,7 @@ export async function chat(argv: string[], link: Link): Promise<number> {
     const client: ContractRouterClient<{ chat: typeof chatContract }> = createORPCClient(link)
     const reply = await client.chat.press({ ref, action })
     process.stdout.write(`${reply.kind === 'private-link' ? reply.url : reply.text}\n`)
-    return 0
+    return reply.kind === 'notice' ? 1 : 0
   }
   if (argv.length !== 1 || argv[0] === '--help' || argv[0] === '-h') {
     process.stderr.write('Usage: kurumi chat <agent> | kurumi chat press <ref> <action>\n')

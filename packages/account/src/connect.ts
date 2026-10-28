@@ -98,6 +98,7 @@ export type ConnectionOptions = {
 type OpenLink = { kind: 'authorize'; url: URL } | { kind: 'unavailable' }
 type CallbackPage =
   | { kind: 'completed'; granted: ServiceId[]; missing: ServiceId[] }
+  | { kind: 'shared-services-missing'; services: ServiceId[] }
   | { kind: 'cancelled' | 'unavailable' | 'failed' | 'nothing-granted' }
 
 export function googleClient(db: Db, vaultKey: Uint8Array) {
@@ -231,7 +232,6 @@ export function createConnections({
               eq(account.vendor, 'google'),
               eq(account.status, 'needs_reauth'),
               eq(accountGrant.agentGroupId, groupId),
-              inArray(accountGrant.service, services),
             ),
           )
           .all()
@@ -273,6 +273,18 @@ export function createConnections({
       input: z.infer<typeof ConnectInputSchema>,
       caller: Extract<Caller, { kind: 'agent' }>,
     ) {
+      const existing = db
+        .select({ id: connectionRequest.id })
+        .from(connectionRequest)
+        .where(
+          and(
+            eq(connectionRequest.agentGroupId, caller.agentGroupId),
+            eq(connectionRequest.sessionId, caller.sessionId),
+            eq(connectionRequest.vendor, 'google'),
+            inArray(connectionRequest.state, ['open', 'authorizing']),
+          ),
+        )
+        .get()
       const requestId = connections.createRequest(input, caller)
       const row = db
         .select()
@@ -280,7 +292,7 @@ export function createConnections({
         .where(eq(connectionRequest.id, requestId))
         .get()
       if (row?.cardMessageId) await cards?.deliver(row.cardMessageId)
-      return { kind: 'card_posted' as const, requestId }
+      return { kind: 'card_posted' as const, requestId, reused: requestId === existing?.id }
     },
     press(
       { ref, action }: { ref: string; action: string },
@@ -356,17 +368,14 @@ export function createConnections({
           request.expiresAt <= now
         )
           return { kind: 'unavailable' }
-        if (
-          request.state === 'authorizing' &&
-          (request.authorizedBy ?? request.requestedBy) !== link.mintedFor
-        )
-          return { kind: 'unavailable' }
         const client = clientOf()
-        const oauthState = request.state === 'authorizing' ? request.oauthState : createState()
-        const verifier =
-          request.state === 'authorizing'
-            ? open(vaultKey, request.id, request.pkceVerifier)
-            : createPkce().verifier
+        const reuse =
+          request.state === 'authorizing' &&
+          (request.authorizedBy ?? request.requestedBy) === link.mintedFor
+        const oauthState = reuse ? request.oauthState : createState()
+        const verifier = reuse
+          ? open(vaultKey, request.id, request.pkceVerifier)
+          : createPkce().verifier
         const url = authorizeUrl({
           vendor: request.vendor,
           services: request.oauthServices ?? request.services,
@@ -375,7 +384,7 @@ export function createConnections({
           state: oauthState,
           challenge: s256Challenge(verifier),
         })
-        if (request.state === 'open')
+        if (!reuse)
           tx.update(connectionRequest)
             .set({
               state: 'authorizing',
@@ -451,25 +460,42 @@ export function createConnections({
             .from(account)
             .where(and(eq(account.vendor, request.vendor), eq(account.subject, identity.subject)))
             .get()
-          if (
-            previous &&
-            tx
-              .select()
-              .from(accountGrant)
-              .where(
-                and(
-                  eq(accountGrant.accountId, previous.id),
-                  ne(accountGrant.agentGroupId, current.agentGroupId),
-                  notInArray(accountGrant.service, services),
+          const missing = previous
+            ? [
+                ...new Set(
+                  tx
+                    .select({ service: accountGrant.service })
+                    .from(accountGrant)
+                    .where(
+                      and(
+                        eq(accountGrant.accountId, previous.id),
+                        ne(accountGrant.agentGroupId, current.agentGroupId),
+                        notInArray(accountGrant.service, services),
+                      ),
+                    )
+                    .all()
+                    .map(({ service }) => service),
                 ),
-              )
-              .get()
-          )
-            throw new OAuthError(
-              'Consent would remove another group’s services',
-              'shared_services_missing',
-              502,
-            )
+              ]
+            : []
+          if (missing.length) {
+            tx.update(connectionRequest)
+              .set({
+                state: 'open',
+                oauthState: null,
+                pkceVerifier: null,
+                authorizedBy: null,
+                oauthServices: [
+                  ...new Set([...(current.oauthServices ?? current.services), ...missing]),
+                ],
+              })
+              .where(eq(connectionRequest.id, current.id))
+              .run()
+            return {
+              page: { kind: 'shared-services-missing', services: missing },
+              committed: false,
+            }
+          }
           const id = previous?.id ?? `acc-${Bun.randomUUIDv7()}`
           if (material.kind === 'oauth' && material.refreshToken === null && previous) {
             const stored = accountMaterial.parse(JSON.parse(open(vaultKey, id, previous.material)))
@@ -526,6 +552,12 @@ export function createConnections({
             .run()
           return { page: pageFor(requestForState(state)), committed: true }
         })
+        if (result.page.kind === 'shared-services-missing')
+          log({
+            kind: 'account.connect.failed',
+            requestId: request.id,
+            reason: 'shared_services_missing',
+          })
         if (result.committed)
           log({
             kind: 'account.connect.completed',

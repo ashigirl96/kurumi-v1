@@ -20,6 +20,7 @@ import { eq } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 
+import { postInput } from './contract.ts'
 import { container, inboundMessage, outboundMessage, session } from './schema.ts'
 import {
   createSessionLedger,
@@ -632,4 +633,26 @@ test('committed cards use the terminal adapter, deduplicate delivery and fail wi
   expect(
     db.select().from(outboundMessage).where(eq(outboundMessage.id, failed)).get()?.status,
   ).toBe('failed')
+})
+
+test('channel.post accepts text and rejects an agent-forged card body', () => {
+  const input = {
+    id: 'forged',
+    inReplyTo: 'in-test',
+    body: {
+      kind: 'card',
+      card: {
+        owner: 'account.connect',
+        ref: 'cr-forged',
+        title: 'Google',
+        body: 'gmail',
+        buttons: [],
+      },
+    },
+  }
+  expect(postInput.safeParse(input).success).toBe(false)
+  expect(postInput.safeParse({ ...input, body: { kind: 'text', text: 'hello' } }).success).toBe(
+    true,
+  )
+  expect(db.select().from(outboundMessage).all()).toEqual([])
 })
