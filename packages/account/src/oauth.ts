@@ -107,6 +107,13 @@ export function parseTokenResponse(body: unknown): TokenResponse {
       200,
     )
   }
+  if (
+    body.access_token.length === 0 ||
+    body.token_type.toLowerCase() !== 'bearer' ||
+    body.expires_in <= 0 ||
+    !Number.isFinite(new Date(Date.now() + body.expires_in * 1000).getTime())
+  )
+    throw new OAuthError('invalid OAuth token lifetime or type', 'unexpected_response', 200)
   return {
     accessToken: body.access_token,
     tokenType: body.token_type,
@@ -136,6 +143,7 @@ async function requestToken(
 ): Promise<TokenResponse> {
   const response = await fetchImpl(oauthOf(vendor).tokenUrl, {
     method: 'POST',
+    signal: AbortSignal.timeout(30_000),
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ grant_type: grant, ...form }),
   })

@@ -342,7 +342,7 @@ test('completion seals tokens, grants covered requested services, injects the ac
       .map(({ service }) => service),
   ).toEqual(['gmail', 'google-calendar'])
   expect(upstream.ledger.candidates('work', 'gmail')).toHaveLength(1)
-  const credential = upstream.ledger.credentialFor(
+  const credential = await upstream.ledger.credentialFor(
     { agentGroupId: 'work' },
     {
       host: 'gmail.googleapis.com',
@@ -650,7 +650,7 @@ test('reconnecting without a new refresh token keeps the stored refresh token', 
 test.each([
   ['exchange', 'invalid_grant'],
   ['identity', 'missing_id_token'],
-  ['validation', 'ZodError'],
+  ['validation', 'unexpected_response'],
 ] as const)('a failed %s logs only the request id and reason', async (failure, reason) => {
   const events: unknown[] = []
   tokenEndpoint(

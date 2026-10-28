@@ -459,7 +459,7 @@ test('a container selector follows a later default and keeps the OAuth beta', as
   expect(upstream.requests[0]?.headers['anthropic-beta']).toBe('oauth-2025-04-20')
 })
 
-test('credential injection refuses a non-443 port before choosing an account', () => {
+test('credential injection refuses a non-443 port before choosing an account', async () => {
   const inject = credentialInject({
     credentialFor: () => {
       throw new Error('no account should be chosen')
@@ -467,7 +467,7 @@ test('credential injection refuses a non-443 port before choosing an account', (
   })
 
   expect(
-    inject({
+    await inject({
       principal: { agentGroupId: 'g1' },
       host: 'api.anthropic.com',
       port: 8443,
@@ -1092,15 +1092,16 @@ test('a passthrough CONNECT to a non-public address is logged as refused', async
   ])
 })
 
-test('an injected request names the service of the injection the ledger chose', () => {
+test('an injected request names the service of the injection the ledger chose', async () => {
   const handle = accountHandle('anthropic', 'main')
   const inject = credentialInject({
-    credentialFor: (_principal, egress) => ({
+    credentialFor: async (_principal, egress) => ({
       kind: 'inject',
       injection: {
         service: 'anthropic-api',
         handle,
         accountId: 'a1',
+        unauthorized: () => {},
         apply: () => ({ path: egress.path, headers: egress.headers }),
         toJSON: () => {
           throw new Error('an injection is never serialized')
@@ -1109,7 +1110,7 @@ test('an injected request names the service of the injection the ledger chose', 
     }),
   })
   expect(
-    inject({
+    await inject({
       principal: { agentGroupId: 'g1' },
       host: 'api.anthropic.com',
       port: 443,
@@ -2456,3 +2457,36 @@ describe('an approved request the upstream never received', () => {
     },
   )
 })
+
+test.each([false, true])(
+  'upstream 401 invalidates the injection once without replay (upgrade=%s)',
+  async (upgrade) => {
+    const unauthorized = jest.fn(() => {})
+    const inject = credentialInject({
+      credentialFor: async (_principal, egress) => ({
+        kind: 'inject',
+        injection: {
+          service: 'anthropic-api',
+          handle: accountHandle('anthropic', 'main'),
+          accountId: 'a1',
+          apply: () => ({ path: egress.path, headers: egress.headers }),
+          unauthorized,
+          toJSON: () => {
+            throw new Error('never serialize an injection')
+          },
+        },
+      }),
+    })
+    const { upstream, tunnel } = await setupCredentials({ inject })
+    upstream.setResponse('/v1/models', { status: 401, body: 'rejected' })
+    const response = upgrade
+      ? await exchangeRaw(
+          tunnel.socket,
+          'GET /v1/models HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n',
+        )
+      : await sendTestRequest(tunnel, { method: 'GET', path: '/v1/models' })
+    expect(response.status).toBe(401)
+    expect(unauthorized).toHaveBeenCalledTimes(1)
+    expect(upstream.requests).toHaveLength(1)
+  },
+)

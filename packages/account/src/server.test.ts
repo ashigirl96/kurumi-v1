@@ -11,6 +11,7 @@ import { createRouterClient, ORPCError } from '@orpc/server'
 import { eq, sql } from 'drizzle-orm'
 
 import { KEY_MAX_LENGTH } from './contract.ts'
+import { tokenFull, refreshFull } from './fixtures/google/token-responses.ts'
 import { account, accountGrant, defaultAccount } from './schema.ts'
 import {
   accountHandle,
@@ -335,6 +336,7 @@ describe('key accounts', () => {
       kind: 'key',
       services: ['anthropic-api'],
       autoGrant: true,
+      status: 'active',
     })
   })
 
@@ -538,6 +540,7 @@ describe('the account router', () => {
       kind: 'key',
       services: ['anthropic-api'],
       autoGrant: true,
+      status: 'active',
     })
   })
 
@@ -752,8 +755,8 @@ describe('the credential for a Google request', () => {
     ],
     ['group 2 naming no account gets its gmail default', 'g2', gmail(), handleB, 'ya29.key-of-b'],
     ['group 2 calendar uses its only grant', 'g2', calendar, handleA, 'ya29.key-of-a'],
-  ])('%s', (_name, group, request, handle, key) => {
-    expect(sent(decide(group, request))).toEqual({
+  ])('%s', async (_name, group, request, handle, key) => {
+    expect(sent(await decide(group, request))).toEqual({
       handle,
       path: request.path,
       headers: { authorization: `Bearer ${key}` },
@@ -763,15 +766,15 @@ describe('the credential for a Google request', () => {
   test.each([
     ['gmail', gmail()],
     ['google-calendar', calendar],
-  ] as const)('an injection names %s, the service it was decided for', (service, request) => {
-    const decision = decide('g2', request)
+  ] as const)('an injection names %s, the service it was decided for', async (service, request) => {
+    const decision = await decide('g2', request)
     if (decision.kind !== 'inject') throw new Error(`expected an injection, not ${decision.kind}`)
 
     expect(decision.injection.service).toBe(service)
   })
 
-  test('an account the group was not granted is refused with the handles it was', () => {
-    expect(decide('g2', gmail('Bearer kurumi:google/a@work.example'))).toEqual({
+  test('an account the group was not granted is refused with the handles it was', async () => {
+    expect(await decide('g2', gmail('Bearer kurumi:google/a@work.example'))).toEqual({
       kind: 'refuse',
       refusal: {
         code: 'account_not_granted',
@@ -782,17 +785,17 @@ describe('the credential for a Google request', () => {
     })
   })
 
-  test('a group without a grant for the service is not connected', () => {
-    expect(decide('g3', gmail())).toEqual({
+  test('a group without a grant for the service is not connected', async () => {
+    expect(await decide('g3', gmail())).toEqual({
       kind: 'refuse',
       refusal: { code: 'account_not_connected', service: 'gmail' },
     })
   })
 
-  test('several grants are ambiguous once the default is cleared', () => {
+  test('several grants are ambiguous once the default is cleared', async () => {
     db.transaction((tx) => ledger.clearDefault(tx, { agentGroupId: 'g1', service: 'gmail' }))
 
-    expect(decide('g1', gmail())).toEqual({
+    expect(await decide('g1', gmail())).toEqual({
       kind: 'refuse',
       refusal: {
         code: 'account_ambiguous',
@@ -802,9 +805,12 @@ describe('the credential for a Google request', () => {
     })
   })
 
-  test('a path on an intercepted host that names no service passes untouched', () => {
+  test('a path on an intercepted host that names no service passes untouched', async () => {
     expect(
-      decide('g1', egress('www.googleapis.com', '/discovery/v1/apis', [['Authorization', 'x']])),
+      await decide(
+        'g1',
+        egress('www.googleapis.com', '/discovery/v1/apis', [['Authorization', 'x']]),
+      ),
     ).toEqual({ kind: 'pass' })
   })
 
@@ -817,12 +823,18 @@ describe('the credential for a Google request', () => {
       'material that holds no key',
       () => sealMaterial('acc-b', JSON.stringify({ kind: 'oauth', accessToken: 'ya29.x' })),
     ],
-  ])('%s makes the chosen account need re-authorization', (_name, spoil) => {
+  ])('%s makes the chosen account need re-authorization', async (_name, spoil) => {
     spoil()
 
-    expect(decide('g2', gmail())).toEqual({
+    expect(await decide('g2', gmail())).toEqual({
       kind: 'refuse',
-      refusal: { code: 'account_needs_reauth', service: 'gmail', handle: handleB },
+      refusal: {
+        code: 'account_needs_reauth',
+        service: 'gmail',
+        handle: handleB,
+        agentGroupId: 'g2',
+        services: ['gmail', 'google-calendar'],
+      },
     })
   })
 })
@@ -832,7 +844,7 @@ describe('the slot an Anthropic account is written to', () => {
     ['the group selector', `Bearer ${anthropicGroupSelector}`],
     ['a named selector', 'Bearer kurumi:anthropic/main'],
     ['the client own credential', 'Bearer sk-ant-oat01-client-own'],
-  ])('%s is replaced with the account bearer', (_name, authorization) => {
+  ])('%s is replaced with the account bearer', async (_name, authorization) => {
     addKey({ autoGrant: true })
 
     const request = anthropicApi([
@@ -840,7 +852,7 @@ describe('the slot an Anthropic account is written to', () => {
       ['anthropic-version', '2023-06-01'],
     ])
 
-    expect(sent(decide('g1', request))).toEqual({
+    expect(sent(await decide('g1', request))).toEqual({
       handle: accountHandle('anthropic', 'main'),
       path: '/v1/messages',
       headers: {
@@ -851,14 +863,14 @@ describe('the slot an Anthropic account is written to', () => {
     })
   })
 
-  test('the raw path goes upstream as written', () => {
+  test('the raw path goes upstream as written', async () => {
     addKey({ autoGrant: true })
     const path = '/v1/./models/../messages?beta=%2Fx%41&q=a+b'
 
-    expect(sent(decide('g1', anthropicApi([], path))).path).toBe(path)
+    expect(sent(await decide('g1', anthropicApi([], path))).path).toBe(path)
   })
 
-  test('two Authorization lines are refused before any account is chosen', () => {
+  test('two Authorization lines are refused before any account is chosen', async () => {
     addKey({ autoGrant: true })
 
     const request = anthropicApi([
@@ -866,13 +878,13 @@ describe('the slot an Anthropic account is written to', () => {
       ['authorization', 'x'],
     ])
 
-    expect(decide('g1', request)).toEqual({
+    expect(await decide('g1', request)).toEqual({
       kind: 'refuse',
       refusal: { code: 'duplicate_slot', service: 'anthropic-api', header: 'authorization' },
     })
   })
 
-  test('x-api-key beside X_Api_Key is a duplicate slot', () => {
+  test('x-api-key beside X_Api_Key is a duplicate slot', async () => {
     addKey({ autoGrant: true })
 
     const request = anthropicApi([
@@ -880,13 +892,13 @@ describe('the slot an Anthropic account is written to', () => {
       ['X_Api_Key', 'sk-ant-other'],
     ])
 
-    expect(decide('g1', request)).toEqual({
+    expect(await decide('g1', request)).toEqual({
       kind: 'refuse',
       refusal: { code: 'duplicate_slot', service: 'anthropic-api', header: 'x-api-key' },
     })
   })
 
-  test('a selector in Authorization beside one in x-api-key is refused', () => {
+  test('a selector in Authorization beside one in x-api-key is refused', async () => {
     addKey({ autoGrant: true })
 
     const request = anthropicApi([
@@ -894,7 +906,7 @@ describe('the slot an Anthropic account is written to', () => {
       ['x-api-key', anthropicGroupSelector],
     ])
 
-    expect(decide('g1', request)).toEqual({
+    expect(await decide('g1', request)).toEqual({
       kind: 'refuse',
       refusal: {
         code: 'selector_unreadable',
@@ -944,21 +956,21 @@ describe('the slot an Anthropic account is written to', () => {
       ],
       `claude-code-20250219,${oauthBeta}`,
     ],
-  ] as const)('an account lists the OAuth beta once after %s', (_client, lines, beta) => {
+  ] as const)('an account lists the OAuth beta once after %s', async (_client, lines, beta) => {
     addKey({ autoGrant: true })
 
-    expect(betaLines(sent(decide('g1', anthropicApi(lines))).headers)).toEqual([
+    expect(betaLines(sent(await decide('g1', anthropicApi(lines))).headers)).toEqual([
       ['anthropic-beta', beta],
     ])
   })
 
-  test('a selector kurumi cannot read is refused with the selectors the group may write', () => {
+  test('a selector kurumi cannot read is refused with the selectors the group may write', async () => {
     addKey({ autoGrant: true })
     addKey({ label: 'second', value: secondSecret, autoGrant: true })
 
     const request = anthropicApi([['Authorization', 'Bearer sk-ant-kurumi-anthropic/second']])
 
-    expect(decide('g1', request)).toEqual({
+    expect(await decide('g1', request)).toEqual({
       kind: 'refuse',
       refusal: {
         code: 'selector_unreadable',
@@ -974,10 +986,10 @@ describe('the slot an Anthropic account is written to', () => {
     })
   })
 
-  test('an injection holds its secret only for apply', () => {
+  test('an injection holds its secret only for apply', async () => {
     addKey({ autoGrant: true })
 
-    const decision = decide('g1', anthropicApi())
+    const decision = await decide('g1', anthropicApi())
     if (decision.kind !== 'inject') throw new Error(`expected an injection, not ${decision.kind}`)
 
     expect(decision.injection.apply().headers.get('authorization')).toBe(`Bearer ${secret}`)
@@ -995,28 +1007,28 @@ const clientLines = (env: Record<string, string>): [string, string][] => [
 const fromContainer = () => decide('g1', anthropicApi(clientLines(ledger.containerEnv())))
 
 describe('the container env as the client credential', () => {
-  test('one grant is used', () => {
+  test('one grant is used', async () => {
     addKey({ autoGrant: true })
 
-    expect(sent(fromContainer())).toMatchObject({ handle: 'anthropic/main' })
+    expect(sent(await fromContainer())).toMatchObject({ handle: 'anthropic/main' })
   })
 
-  test('the default is used among several grants', () => {
+  test('the default is used among several grants', async () => {
     addKey({ autoGrant: true })
     addKey({ label: 'second', value: secondSecret, autoGrant: true })
     setDefault('g1', idOf('second'), 'anthropic-api')
 
-    expect(sent(fromContainer())).toMatchObject({
+    expect(sent(await fromContainer())).toMatchObject({
       handle: 'anthropic/second',
       headers: { authorization: `Bearer ${secondSecret}` },
     })
   })
 
-  test('several grants without a default are ambiguous', () => {
+  test('several grants without a default are ambiguous', async () => {
     addKey({ autoGrant: true })
     addKey({ label: 'second', value: secondSecret, autoGrant: true })
 
-    expect(fromContainer()).toEqual({
+    expect(await fromContainer()).toEqual({
       kind: 'refuse',
       refusal: {
         code: 'account_ambiguous',
@@ -1026,8 +1038,8 @@ describe('the container env as the client credential', () => {
     })
   })
 
-  test('no grant is not connected', () => {
-    expect(fromContainer()).toEqual({
+  test('no grant is not connected', async () => {
+    expect(await fromContainer()).toEqual({
       kind: 'refuse',
       refusal: { code: 'account_not_connected', service: 'anthropic-api' },
     })
@@ -1037,18 +1049,18 @@ describe('the container env as the client credential', () => {
 describe('the methods a credential travels on', () => {
   const allowed = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']
 
-  test.each(allowed)('%s carries the credential', (method) => {
+  test.each(allowed)('%s carries the credential', async (method) => {
     addKey({ autoGrant: true })
 
-    expect(decide('g1', anthropicApi([], '/v1/messages', method)).kind).toBe('inject')
+    expect((await decide('g1', anthropicApi([], '/v1/messages', method))).kind).toBe('inject')
   })
 
   test.each(['TRACE', 'TRACK', 'CONNECT', 'OPTIONS', 'PROPFIND'])(
     '%s is refused and carries no credential',
-    (method) => {
+    async (method) => {
       addKey({ autoGrant: true })
 
-      expect(decide('g1', anthropicApi([], '/v1/messages', method))).toEqual({
+      expect(await decide('g1', anthropicApi([], '/v1/messages', method))).toEqual({
         kind: 'refuse',
         refusal: { code: 'method_not_allowed', service: 'anthropic-api', method, allowed },
       })
@@ -1056,7 +1068,7 @@ describe('the methods a credential travels on', () => {
   )
 })
 
-test('the selector a container got at spawn follows every later grant change', () => {
+test('the selector a container got at spawn follows every later grant change', async () => {
   const [selector = ''] = Object.values(ledger.containerEnv())
   const decideAsSpawned = () =>
     decide('g1', anthropicApi([['Authorization', `Bearer ${selector}`]]))
@@ -1064,31 +1076,31 @@ test('the selector a container got at spawn follows every later grant change', (
   const second = accountHandle('anthropic', 'second')
 
   addKey({ autoGrant: true })
-  expect(sent(decideAsSpawned())).toMatchObject({
+  expect(sent(await decideAsSpawned())).toMatchObject({
     handle: main,
     headers: { authorization: `Bearer ${secret}` },
   })
 
   addKey({ label: 'second', value: secondSecret, autoGrant: true })
-  expect(decideAsSpawned()).toEqual({
+  expect(await decideAsSpawned()).toEqual({
     kind: 'refuse',
     refusal: { code: 'account_ambiguous', service: 'anthropic-api', granted: [main, second] },
   })
 
   setDefault('g1', idOf('second'), 'anthropic-api')
-  expect(sent(decideAsSpawned())).toMatchObject({
+  expect(sent(await decideAsSpawned())).toMatchObject({
     handle: second,
     headers: { authorization: `Bearer ${secondSecret}` },
   })
 
   revoke('g1', idOf('second'), 'anthropic-api')
-  expect(sent(decideAsSpawned())).toMatchObject({ handle: main })
+  expect(sent(await decideAsSpawned())).toMatchObject({ handle: main })
 
   db.transaction((tx) => {
     ledger.remove(tx, main)
     ledger.remove(tx, second)
   })
-  expect(decideAsSpawned()).toEqual({
+  expect(await decideAsSpawned()).toEqual({
     kind: 'refuse',
     refusal: { code: 'account_not_connected', service: 'anthropic-api' },
   })
@@ -1109,5 +1121,295 @@ describe('the container env', () => {
 
     revoke('g1', idOf('second'), 'anthropic-api')
     expect(ledger.containerEnv()).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: anthropicGroupSelector })
+  })
+})
+
+const held = () => db.select().from(account).where(eq(account.id, 'acc-a')).get()!
+
+const material = () => JSON.parse(open(vaultKey, 'acc-a', held().material))
+
+describe('Google token refresh', () => {
+  const request = egress('gmail.googleapis.com', '/gmail/v1/users/me/profile')
+  const initial = {
+    kind: 'oauth',
+    accessToken: 'old-access',
+    refreshToken: 'old-refresh',
+    grantedScopes: tokenFull.scope.split(' '),
+  }
+
+  function setup(reply: (init?: RequestInit) => Response | Promise<Response>) {
+    let calls = 0
+    const events: unknown[] = []
+    const fetchImpl: typeof fetch = Object.assign(
+      async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        expect(db.$client.inTransaction).toBe(false)
+        calls++
+        return reply(init)
+      },
+      { preconnect: fetch.preconnect },
+    )
+    ledger = createAccountLedger({
+      db,
+      vaultKey,
+      fetch: fetchImpl,
+      log: (event) => events.push(event),
+    })
+    ledger.connections.setClient({ clientId: 'test-client', clientSecret: 'test-secret' })
+    db.update(account)
+      .set({
+        subject: '100000000000000000001',
+        material: seal(vaultKey, 'acc-a', JSON.stringify(initial)),
+        accessExpiresAt: new Date(0),
+      })
+      .where(eq(account.id, 'acc-a'))
+      .run()
+    grant('g1', 'acc-a', 'gmail')
+    grant('g2', 'acc-a', 'google-calendar')
+    return { calls: () => calls, events }
+  }
+
+  test('twenty concurrent calls across groups and services share one refresh and retain its rotated token', async () => {
+    const response = Promise.withResolvers<Response>()
+    const endpoint = setup((init) => {
+      expect(init?.body instanceof URLSearchParams ? init.body.get('refresh_token') : null).toBe(
+        'old-refresh',
+      )
+      return response.promise
+    })
+    const calls = Array.from({ length: 20 }, (_, i) =>
+      i % 2 === 0
+        ? decide('g1', request)
+        : decide('g2', egress('www.googleapis.com', '/calendar/v3/calendars/primary/events')),
+    )
+    expect(endpoint.calls()).toBe(1)
+    response.resolve(Response.json({ ...refreshFull, refresh_token: 'rotated-refresh' }))
+    for (const decision of await Promise.all(calls))
+      expect(sent(decision).headers.authorization).toBe(`Bearer ${refreshFull.access_token}`)
+    expect(material().refreshToken).toBe('rotated-refresh')
+    expect(held().accessExpiresAt!.getTime()).toBeGreaterThan(Date.now() + 3_500_000)
+    expect(endpoint.events).toEqual([
+      {
+        kind: 'account.refresh',
+        accountId: 'acc-a',
+        outcome: 'fresh',
+        durationMs: expect.any(Number),
+      },
+    ])
+    await decide('g1', request)
+    expect(endpoint.calls()).toBe(1)
+  })
+
+  test('a fresh token skips refresh, and one with sixty seconds left refreshes while keeping the stored refresh token', async () => {
+    const endpoint = setup(() => Response.json(refreshFull))
+    db.update(account)
+      .set({ accessExpiresAt: new Date(Date.now() + 120_000) })
+      .where(eq(account.id, 'acc-a'))
+      .run()
+    expect(sent(await decide('g1', request)).headers.authorization).toBe('Bearer old-access')
+    expect(endpoint.calls()).toBe(0)
+    db.update(account)
+      .set({ accessExpiresAt: new Date(Date.now() + 60_000) })
+      .where(eq(account.id, 'acc-a'))
+      .run()
+    expect((await decide('g1', request)).kind).toBe('inject')
+    expect(material().refreshToken).toBe('old-refresh')
+    expect(endpoint.calls()).toBe(1)
+  })
+
+  test.each([
+    'invalid_grant',
+    'invalid_client',
+    'unauthorized_client',
+    'access_denied',
+    'invalid_scope',
+  ])('%s marks needs_reauth and reconnecting the same subject clears it', async (error) => {
+    let reconnect = false
+    const endpoint = setup(() =>
+      reconnect ? Response.json(tokenFull) : Response.json({ error }, { status: 400 }),
+    )
+    expect(await decide('g1', request)).toEqual({
+      kind: 'refuse',
+      refusal: {
+        code: 'account_needs_reauth',
+        service: 'gmail',
+        handle: handleA,
+        agentGroupId: 'g1',
+        services: ['gmail', 'google-calendar'],
+      },
+    })
+    expect(held().status).toBe('needs_reauth')
+    expect(ledger.list().find(({ handle }) => handle === handleA)?.status).toBe('needs_reauth')
+    await decide('g1', request)
+    expect(endpoint.calls()).toBe(1)
+    reconnect = true
+    const link = ledger.connections.connect(
+      { services: ['gmail'], agentGroupId: 'g1' },
+      { kind: 'host' },
+    )
+    const authorize = ledger.connections.openLink(new URL(link.url).pathname.split('/').at(-1)!)
+    if (authorize.kind !== 'authorize') throw new Error('expected authorization')
+    const page = await ledger.connections.callback(
+      new URL(
+        `http://127.0.0.1:4001/oauth/callback?state=${authorize.url.searchParams.get('state')}&code=new-code`,
+      ),
+    )
+    expect(page.kind).toBe('completed')
+    expect(held().status).toBe('active')
+    expect(sent(await decide('g1', request)).headers.authorization).toBe(
+      `Bearer ${tokenFull.access_token}`,
+    )
+  })
+
+  test.each(['network', 'timeout', 'server', 'invalid-token', 'unexpected-4xx'])(
+    '%s failure leaves the account active and the next call retries',
+    async (reason) => {
+      let failed = false
+      const endpoint = setup(() => {
+        if (failed) return Response.json(refreshFull)
+        failed = true
+        if (reason === 'network') throw new TypeError('network down')
+        if (reason === 'timeout') throw new DOMException('deadline', 'TimeoutError')
+        if (reason === 'unexpected-4xx') return new Response('not JSON', { status: 400 })
+        if (reason === 'invalid-token') return Response.json({ ...refreshFull, expires_in: -1 })
+        return Response.json({ error: 'invalid_grant' }, { status: 503 })
+      })
+      expect(await decide('g1', request)).toEqual({
+        kind: 'refuse',
+        refusal: { code: 'account_refresh_failed', service: 'gmail', handle: handleA },
+      })
+      expect(held().status).toBe('active')
+      expect(material()).toEqual(initial)
+      expect((await decide('g1', request)).kind).toBe('inject')
+      expect(endpoint.calls()).toBe(2)
+    },
+  )
+
+  test.each(['set-client', 'revoke', 'remove'])(
+    'a concurrent %s cannot be overwritten or bypassed by an old refresh',
+    async (change) => {
+      const response = Promise.withResolvers<Response>()
+      setup(() => response.promise)
+      const pending = decide('g1', request)
+      if (change === 'set-client')
+        ledger.connections.setClient({
+          clientId: 'replacement',
+          clientSecret: 'replacement-secret',
+        })
+      else if (change === 'revoke') revoke('g1', 'acc-a', 'gmail')
+      else db.transaction((tx) => ledger.remove(tx, handleA))
+      response.resolve(Response.json(refreshFull))
+      expect((await pending).kind).toBe('refuse')
+      if (change === 'set-client') expect(material()).toEqual(initial)
+      if (change === 'remove') expect(held()).toBeUndefined()
+    },
+  )
+
+  test.each([400, 401, 403, 429, 499])(
+    'OAuth %i marks needs_reauth without retrying',
+    async (status) => {
+      const endpoint = setup(() => Response.json({ error: 'unauthorized_client' }, { status }))
+      expect((await decide('g1', request)).kind).toBe('refuse')
+      expect(held().status).toBe('needs_reauth')
+      await decide('g1', request)
+      expect(endpoint.calls()).toBe(1)
+    },
+  )
+
+  test('an upstream rejection expires only the injected OAuth material and the next request refreshes', async () => {
+    const endpoint = setup(() => Response.json({ error: 'invalid_grant' }, { status: 400 }))
+    db.update(account)
+      .set({ accessExpiresAt: new Date(Date.now() + 3_600_000) })
+      .where(eq(account.id, 'acc-a'))
+      .run()
+    const decision = await decide('g1', request)
+    if (decision.kind !== 'inject') throw new Error('expected injection')
+    decision.injection.unauthorized()
+    expect(held().accessExpiresAt?.getTime()).toBe(0)
+    expect(await decide('g1', request)).toMatchObject({
+      kind: 'refuse',
+      refusal: { code: 'account_needs_reauth', services: ['gmail', 'google-calendar'] },
+    })
+    expect(endpoint.calls()).toBe(1)
+  })
+
+  test.each(['reconnect', 'refresh'])(
+    'a late upstream rejection cannot expire material replaced by %s',
+    async (change) => {
+      setup(() => Response.json(refreshFull))
+      db.update(account)
+        .set({ accessExpiresAt: new Date(Date.now() + 3_600_000) })
+        .where(eq(account.id, 'acc-a'))
+        .run()
+      const decision = await decide('g1', request)
+      if (decision.kind !== 'inject') throw new Error('expected injection')
+      if (change === 'reconnect')
+        sealMaterial('acc-a', JSON.stringify({ ...initial, accessToken: 'new-access' }))
+      else {
+        decision.injection.unauthorized()
+        await decide('g1', request)
+      }
+      const expiresAt = held().accessExpiresAt
+      decision.injection.unauthorized()
+      expect(held().accessExpiresAt).toEqual(expiresAt)
+      expect((await decide('g1', request)).kind).toBe('inject')
+    },
+  )
+
+  test.each(['inherited', 'replaced', 'failure'])(
+    'a reconnect during refresh uses current material with a %s refresh token',
+    async (mode) => {
+      const response = Promise.withResolvers<Response>()
+      setup((init) =>
+        init?.body instanceof URLSearchParams && init.body.get('grant_type') === 'refresh_token'
+          ? response.promise
+          : Response.json({
+              ...tokenFull,
+              access_token: 'reconnected',
+              refresh_token: mode === 'replaced' ? 'new-refresh' : undefined,
+            }),
+      )
+      const pending = decide('g1', request)
+      const link = ledger.connections.connect(
+        { services: ['gmail', 'google-calendar'], agentGroupId: 'g1' },
+        { kind: 'host' },
+      )
+      const authorize = ledger.connections.openLink(new URL(link.url).pathname.split('/').at(-1)!)
+      if (authorize.kind !== 'authorize') throw new Error('expected authorization')
+      expect(
+        (
+          await ledger.connections.callback(
+            new URL(
+              `http://127.0.0.1:4001/oauth/callback?state=${authorize.url.searchParams.get('state')}&code=new-code`,
+            ),
+          )
+        ).kind,
+      ).toBe('completed')
+      response.resolve(
+        mode === 'failure'
+          ? Response.json({ error: 'invalid_grant' }, { status: 400 })
+          : Response.json({ ...refreshFull, refresh_token: 'rotated-refresh' }),
+      )
+      expect(sent(await pending).headers.authorization).toBe(
+        `Bearer ${mode === 'inherited' ? refreshFull.access_token : 'reconnected'}`,
+      )
+      expect(material().refreshToken).toBe(
+        mode === 'inherited'
+          ? 'rotated-refresh'
+          : mode === 'replaced'
+            ? 'new-refresh'
+            : 'old-refresh',
+      )
+      expect(held().status).toBe('active')
+    },
+  )
+
+  test('an expired token without a refresh token needs reauthorization', async () => {
+    const endpoint = setup(() => {
+      throw new Error('must not refresh')
+    })
+    sealMaterial('acc-a', JSON.stringify({ ...initial, refreshToken: null }))
+    expect((await decide('g1', request)).kind).toBe('refuse')
+    expect(held().status).toBe('needs_reauth')
+    expect(endpoint.calls()).toBe(0)
   })
 })

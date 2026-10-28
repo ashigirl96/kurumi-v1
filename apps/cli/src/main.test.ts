@@ -97,6 +97,32 @@ test('account connect prints a plain link for the requested services and group',
   expect(stdout).toBe('http://127.0.0.1:42331/connect/test-token\n')
 })
 
+test('account list shows needs_reauth and active beside each account', async () => {
+  const accounts = ['needs_reauth', 'active'].map((status, index) => ({
+    handle: `google/test-${index}`,
+    kind: 'oauth',
+    services: ['gmail'],
+    autoGrant: false,
+    status,
+  }))
+  expect(
+    await runCommand(['account', 'list'], {
+      contract: cliContract,
+      link: answering(accounts),
+      stdin: piped(''),
+    }),
+  ).toBe(0)
+  expect(
+    stdout
+      .trim()
+      .split('\n')
+      .map((line) => line.trim().split(/\s+/)),
+  ).toEqual([
+    ['google/test-0', 'oauth', 'gmail', 'needs_reauth'],
+    ['google/test-1', 'oauth', 'gmail', 'active'],
+  ])
+})
+
 test('the CLI builds from the full host contract and status answers', async () => {
   expect(await run(['status'], piped(''))).toBe(0)
 
