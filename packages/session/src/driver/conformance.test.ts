@@ -293,6 +293,117 @@ test('repeated early exits increase backoff and completed work resets it', async
   ).toEqual([250, 500, 250])
 })
 
+test('three container deaths fail only the poisonous inbound, even across a host restart', async () => {
+  await ledger.start()
+  const poison = event('poison')
+  const accepted = await ledger.routeInbound(poison)
+  for (let index = 0; index < 2; index++) {
+    await until(() => driver.runs.length === index + 1)
+    await ledger.channel.pull(principal(index), { waitMs: 0 })
+    await driver.kill(principal(index).containerId, 0)
+    await until(() => db.select().from(container).all().length === 0)
+  }
+  await ledger.stop()
+  ledger = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: configured,
+    runtimeLog: (entry) => logs.push(entry),
+  })
+  await ledger.start()
+  await until(() => driver.runs.length === 3)
+  const last = principal(2)
+  await ledger.channel.pull(last, { waitMs: 0 })
+  await driver.kill(last.containerId, 0)
+  await driver.kill(last.containerId, 0)
+  expect(db.select().from(inboundMessage).get()).toMatchObject({
+    id: accepted.inboundId,
+    status: 'failed',
+    tries: 3,
+    claimedBy: null,
+  })
+  expect(logs.filter((entry) => entry.kind === 'session.inbound.exhausted')).toEqual([
+    expect.objectContaining({ inboundId: accepted.inboundId, tries: 3 }),
+  ])
+  await ledger.routeInbound(poison)
+  await Bun.sleep(1300)
+  expect(driver.runs).toHaveLength(3)
+  const next = await ledger.routeInbound(event('healthy'))
+  expect(next.sessionId).toBe(accepted.sessionId)
+  await until(() => driver.runs.length === 4)
+  const who = principal(3)
+  expect((await ledger.channel.pull(who, { waitMs: 0 })).messages.map(({ id }) => id)).toEqual([
+    next.inboundId,
+  ])
+  await ledger.channel.complete(who, { ids: [next.inboundId] })
+  expect(db.select().from(inboundMessage).all()).toMatchObject([
+    { id: accepted.inboundId, status: 'failed', tries: 3 },
+    { id: next.inboundId, status: 'completed', tries: 1 },
+  ])
+})
+
+test('an exhausted inbound leaves already queued work with its own full budget', async () => {
+  await ledger.start()
+  const poison = await ledger.routeInbound(event('poison'))
+  const next = await ledger.routeInbound(event('healthy'))
+  for (let index = 0; index < 3; index++) {
+    await until(() => driver.runs.length === index + 1)
+    const who = principal(index)
+    await ledger.channel.pull(who, { waitMs: 0 })
+    await driver.kill(who.containerId, 0)
+  }
+  expect(db.select().from(inboundMessage).all()).toMatchObject([
+    { id: poison.inboundId, status: 'failed', tries: 3 },
+    { id: next.inboundId, status: 'pending', tries: 0 },
+  ])
+  await until(() => driver.runs.length === 4)
+  const who = principal(3)
+  expect((await ledger.channel.pull(who, { waitMs: 0 })).messages[0]?.id).toBe(next.inboundId)
+  await ledger.channel.complete(who, { ids: [next.inboundId] })
+  await driver.kill(who.containerId, 0)
+  await Bun.sleep(400)
+  expect(driver.runs).toHaveLength(4)
+  expect(db.select().from(inboundMessage).all()).toMatchObject([
+    { id: poison.inboundId, status: 'failed', tries: 3 },
+    { id: next.inboundId, status: 'completed', tries: 1 },
+  ])
+})
+
+test('startup failures consume the inbound budget without needing a claim', async () => {
+  driver.result = { ok: false, reason: 'cannot start' }
+  await ledger.start()
+  await ledger.routeInbound(event('work'))
+  await until(() => driver.runs.length === 3)
+  await until(() => db.select().from(container).all().length === 0)
+  expect(db.select().from(inboundMessage).get()).toMatchObject({
+    status: 'failed',
+    tries: 3,
+    claimedBy: null,
+  })
+  await Bun.sleep(1300)
+  expect(driver.runs).toHaveLength(3)
+})
+
+test('idle container deaths do not charge deferred input or launch it before it is due', async () => {
+  const accepted = await ledger.routeInbound(event('work'))
+  const who = principal()
+  await ledger.channel.pull(who, { waitMs: 0 })
+  await ledger.channel.complete(who, { ids: [accepted.inboundId] })
+  const later = await ledger.routeInbound(event('later'))
+  db.update(inboundMessage)
+    .set({ processAfter: new Date(Date.now() + 60_000) })
+    .where(eq(inboundMessage.id, later.inboundId))
+    .run()
+  await ledger.start()
+  await driver.kill(who.containerId, 0)
+  await Bun.sleep(400)
+  expect(driver.runs).toHaveLength(1)
+  expect(
+    db.select().from(inboundMessage).where(eq(inboundMessage.id, later.inboundId)).get(),
+  ).toMatchObject({ status: 'pending', tries: 0 })
+})
+
 test('state and heartbeat remain session scoped and reject revoked incarnations', async () => {
   await ledger.routeInbound(event('work'))
   const who = principal()
@@ -761,6 +872,130 @@ test('detach leaves running agents and removes only an agent that is still start
   expect(exits).toEqual([])
   expect((await dockerDriver.run(agentSpec({ sessionId: 'ses-three' }))).ok).toBe(false)
 })
+
+test.each([0, 2])(
+  'clean host stops during startup preserve pending input with %i prior attempts',
+  async (tries) => {
+    await ledger.stop()
+    const docker = fakeDaemon()
+    const input = event('healthy startup interrupted only by host stop')
+    let open = false
+    configured.egress.admission = () =>
+      open
+        ? { open: true }
+        : { open: false, reason: 'probing', detail: 'test gate', since: new Date() }
+    for (let index = 0; index < 3; index++) {
+      open = false
+      const host = supervisedHost(docker)
+      try {
+        await host.sessions.start()
+        if (index === 0) {
+          await host.sessions.routeInbound(input)
+          db.update(inboundMessage).set({ tries }).run()
+        }
+        docker.hold('create')
+        open = true
+        const routed = host.sessions.routeInbound(input)
+        await until(() => docker.commands('create').length === index + 1)
+        const stopping = host.stop()
+        docker.release('create')
+        await Promise.all([routed, stopping])
+        expect(docker.commands('start')).toHaveLength(0)
+        expect(db.select().from(container).all()).toEqual([])
+        expect(docker.containers.size).toBe(0)
+        expect(db.select().from(inboundMessage).get()).toMatchObject({
+          id: input.messageId,
+          status: 'pending',
+          tries,
+          claimedBy: null,
+        })
+      } finally {
+        docker.release('create')
+        await host.stop()
+      }
+    }
+    expect(logs.filter((entry) => entry.kind === 'session.inbound.exhausted')).toEqual([])
+  },
+)
+
+test.each([0, 2])(
+  'clean host stop after a startup claim releases it without exhausting %i prior attempts',
+  async (tries) => {
+    await ledger.stop()
+    const docker = fakeDaemon()
+    const cli = docker.daemon
+    const started = Promise.withResolvers<void>()
+    docker.daemon = {
+      start(args, options) {
+        const proc = cli.start(args, options)
+        if (args[0] !== 'start') return proc
+        return {
+          kill: () => proc.kill(),
+          result: proc.result.then(async (result) => {
+            await started.promise
+            return result
+          }),
+        }
+      },
+    }
+    let open = false
+    configured.egress.admission = () =>
+      open
+        ? { open: true }
+        : { open: false, reason: 'probing', detail: 'test gate', since: new Date() }
+    const host = supervisedHost(docker)
+    const input = event('runner claimed before startup returned')
+    try {
+      await host.sessions.start()
+      await host.sessions.routeInbound(input)
+      db.update(inboundMessage).set({ tries }).run()
+      open = true
+      const routed = host.sessions.routeInbound(input)
+      await until(() => docker.commands('start').length === 1)
+      const who = host.sessions.authenticate(tokens(docker)[0] ?? '')
+      if (!who) throw new Error('the starting container token was refused')
+      await host.sessions.channel.pull(who, { waitMs: 0 })
+      expect(db.select().from(container).get()?.status).toBe('starting')
+      expect(db.select().from(inboundMessage).get()).toMatchObject({
+        status: 'processing',
+        tries: tries + 1,
+        claimedBy: who.containerId,
+      })
+      const stopping = host.stop()
+      started.resolve()
+      await Promise.all([routed, stopping])
+      expect(docker.containers.size).toBe(0)
+      expect(db.select().from(container).all()).toEqual([])
+      expect(db.select().from(inboundMessage).get()).toMatchObject({
+        status: 'pending',
+        tries: tries + 1,
+        claimedBy: null,
+      })
+      expect(logs.filter((entry) => entry.kind === 'session.inbound.exhausted')).toEqual([])
+    } finally {
+      started.resolve()
+      await host.stop()
+    }
+    const restarted = supervisedHost(docker)
+    try {
+      await restarted.sessions.start()
+      await until(() => docker.commands('start').length === 2)
+      const healthy = await restarted.sessions.routeInbound(event('healthy queued after restart'))
+      expect((await servedOnce(restarted, tokens(docker)[1] ?? '')).messages[0]?.id).toBe(
+        input.messageId,
+      )
+      expect((await servedOnce(restarted, tokens(docker)[1] ?? '')).messages[0]?.id).toBe(
+        healthy.inboundId,
+      )
+      expect(db.select().from(inboundMessage).orderBy(inboundMessage.seq).all()).toMatchObject([
+        { id: input.messageId, status: 'completed', tries: tries + 2 },
+        { id: healthy.inboundId, status: 'completed', tries: 1 },
+      ])
+    } finally {
+      await restarted.stop()
+    }
+  },
+)
 
 test('a removal that gets no answer is killed after the driver timeout instead of hanging', async () => {
   const docker = fakeDaemon()
