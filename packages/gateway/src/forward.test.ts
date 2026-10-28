@@ -1183,11 +1183,13 @@ async function setupHeld({
         return { approvalId }
       },
     },
-    notify: (notice) => {
+    queueNotice: (_tx, notice) => {
       if (notices.some(({ key }) => key === notice.key)) return 'duplicate'
       notices.push(notice)
       return 'queued'
     },
+    deliverNotice: () => {},
+    log: () => {},
     holdMs,
     now,
   })
@@ -1489,7 +1491,7 @@ describe('held requests', () => {
       {
         key: id,
         sessionId: 's1',
-        text: `kurumi: approval ${id} was approved: POST https://api.anthropic.com/v1/messages as anthropic/main. The first attempt ended before the decision. Send exactly the same request with the same body within 10 minutes; it passes once. A changed body needs a new approval.`,
+        text: `kurumi: approval ${id} was approved: POST https://api.anthropic.com/v1/messages as anthropic/main. The first attempt ended before the decision. Send exactly the same request with the same body before ${new Date(at + ALLOWANCE_MS).toISOString()}; it passes once. A changed body needs a new approval.`,
       },
     ])
     expect(allowance(id)).toMatchObject({
