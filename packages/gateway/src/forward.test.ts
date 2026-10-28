@@ -1049,6 +1049,81 @@ test('a request to an intercepted host whose path names no service is logged as 
   expect(events[0]).not.toHaveProperty('account')
 })
 
+test('an accepted passthrough CONNECT logs one principal-attributed row, not its inner requests', async () => {
+  const events: EgressEvent<EgressPrincipal>[] = []
+  const upstream = await startFakeUpstream({ host: '127.0.0.1' })
+  stops.push(upstream.stop)
+  const principal = { agentGroupId: 'g1', sessionId: 's1' }
+  const gateway = await startAgentPort({
+    bind: { host: '127.0.0.1', port: 0 },
+    authenticate: (token) => (token === 'test-token' ? principal : null),
+    intercepts: () => false,
+    addressRefusal: () => () => null,
+    forward: {
+      inject: () => {
+        throw new Error('passthrough must not inspect requests')
+      },
+      log: (event) => events.push(event),
+    },
+  })
+  stops.push(gateway.stop)
+  const tunnel = await openTestTunnel({
+    proxyPort: gateway.port,
+    token: 'test-token',
+    caPem: upstream.caPem,
+    target: { host: '127.0.0.1', port: upstream.port },
+  })
+  stops.push(tunnel.close)
+  expect(events).toEqual([
+    {
+      decision: 'passed',
+      principal,
+      at: expect.any(Number),
+      host: '127.0.0.1',
+      method: 'CONNECT',
+      path: `127.0.0.1:${upstream.port}`,
+      status: 200,
+      durationMs: expect.any(Number),
+    },
+  ])
+  expect((await sendTestRequest(tunnel, { path: '/first?secret=not-logged' })).status).toBe(200)
+  expect((await sendTestRequest(tunnel, { path: '/second' })).status).toBe(200)
+  tunnel.close()
+  await gateway.stop()
+  expect(events).toHaveLength(1)
+})
+
+test.each(['dial', 'dns', 'authentication', 'authority'])(
+  'a CONNECT rejected by %s never logs an accepted tunnel',
+  async (failure) => {
+    const events: EgressEvent<EgressPrincipal>[] = []
+    const upstream = await startFakeUpstream({ host: '127.0.0.1' })
+    await upstream.stop()
+    const gateway = await startAgentPort({
+      bind: { host: '127.0.0.1', port: 0 },
+      authenticate: () =>
+        failure === 'authentication' ? null : { agentGroupId: 'g1', sessionId: 's1' },
+      intercepts: () => false,
+      addressRefusal: () => () => null,
+      resolve: async () => {
+        if (failure === 'dns') throw new Error('DNS failed')
+        return [{ address: '127.0.0.1', family: 4 }]
+      },
+      forward: {
+        inject: ({ path, headers }) => ({ path, headers }),
+        log: (event) => events.push(event),
+      },
+    })
+    stops.push(gateway.stop)
+    const target = failure === 'authority' ? 'invalid.test' : `dial.test:${upstream.port}`
+    expect(await connectStatus(gateway.port, target)).toBe(
+      failure === 'authentication' ? 407 : failure === 'authority' ? 400 : 502,
+    )
+    await gateway.stop()
+    expect(events).toEqual([])
+  },
+)
+
 test('CONNECT to an intercepted host on another port is logged as refused with no service', async () => {
   const events: EgressEvent<CredentialPrincipal>[] = []
   const gateway = await startAgentPort({
