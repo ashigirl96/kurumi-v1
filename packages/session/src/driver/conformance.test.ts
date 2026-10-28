@@ -873,6 +873,51 @@ test('detach leaves running agents and removes only an agent that is still start
   expect((await dockerDriver.run(agentSpec({ sessionId: 'ses-three' }))).ok).toBe(false)
 })
 
+test.each([0, 2])(
+  'clean host stops during startup preserve pending input with %i prior attempts',
+  async (tries) => {
+    await ledger.stop()
+    const docker = fakeDaemon()
+    const input = event('healthy startup interrupted only by host stop')
+    let open = false
+    configured.egress.admission = () =>
+      open
+        ? { open: true }
+        : { open: false, reason: 'probing', detail: 'test gate', since: new Date() }
+    for (let index = 0; index < 3; index++) {
+      open = false
+      const host = supervisedHost(docker)
+      try {
+        await host.sessions.start()
+        if (index === 0) {
+          await host.sessions.routeInbound(input)
+          db.update(inboundMessage).set({ tries }).run()
+        }
+        docker.hold('create')
+        open = true
+        const routed = host.sessions.routeInbound(input)
+        await until(() => docker.commands('create').length === index + 1)
+        const stopping = host.stop()
+        docker.release('create')
+        await Promise.all([routed, stopping])
+        expect(docker.commands('start')).toHaveLength(0)
+        expect(db.select().from(container).all()).toEqual([])
+        expect(docker.containers.size).toBe(0)
+        expect(db.select().from(inboundMessage).get()).toMatchObject({
+          id: input.messageId,
+          status: 'pending',
+          tries,
+          claimedBy: null,
+        })
+      } finally {
+        docker.release('create')
+        await host.stop()
+      }
+    }
+    expect(logs.filter((entry) => entry.kind === 'session.inbound.exhausted')).toEqual([])
+  },
+)
+
 test('a removal that gets no answer is killed after the driver timeout instead of hanging', async () => {
   const docker = fakeDaemon()
   docker.add('kurumi-agent-stuck', {
