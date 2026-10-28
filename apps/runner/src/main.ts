@@ -5,6 +5,7 @@ import type { contract } from '@kurumi/session/contract'
 import { createORPCClient, ORPCError } from '@orpc/client'
 import { RPCLink } from '@orpc/client/fetch'
 import type { ContractRouterClient } from '@orpc/contract'
+import { z } from 'zod'
 
 import { runTurn } from './claude.ts'
 import { createKurumiServer } from './tools.ts'
@@ -12,6 +13,15 @@ import { createKurumiServer } from './tools.ts'
 type Host = ContractRouterClient<{ session: typeof contract }>
 
 const CONTINUATION = 'continuation'
+const storedDeliveryFailure = z.object({ storedOutboundId: z.string() })
+
+function deliveryFailed(error: unknown): boolean {
+  return (
+    error instanceof ORPCError &&
+    error.code === 'SERVICE_UNAVAILABLE' &&
+    storedDeliveryFailure.safeParse(error.data).success
+  )
+}
 
 function slotTaken(error: unknown): boolean {
   return error instanceof ORPCError && error.code === 'CONFLICT'
@@ -35,8 +45,9 @@ export async function runRunner(options: {
     headers: { authorization: `Bearer ${options.token}` },
   })
   const host: Host = createORPCClient(link)
-  async function retry<T>(operation: () => Promise<T>): Promise<T> {
+  async function retry<T>(operation: () => Promise<T>, maxDeliveryFailures = Infinity): Promise<T> {
     let delayMs = 100
+    let deliveryFailures = 0
     while (true) {
       signal.throwIfAborted()
       try {
@@ -44,23 +55,37 @@ export async function runRunner(options: {
       } catch (error) {
         if (signal.aborted) throw error
         if (error instanceof ORPCError && error.status >= 400 && error.status < 500) throw error
+        if (deliveryFailed(error) && ++deliveryFailures >= maxDeliveryFailures) throw error
         options.onRetry?.({ kind: 'runner.retry', delayMs })
         await delay(delayMs, undefined, { signal })
         delayMs = Math.min(delayMs * 2, 5000)
       }
     }
   }
-  async function fillSlot(id: string, inReplyTo: string, text: string): Promise<boolean> {
+  async function fillSlot(
+    id: string,
+    inReplyTo: string,
+    text: string,
+  ): Promise<'delivered' | 'taken' | 'failed'> {
     try {
-      await retry(() =>
-        host.session.channel.post(
-          { id, inReplyTo, to: null, body: { kind: 'text', text } },
-          { signal },
-        ),
+      await retry(
+        () =>
+          host.session.channel.post(
+            { id, inReplyTo, to: null, body: { kind: 'text', text } },
+            { signal },
+          ),
+        8,
       )
-      return true
+      return 'delivered'
     } catch (error) {
-      if (slotTaken(error)) return false
+      if (signal.aborted) throw error
+      if (slotTaken(error)) return 'taken'
+      if (deliveryFailed(error)) {
+        process.stderr.write(
+          `${JSON.stringify({ kind: 'runner.reply.failed', inboundId: inReplyTo, outboundId: id })}\n`,
+        )
+        return 'failed'
+      }
       throw error
     }
   }
@@ -74,6 +99,7 @@ export async function runRunner(options: {
         .catch(() => {})
     }, options.heartbeatMs ?? 10_000)
     let slot = 0
+    let status: 'completed' | 'failed' = 'completed'
     try {
       await runTurn({
         prompt: message.content,
@@ -81,7 +107,12 @@ export async function runRunner(options: {
         continuation: saved.value,
         signal,
         async reply(text) {
-          while (!(await fillSlot(replyId(message.id, slot), message.id, text))) slot++
+          let result = await fillSlot(replyId(message.id, slot), message.id, text)
+          while (result === 'taken') {
+            slot++
+            result = await fillSlot(replyId(message.id, slot), message.id, text)
+          }
+          if (result === 'failed') status = 'failed'
           slot++
         },
         async remember(continuation) {
@@ -93,7 +124,7 @@ export async function runRunner(options: {
     } finally {
       clearInterval(heartbeat)
     }
-    await retry(() => host.session.channel.complete({ ids: [message.id] }, { signal }))
+    await retry(() => host.session.channel.complete({ ids: [message.id], status }, { signal }))
   }
   try {
     while (!signal.aborted) {

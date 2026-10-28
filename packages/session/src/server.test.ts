@@ -754,6 +754,7 @@ test.each(['completed', 'failed'] as const)(
     const other = agents.create({ name: 'other' }).id
     await ledger.routeInbound(event('other', other))
     const stranger = ledger.authenticate(driver.runs[1]?.env.KURUMI_TOKEN ?? '')
+    if (!principal || !stranger) throw new Error('missing live containers')
     await ledger.channel.pull(principal, { waitMs: 0 })
     await rejects(ledger.channel.complete(stranger, { ids: [first.inboundId], status }), {
       code: 'FORBIDDEN',

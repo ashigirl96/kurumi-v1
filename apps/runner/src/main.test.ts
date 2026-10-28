@@ -119,9 +119,9 @@ test('offline replies stop retrying, preserve every reply and later continuation
   try {
     await waitFor(() => host.db.select().from(inboundMessage).all()[0]?.status === 'failed', 26000)
     const offline = host.db.select().from(outboundMessage).all()
-    expect(offline.map((row) => [row.content, row.status, row.attempts])).toEqual([
-      ['first offline reply', 'failed', 8],
-      ['second offline reply', 'failed', 8],
+    expect(offline.map((row) => [row.content, row.status])).toEqual([
+      ['first offline reply', 'failed'],
+      ['second offline reply', 'queued'],
     ])
     await Bun.sleep(150)
     expect(host.db.select().from(outboundMessage).all()).toEqual(offline)
@@ -201,3 +201,35 @@ test('abort during disconnected delivery leaves accepted work failed and its inb
     await host.stop()
   }
 })
+
+test('an unmarked host outage is not mistaken for a durably accepted failed reply', async () => {
+  const host = await startHost()
+  const answer = sdk.respond
+  sdk.respond = (call) =>
+    (async function* () {
+      for await (const message of answer(call)) {
+        if ('type' in message && message.type === 'assistant') host.setUnavailable(true)
+        yield message
+      }
+    })()
+  const controller = new AbortController()
+  let retries = 0
+  const running = runRunner({
+    url: host.url,
+    token: host.token,
+    signal: controller.signal,
+    onRetry() {
+      if (++retries === 8) host.setUnavailable(false)
+    },
+  })
+  try {
+    expect(await host.reply()).toBe('model heard: hello')
+    await waitFor(() => host.db.select().from(inboundMessage).all()[0]?.status === 'completed')
+    expect(retries).toBe(8)
+    expect(host.db.select().from(outboundMessage).all()[0]?.status).toBe('delivered')
+  } finally {
+    controller.abort()
+    await running
+    await host.stop()
+  }
+}, 20000)
