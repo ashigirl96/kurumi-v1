@@ -14,7 +14,10 @@ export type AgentPrincipal = {
 export const pullInput = z.strictObject({
   waitMs: z.number().int().min(0).max(25_000).default(25_000),
 })
-export const completeInput = z.strictObject({ ids: z.array(z.string().min(1)).min(1).max(100) })
+export const completeInput = z.strictObject({
+  ids: z.array(z.string().min(1)).min(1).max(100),
+  status: z.enum(['completed', 'failed']).optional(),
+})
 export const postInput = z.strictObject({
   id: z.string().min(1),
   inReplyTo: z.string().min(1),

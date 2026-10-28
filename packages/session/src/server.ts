@@ -689,6 +689,7 @@ export function createSessionLedger({
       if (platformMessageId === null)
         throw new ORPCError('SERVICE_UNAVAILABLE', {
           message: 'outbound delivery failed; retry the same post',
+          data: { storedOutboundId: id },
         })
       runtimeLog?.({
         kind: 'session.outbound.delivered',
@@ -924,7 +925,7 @@ export function createSessionLedger({
         return task
       },
       async complete(principal, input) {
-        const { ids } = parse(completeInput, input)
+        const { ids, status = 'completed' } = parse(completeInput, input)
         transaction(db, (tx) => {
           authorize(tx, principal)
           for (const id of ids) {
@@ -933,13 +934,10 @@ export function createSessionLedger({
               !row ||
               row.sessionId !== principal.sessionId ||
               row.claimedBy !== principal.containerId ||
-              !['processing', 'completed'].includes(row.status)
+              (row.status !== 'processing' && row.status !== status)
             )
               throw new ORPCError('FORBIDDEN')
-            tx.update(inboundMessage)
-              .set({ status: 'completed' })
-              .where(eq(inboundMessage.id, id))
-              .run()
+            tx.update(inboundMessage).set({ status }).where(eq(inboundMessage.id, id)).run()
           }
         })
         retries.delete(principal.sessionId)

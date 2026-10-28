@@ -193,6 +193,9 @@ export async function startHost() {
     token,
     latestToken: () => driver.runs.at(-1)?.env.KURUMI_TOKEN ?? '',
     input,
+    connect(text: string) {
+      return chatLedger.terminal({ agentGroupId: agent.id, text, follow: true })
+    },
     paths,
     revoke: () => driver.kill(driver.runs[0]?.containerId ?? '', 0),
     setUnavailable(value: boolean) {
