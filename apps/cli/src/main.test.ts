@@ -615,6 +615,30 @@ describe('gateway', () => {
     ])
   })
 
+  test('log prints a passed CONNECT authority and principal without an account or service', async () => {
+    expect(
+      await runCommand(['gateway', 'log', '--decision', 'passed'], {
+        contract: cliContract,
+        link: answering([
+          {
+            ...row,
+            host: 'example.com',
+            method: 'CONNECT',
+            path: 'example.com:443',
+            decision: 'passed',
+            account: null,
+            service: null,
+          },
+        ]),
+        stdin: piped(''),
+      }),
+    ).toBe(0)
+    expect(stdout).toBe(
+      '2026-10-24T00:00:00.000Z  -  -  passed  200  812ms  CONNECT  example.com:443  g1\n',
+    )
+    expect(calls).toEqual([{ path: ['gateway', 'log'], input: { decision: 'passed', limit: 100 } }])
+  })
+
   test('status prints admission, the Agent Port address, and the CA fingerprint', async () => {
     const status = {
       admission: 'open',
