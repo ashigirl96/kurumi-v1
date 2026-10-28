@@ -319,6 +319,7 @@ export function createSessionLedger({
         .orderBy(inboundMessage.seq)
         .get()
       if (
+        !stopped &&
         message &&
         (message.status === 'processing'
           ? message.claimedBy === id
