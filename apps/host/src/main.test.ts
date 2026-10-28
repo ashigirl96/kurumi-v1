@@ -1056,6 +1056,86 @@ test('a gateway approval decided before a restart grants its allowance and notif
   }
 }, 10000)
 
+test.each(['same host', 'restart'])(
+  'a failed post-grant notice recovers on the %s',
+  async (recovery) => {
+    const home = homeForTest()
+    await startAndStop(home)
+    const fault = join(home, 'notify-fault')
+    writeFileSync(fault, '')
+    const preload = join(home, 'notify-fault.ts')
+    writeFileSync(
+      preload,
+      `
+    import { mock } from 'bun:test'
+    import { existsSync } from 'node:fs'
+    import { openKurumiDb, migrateAll } from ${JSON.stringify(join(import.meta.dir, 'db.ts'))}
+    const open = openKurumiDb
+    mock.module(${JSON.stringify(join(import.meta.dir, 'db.ts'))}, () => ({
+      migrateAll,
+      openKurumiDb(path) {
+        const db = open(path)
+        db.$client.function('issue63_notify_fault', () => Number(existsSync(${JSON.stringify(fault)})))
+        return db
+      },
+    }))
+    `,
+    )
+    const sqlite = new Database(join(home, 'kurumi.db'))
+    sqlite.run(
+      `INSERT INTO agent_group (id, name, folder, created_at) VALUES ('ag-1', 'work', 'work', 0)`,
+    )
+    sqlite.run(`INSERT INTO session (id, agent_group_id, mode, status, last_active_at, created_at)
+    VALUES ('ses-1', 'ag-1', 'shared', 'active', 0, 0)`)
+    sqlite.run(`INSERT INTO egress_allowance (approval_id, agent_group_id, session_id, rule_id, account_handle, method, host, path, fingerprint, state, created_at)
+    VALUES ('apr-1', 'ag-1', 'ses-1', 'rul-1', 'anthropic/main', 'POST', 'api.anthropic.com', '/v1/messages', x'00', 'pending', 0)`)
+    sqlite.run(`INSERT INTO pending_approval (id, kind, agent_group_id, session_id, title, body, payload, approvers, status, decided_by, created_at, decided_at)
+    VALUES ('apr-1', 'gateway.request', 'ag-1', 'ses-1', 'POST', '[]', '{}', '[{"kind":"host"}]', 'approved', '{"kind":"host"}', 0, 0)`)
+    sqlite.run(`CREATE TRIGGER issue63_notify_failure BEFORE INSERT ON outbound_message
+    WHEN new.id = 'ntf-visible-apr-1' AND issue63_notify_fault() = 1
+    BEGIN SELECT RAISE(ABORT, 'injected notice queue failure'); END`)
+    sqlite.close()
+    let host = await spawnHost(home, preload)
+    await waitForHost(home, host)
+    const query = async (sql: string) => JSON.parse(await cli(home, ['db', 'query', sql]))
+    expect(await query('SELECT state, expires_at FROM egress_allowance')).toEqual([
+      { state: 'granted', expires_at: expect.any(Number) },
+    ])
+    const original = await query('SELECT state, expires_at FROM egress_allowance')
+    expect(await query('SELECT handler_error FROM pending_approval')).toEqual([
+      { handler_error: 'injected notice queue failure' },
+    ])
+    expect(await query("SELECT id FROM inbound_message WHERE id = 'ntf-apr-1'")).toEqual([])
+    if (recovery === 'restart') {
+      host.kill('SIGTERM')
+      expect(await host.exited).toBe(0)
+    }
+    rmSync(fault)
+    if (recovery === 'restart') {
+      host = await spawnHost(home, preload)
+      await waitForHost(home, host)
+    }
+    let notices: unknown = []
+    for (let attempt = 0; attempt < 30; attempt++) {
+      notices = await query("SELECT id FROM inbound_message WHERE id = 'ntf-apr-1'")
+      if (Array.isArray(notices) && notices.length) break
+      await Bun.sleep(100)
+    }
+    expect(notices).toEqual([{ id: 'ntf-apr-1' }])
+    await cli(home, ['approval', 'decide', 'apr-1', '--approve'])
+    expect(await query('SELECT state, expires_at FROM egress_allowance')).toEqual(original)
+    expect(await query("SELECT id FROM outbound_message WHERE id = 'ntf-visible-apr-1'")).toEqual([
+      { id: 'ntf-visible-apr-1' },
+    ])
+    expect(await query('SELECT handler_error FROM pending_approval')).toEqual([
+      { handler_error: 'injected notice queue failure' },
+    ])
+    host.kill('SIGTERM')
+    expect(await host.exited).toBe(0)
+  },
+  15000,
+)
+
 test('kurumi gateway rules adds, lists, and removes a rule through the host, and names the fix for a bad one', async () => {
   const home = homeForTest()
   const host = await spawnHost(home)

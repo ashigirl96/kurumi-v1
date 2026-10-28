@@ -141,10 +141,12 @@ export async function startHost(config: HostConfig) {
   let socketOwned = false
   let stopped: Promise<void> | undefined
   let connectionExpiry: ReturnType<typeof setInterval> | undefined
+  let noticeRecovery: ReturnType<typeof setInterval> | undefined
   const socket = join(config.home, 'kurumi.sock')
   function stop(): Promise<void> {
     stopped ??= (async () => {
       clearInterval(connectionExpiry)
+      clearInterval(noticeRecovery)
       chat?.stop()
       const results = await Promise.allSettled([
         sessions?.stop(),
@@ -332,7 +334,9 @@ export async function startHost(config: HostConfig) {
       db,
       accounts: accountLedger,
       approvals: approvalLedger,
-      notify: (notice) => sessionLedger.notify(notice),
+      queueNotice: (tx, notice) => sessionLedger.queueNotice(tx, notice),
+      deliverNotice: (notice) => sessionLedger.deliverNotice(notice),
+      log: (event) => process.stderr.write(`${JSON.stringify(event)}\n`),
     })
     const ledgers = {
       agentLedger,
@@ -420,6 +424,18 @@ export async function startHost(config: HostConfig) {
       process.umask(umask)
     }
     await started
+    const recoverNotices = () => {
+      try {
+        egressApproval.recoverNotices()
+      } catch (error) {
+        process.stderr.write(
+          `${JSON.stringify({ kind: 'gateway.notice.recovery_failed', error: error instanceof Error ? error.message : String(error) })}\n`,
+        )
+      }
+    }
+    recoverNotices()
+    noticeRecovery = setInterval(recoverNotices, 1_000)
+    noticeRecovery.unref()
     accountLedger.connections.expireRequests()
     connectionExpiry = setInterval(() => {
       try {

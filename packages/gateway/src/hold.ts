@@ -37,6 +37,7 @@ export type SessionNotice = { key: string; sessionId: string; text: string }
 export type EgressApproval = EgressGate<EgressPrincipal> & {
   /** Idempotent; never waits on the upstream. Throws when no allowance row exists. */
   decided(approval: { id: string }, decision: 'approve' | 'deny'): Promise<void>
+  recoverNotices(): void
   rules: RuleStore
 }
 
@@ -172,21 +173,23 @@ function cardOf(held: HeldRequest) {
   }
 }
 
+type NoticeOutcome = { decision: 'approve'; expiresAt: Date } | { decision: 'deny' }
+
 function noticeText(
-  decision: 'approve' | 'deny',
+  outcome: NoticeOutcome,
   row: Pick<
     typeof egressAllowance.$inferSelect,
     'approvalId' | 'method' | 'host' | 'pathWithoutQuery' | 'accountHandle'
   >,
 ): string {
   const request = `${row.method} https://${row.host}${row.pathWithoutQuery} as ${row.accountHandle}`
-  switch (decision) {
+  switch (outcome.decision) {
     case 'approve':
-      return `kurumi: approval ${row.approvalId} was approved: ${request}. The first attempt ended before the decision. Send exactly the same request with the same body within 10 minutes; it passes once. A changed body needs a new approval.`
+      return `kurumi: approval ${row.approvalId} was approved: ${request}. The first attempt ended before the decision. Send exactly the same request with the same body before ${outcome.expiresAt.toISOString()}; it passes once. A changed body needs a new approval.`
     case 'deny':
       return `kurumi: approval ${row.approvalId} was denied: ${request}. Do not send this request again unless the user asks for it.`
     default: {
-      const unknown: never = decision
+      const unknown: never = outcome
       return unknown
     }
   }
@@ -196,8 +199,9 @@ export function createEgressApproval(deps: {
   db: Db
   accounts: Pick<AccountLedger, 'accountIdOf'>
   approvals: GatewayApprovals
-  /** Queues `text` for the session once per key. */
-  notify(notice: SessionNotice): unknown
+  queueNotice(tx: Tx, notice: SessionNotice): 'queued' | 'duplicate' | 'no_session'
+  deliverNotice(notice: SessionNotice): void
+  log(event: { kind: 'gateway.notice.failed'; approvalId: string; error: string }): void
   holdMs?: number
   now?: () => number
 }): EgressApproval {
@@ -418,8 +422,58 @@ export function createEgressApproval(deps: {
     return true
   }
 
+  function queueNotice(
+    tx: Tx,
+    row: typeof egressAllowance.$inferSelect,
+    outcome: NoticeOutcome,
+  ): SessionNotice | null {
+    const notice = {
+      key: row.approvalId,
+      sessionId: row.sessionId,
+      text: noticeText(outcome, row),
+    }
+    return deps.queueNotice(tx, notice) === 'no_session' ? null : notice
+  }
+
+  function notify(row: typeof egressAllowance.$inferSelect, outcome: NoticeOutcome): void {
+    const notice = transaction(deps.db, (tx) => queueNotice(tx, row, outcome))
+    if (notice) deps.deliverNotice(notice)
+  }
+
+  const eligible = () =>
+    and(eq(egressAllowance.state, 'granted'), gt(egressAllowance.expiresAt, new Date(now())))
+
   return {
     rules,
+    recoverNotices() {
+      const candidates = deps.db
+        .select({ approvalId: egressAllowance.approvalId })
+        .from(egressAllowance)
+        .where(eligible())
+        .all()
+      for (const { approvalId } of candidates) {
+        try {
+          const notice = transaction(deps.db, (tx) => {
+            const row = tx
+              .select()
+              .from(egressAllowance)
+              .where(and(eq(egressAllowance.approvalId, approvalId), eligible()))
+              .get()
+            if (!row?.expiresAt) return null
+            return queueNotice(tx, row, { decision: 'approve', expiresAt: row.expiresAt })
+          })
+          if (notice) deps.deliverNotice(notice)
+        } catch (error) {
+          try {
+            deps.log({
+              kind: 'gateway.notice.failed',
+              approvalId,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          } catch {}
+        }
+      }
+    },
     screen(input) {
       const verdict = evaluate(rules.read(input.account), {
         handle: input.account.handle,
@@ -448,13 +502,6 @@ export function createEgressApproval(deps: {
     async decided(approval, decision) {
       const row = allowanceOf(approval.id)
       if (!row) throw new Error(`gateway approval ${approval.id} has no egress allowance row`)
-      const notify = () => {
-        deps.notify({
-          key: approval.id,
-          sessionId: row.sessionId,
-          text: noticeText(decision, row),
-        })
-      }
       switch (decision) {
         case 'approve': {
           transaction(deps.db, (tx) => {
@@ -470,7 +517,12 @@ export function createEgressApproval(deps: {
           })
           if (takeLive(approval.id)) return
           const current = allowanceOf(approval.id)
-          if (current?.state === 'granted' && (current.expiresAt?.getTime() ?? 0) > now()) notify()
+          if (
+            current?.state === 'granted' &&
+            current.expiresAt &&
+            current.expiresAt.getTime() > now()
+          )
+            notify(current, { decision: 'approve', expiresAt: current.expiresAt })
           return
         }
         case 'deny': {
@@ -490,7 +542,7 @@ export function createEgressApproval(deps: {
             settle('denied')
             return
           }
-          notify()
+          notify(row, { decision: 'deny' })
           return
         }
         default: {
