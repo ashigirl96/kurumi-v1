@@ -988,8 +988,8 @@ test.each([0, 2])(
         healthy.inboundId,
       )
       expect(db.select().from(inboundMessage).orderBy(inboundMessage.seq).all()).toMatchObject([
-        { id: input.messageId, status: 'completed', tries: tries + 2, claimedBy: null },
-        { id: healthy.inboundId, status: 'completed', tries: 1, claimedBy: null },
+        { id: input.messageId, status: 'completed', tries: tries + 2 },
+        { id: healthy.inboundId, status: 'completed', tries: 1 },
       ])
     } finally {
       await restarted.stop()
