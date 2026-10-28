@@ -6,7 +6,7 @@ hostが発行した接続リンクを開き、指定したaccountで同意かキ
 
 - アドレスによる account 選択、未確認アプリの警告、空の scope チェックボックスを処理する。
 - `--account <n>` は `KURUMI_VERIFY_GOOGLE_ACCOUNTS` のカンマ区切りリストの n 番目を選ぶ。既定は 1。account の一覧は repo 外で環境変数に設定する。
-- `--uncheck gmail` または `--uncheck google-calendar` は、その service のチェックを外して残りを選ぶ。`--cancel` は Google から `access_denied` が戻ると非ゼロで終わる。
+- `--uncheck gmail` または `--uncheck google-calendar` は、元の認可requestからそのserviceのscopeだけを除き、`include_granted_scopes=false`で狭いtokenを要求する。残りのscopeとstate、PKCE、redirect URIなどのパラメータは保つ。Googleの既存grantはrevokeしない。`--cancel` は Google から `access_denied` が戻ると非ゼロで終わる。
 - `google-client` は keychain の client id と secret を `account set-client google` に渡す。clientId と clientSecret を持つ JSON を stdin で渡す。
 - `account connect` は5分・1回限りの接続リンクを発行する。使用済み・期限切れのリンクは再実行を案内する。
 - callbackはGoogleのcodeを交換し、暗号化したOAuth accountと、要求したserviceのうち許可された分のgrantを保存する。部分同意では許可されなかったserviceもページに表示する。
@@ -62,7 +62,7 @@ docker exec <container-id> curl -sS -D - -o /dev/null https://gmail.googleapis.c
 
 使用済みリンクと不明なstateは従来の410で再実行を案内する。期限切れのrequestは専用の410で期限切れと再依頼を案内し、code交換もgrantも行わない。`--cancel`ではcallbackがキャンセルを表示し、requestは`cancelled`になりaccountは作られない。期限後も、別のtabの遅い応答や再読込で完了・キャンセルの結果を表示する。cardの無い期限切れrequestは`kurumi account connect`の再実行を案内する。何も許可されなかった場合は`Nothing was granted`を表示し、既存accountも変更しない。失敗後は同じcallbackを再読込せず、`L kurumi <n> account connect --services gmail --agent-group-id <group-id>`で新しいrequestとリンクを作る。検証後は`L down <n>`を実行する。
 
-accountの指定は`L consent <n> '<connect-link>' --account 2`、部分同意は`--uncheck google-calendar`、拒否は`--cancel`を付ける。driverはscope checkboxごとにserviceと設定後の状態を出力する。
+accountの指定は`L consent <n> '<connect-link>' --account 2`、部分同意は`--uncheck google-calendar`、拒否は`--cancel`を付ける。driverは表示されたscope checkboxごとにserviceと設定後の状態を出力する。`--uncheck`ではcheckboxのない追加アクセス画面も進め、hostのcallback本文に`Connected. Granted:`と対象serviceの`Not granted:`があることを確認する。callbackのscope queryだけでは成功と判定しない。hostを止めた場合や、狭いtokenの保存をhostが拒否した場合は非ゼロで終わる。
 
 access tokenの期限が60秒以内なら、gatewayはaccountごとに1回だけrefreshし、同時に来たGmailとCalendarのrequestもその完了を待つ。`host.log`の`account.refresh`（`durationMs`はGoogleとのrefresh往復時間）と、読取queryで`access_expires_at`が進んだことを確認する。`access_expires_at`を過去に書き換えて確かめられるのはkurumiのrefresh経路だけで、Google側の本当の期限切れはaccess tokenの寿命（約1時間）を待たないと起きない。本当の期限切れを見るlaneが複数あるときは、約61分の待ちを1回にまとめて共有する。
 
@@ -113,7 +113,7 @@ L down <n>
 - agent-browser をインストールし、使う profile で test account にログインしておく。driver は `agent-browser profiles` で表示名を directory に解決し、BraveSoftware 配下の場合に Brave を使う。拡張は無効にして起動する。全コマンドは lane 固有の session を使う。agent-browser は名前で指定した profile を session ごとに一時複製するため、複数 lane が同時に使える。
 - desktop user agent で Google の通常の同意画面を開く。headless の既定 user agent では、Google が旧表示に切り替える場合がある。
 - account chooser は profile に複数の account が sign in しているため表示される。Google が chooser を省略した場合、driver は選択対象を確かめられないため失敗する。
-- `--uncheck` は認可 URL で要求した service に限る。Google が既存 grant のため checkbox を出さない場合は失敗する。その service をまだ許可していない account を使う。grantのrevokeは他のlaneのtokenも失効させるため、専有する`alone` laneでのみ行う。
+- `--uncheck`は元の認可URLで要求したserviceに限る。laneの接続リンクは302を1回だけ取得し、Googleの元のauthorize URLであることを検証してからscopeを変更する。Googleの途中のchooserやconsent URLは入力に使えない。`--uncheck`なしではrequestを変更しない。既存grantを持つaccountでも狭いtokenを要求するが、Google側の許可を取り消す操作ではない。別groupのgrantを失うtokenの保存はhostが拒否する。grantのrevokeは他のlaneのtokenも失効させるため、専有する`alone` laneでのみ行う。
 - `google-client` は `account set-client` がない head では、そのコマンド名を示して失敗する。
 - `google-client`は進行中のGoogle requestをすべてキャンセルするため、必ず接続リンクの発行前に実行する。
 - `account list`に`--agent-group-id`はない。一覧のserviceはaccountが持つ範囲を示すため、groupへの付与は読取queryかagentの`list_accounts`で確認する。
