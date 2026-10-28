@@ -57,6 +57,47 @@ export function requireRequestedService(url: URL, service: keyof typeof services
   }
 }
 
+export async function omitService(
+  source: URL,
+  webPort: number,
+  service: keyof typeof services,
+): Promise<URL> {
+  let url = consentUrl(source.href, webPort)
+  if (url.origin === `http://127.0.0.1:${webPort}`) {
+    const response = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(10_000) })
+    await response.body?.cancel()
+    const location = response.headers.get('location')
+    if (response.status !== 302 || !location) {
+      throw new Error(
+        'connect link must return a 302 Google authorize redirect; obtain a fresh link',
+      )
+    }
+    url = consentUrl(new URL(location, url).href, webPort)
+  }
+  if (
+    url.origin !== 'https://accounts.google.com' ||
+    !/^\/o\/oauth2\/(?:v2\/)?auth$/.test(url.pathname) ||
+    url.searchParams.has('continue')
+  ) {
+    throw new Error('--uncheck requires the original Google authorize request, not a Google UI URL')
+  }
+  for (const name of ['scope', 'include_granted_scopes']) {
+    if (url.searchParams.getAll(name).length > 1) throw new Error(`duplicate ${name} is forbidden`)
+  }
+  requireRequestedService(url, service)
+  const excluded: ReadonlySet<string> = new Set(catalog.google.services[service].scopes)
+  url.searchParams.set(
+    'scope',
+    (url.searchParams.get('scope') ?? '')
+      .split(/\s+/)
+      .filter((scope) => scope && !excluded.has(scope))
+      .join(' '),
+  )
+  // Earlier Google grants must not be merged back into this deliberately narrower request.
+  url.searchParams.set('include_granted_scopes', 'false')
+  return url
+}
+
 type MaskRoot = { children: Iterable<MaskElement> }
 type MaskElement = MaskRoot & {
   textContent: string | null
@@ -220,7 +261,7 @@ async function drive(argv: string[]): Promise<void> {
     if (positionals.length !== 2 || parsedLane !== lane || !raw) throw new Error(usage)
     const webPort = 41001 + 10 * Number(lane)
     if (webPort > 65535) throw new Error('lane web port exceeds 65535')
-    const url = consentUrl(raw, webPort)
+    let url = consentUrl(raw, webPort)
     const address = accountAddress(process.env.KURUMI_VERIFY_GOOGLE_ACCOUNTS ?? '', values.account)
     const omitted = values.uncheck
     if (omitted !== undefined && omitted !== 'gmail' && omitted !== 'google-calendar') {
@@ -231,8 +272,8 @@ async function drive(argv: string[]): Promise<void> {
       await browser(['profiles']),
       process.env.KURUMI_VERIFY_BROWSER_PROFILE,
     )
+    if (omitted) url = await omitService(url, webPort, omitted)
     const initial = authorizationUrl(url)
-    if (omitted && initial.searchParams.has('scope')) requireRequestedService(initial, omitted)
     const init = join(evidence, `mask-${run}.js`)
     await writeFile(
       init,
@@ -278,11 +319,30 @@ async function drive(argv: string[]): Promise<void> {
         ) {
           throw new Error('callback does not belong to the consent request')
         }
+        if (
+          omitted &&
+          authorization.searchParams.has('state') &&
+          current.searchParams.get('state') !== authorization.searchParams.get('state')
+        ) {
+          throw new Error('callback does not belong to the consent request')
+        }
         await screenshot('callback')
-        console.log(redact(await browser(['get', 'text', 'body'])))
+        const body = await browser(['get', 'text', 'body'])
+        console.log(redact(body))
         const error = current.searchParams.get('error')
         if (error) throw new Error(`Google consent failed: ${error}`)
         if (values.cancel) throw new Error('Google consent was not cancelled')
+        if (omitted) {
+          const notGranted = /\bNot granted: ([^.]+)\./
+            .exec(body)?.[1]
+            ?.split(',')
+            .map((s) => s.trim())
+          if (!body.startsWith('Connected. Granted:') || !notGranted?.includes(omitted)) {
+            throw new Error(
+              `--uncheck ${omitted}: callback did not confirm the service was not granted`,
+            )
+          }
+        }
         return
       }
       if (current.origin !== 'https://accounts.google.com') {
@@ -295,10 +355,7 @@ async function drive(argv: string[]): Promise<void> {
       }
       submitted = undefined
       const requested = authorizationUrl(consentUrl(current.href, webPort))
-      if (requested.searchParams.has('scope')) {
-        authorization = requested
-        if (omitted) requireRequestedService(authorization, omitted)
-      }
+      if (!omitted && requested.searchParams.has('scope')) authorization = requested
       const snapshot = await browser(['snapshot', '-i'])
       const items = controls(snapshot)
       const chooser = /アカウントを選択|Choose an account/i.test(snapshot)
@@ -326,17 +383,6 @@ async function drive(argv: string[]): Promise<void> {
         }
         if (!action) {
           const checkboxes = items.filter((item) => item.role === 'checkbox')
-          const permissionPage = /アクセスを求め|アクセスをリクエスト|access to|can access/i.test(
-            snapshot,
-          )
-          if (
-            omitted &&
-            permissionPage &&
-            !checkboxes.some((item) => services[omitted].test(item.name))
-          ) {
-            requireRequestedService(authorization, omitted)
-            throw new Error(`account already granted ${omitted}; use an account without that grant`)
-          }
           const scopeCheckboxes = checkboxes.flatMap((item) => {
             const service = Object.entries(services).find(([, pattern]) =>
               pattern.test(item.name),
