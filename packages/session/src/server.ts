@@ -222,6 +222,24 @@ function queueNotice(tx: Tx, { key, sessionId: id, text }: SessionNotice): Notic
       createdAt: now,
     })
     .run()
+  const seq =
+    (tx
+      .select({ seq: sql<number>`coalesce(max(${outboundMessage.seq}), 0)` })
+      .from(outboundMessage)
+      .where(eq(outboundMessage.sessionId, id))
+      .get()?.seq ?? 0) + 1
+  tx.insert(outboundMessage)
+    .values({
+      id: `ntf-visible-${key}`,
+      sessionId: id,
+      seq,
+      kind: 'text',
+      content: text,
+      status: 'queued',
+      attempts: 1,
+      createdAt: now,
+    })
+    .run()
   tx.update(session).set({ lastActiveAt: now }).where(eq(session.id, id)).run()
   return 'queued'
 }
@@ -237,6 +255,7 @@ export function createSessionLedger({
   const spawning = new Map<string, Promise<void>>()
   const cleanups = new Map<string, Promise<void>>()
   const deliveries = new Map<string, Promise<void>>()
+  const outboxes = new Map<string, Promise<void>>()
   const pulls = new Set<Promise<{ messages: Inbound[] }>>()
   const waiters = new Map<string, Set<() => void>>()
   const retries = new Map<string, { attempt: number; due: number }>()
@@ -593,10 +612,6 @@ export function createSessionLedger({
           })
         }
         if (existing.status === 'delivered' || deliveries.has(input.id)) return null
-        tx.update(outboundMessage)
-          .set({ status: 'queued', attempts: existing.attempts + 1 })
-          .where(eq(outboundMessage.id, input.id))
-          .run()
       } else {
         const seq =
           (tx
@@ -624,7 +639,7 @@ export function createSessionLedger({
       await deliveries.get(input.id)
       return
     }
-    await deliverStored(input.id)
+    await deliverPending(input.sessionId)
   }
 
   async function deliverStored(id: string) {
@@ -632,6 +647,11 @@ export function createSessionLedger({
     if (pending) return pending
     const row = db.select().from(outboundMessage).where(eq(outboundMessage.id, id)).get()
     if (!row || row.status === 'delivered') return
+    if (row.status === 'failed')
+      db.update(outboundMessage)
+        .set({ status: 'queued', attempts: row.attempts + 1 })
+        .where(eq(outboundMessage.id, id))
+        .run()
     const current = db.select().from(session).where(eq(session.id, row.sessionId)).get()
     const task = (async () => {
       let platformMessageId: string | null = null
@@ -647,9 +667,9 @@ export function createSessionLedger({
               ? db.select().from(outboundMessage).where(eq(outboundMessage.id, card.replaces)).get()
               : undefined
             platformMessageId = (
-              await (card.replaces
+              await (original?.platformMessageId
                 ? adapter.replaceCard(target, {
-                    id: original?.platformMessageId ?? card.replaces,
+                    id: original.platformMessageId,
                     card,
                   })
                 : adapter.postCard(target, { id, card }))
@@ -686,7 +706,43 @@ export function createSessionLedger({
     }
   }
 
-  function deliverNotice({ key, sessionId: id, text }: SessionNotice): void {
+  function deliverPending(destinationId: string): Promise<void> {
+    const task = (outboxes.get(destinationId) ?? Promise.resolve())
+      .catch(() => {})
+      .then(async () => {
+        while (true) {
+          const row = db
+            .select()
+            .from(outboundMessage)
+            .where(
+              and(
+                eq(outboundMessage.sessionId, destinationId),
+                inArray(outboundMessage.status, ['queued', 'failed']),
+                inArray(outboundMessage.kind, ['text', 'card']),
+                sql`not exists (
+                select 1 from outbound_message replacement
+                where replacement.session_id = ${outboundMessage.sessionId}
+                  and replacement.kind = 'card'
+                  and json_extract(replacement.content, '$.replaces') = ${outboundMessage.id}
+              )`,
+              ),
+            )
+            .orderBy(outboundMessage.seq)
+            .get()
+          if (!row) return
+          await deliverStored(row.id)
+        }
+      })
+    outboxes.set(destinationId, task)
+    void task
+      .finally(() => {
+        if (outboxes.get(destinationId) === task) outboxes.delete(destinationId)
+      })
+      .catch(() => {})
+    return task
+  }
+
+  function deliverNotice({ key, sessionId: id }: SessionNotice): void {
     if (stopped) return
     const inboundId = `ntf-${key}`
     runtimeLog?.({
@@ -697,7 +753,7 @@ export function createSessionLedger({
     })
     wake(id)
     if (enabled) void reconcile(id).catch(() => {})
-    void deliver({ id: `ntf-${crypto.randomUUID()}`, sessionId: id, text }).catch(() => {})
+    void deliverPending(id).catch(() => {})
   }
 
   return {
@@ -710,6 +766,13 @@ export function createSessionLedger({
       timer = setInterval(tick, 100)
       timer.unref()
       tick()
+      await Promise.allSettled(
+        db
+          .select({ id: session.id })
+          .from(session)
+          .all()
+          .map(({ id }) => deliverPending(id)),
+      )
     },
     adopted: () => supervisor?.adopted ?? Promise.resolve(),
     stop() {
@@ -723,6 +786,7 @@ export function createSessionLedger({
         ...spawning.values(),
         ...cleanups.values(),
         ...deliveries.values(),
+        ...outboxes.values(),
         ...pulls,
       ]).then(() => {})
       return stopping
@@ -792,7 +856,9 @@ export function createSessionLedger({
       })
       log?.({ kind: 'session.inbound.committed', inboundId, monotonicMs: performance.now() })
       wake(accepted.receipt.sessionId)
-      await reconcile(accepted.receipt.sessionId)
+      const spawned = reconcile(accepted.receipt.sessionId)
+      await deliverPending(accepted.receipt.sessionId).catch(() => {})
+      await spawned
       return accepted.receipt
     },
     authenticate(token) {
@@ -829,7 +895,8 @@ export function createSessionLedger({
     async deliverCard(id) {
       if (stopped) return
       try {
-        await deliverStored(id)
+        const row = db.select().from(outboundMessage).where(eq(outboundMessage.id, id)).get()
+        if (row) await deliverPending(row.sessionId)
       } catch (error) {
         if (!(error instanceof ORPCError) || error.code !== 'SERVICE_UNAVAILABLE') throw error
       }
@@ -880,6 +947,8 @@ export function createSessionLedger({
       },
       async post(principal, input) {
         const post = parse(postInput, input)
+        if (post.id.startsWith('ntf-visible-'))
+          throw new ORPCError('BAD_REQUEST', { message: 'outbound id is reserved for notices' })
         await deliver(
           {
             id: post.id,

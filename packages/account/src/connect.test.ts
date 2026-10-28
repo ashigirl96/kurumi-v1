@@ -292,6 +292,7 @@ test('a failed cancellation rolls back the client replacement', () => {
 function tokenEndpoint(
   reply: (form: URLSearchParams) => Response | Promise<Response>,
   log?: Parameters<typeof createAccountLedger>[0]['log'],
+  approval: Pick<Parameters<typeof createAccountLedger>[0], 'canApprove'> = {},
 ) {
   let exchanges = 0
   const fetchImpl: typeof fetch = Object.assign(
@@ -303,7 +304,14 @@ function tokenEndpoint(
     },
     { preconnect: fetch.preconnect },
   )
-  const ledger = createAccountLedger({ db, vaultKey, webPort: 42331, fetch: fetchImpl, log })
+  const ledger = createAccountLedger({
+    db,
+    vaultKey,
+    webPort: 42331,
+    fetch: fetchImpl,
+    log,
+    ...approval,
+  })
   connections = ledger.connections
   return { ledger, exchanges: () => exchanges }
 }
@@ -715,7 +723,10 @@ test('a code bug is logged by name and is not converted to the retryable failure
 })
 
 const agentCaller = { kind: 'agent', agentGroupId: 'work', sessionId: 'ses-work' } as const
-function withCards(deps: Partial<Parameters<typeof createAccountLedger>[0]> = {}) {
+function withCards(
+  deps: Partial<Parameters<typeof createAccountLedger>[0]> = {},
+  receipt: 'queued' | 'duplicate' | 'no_session' = 'queued',
+) {
   db.run(sql`CREATE TABLE test_card (id TEXT PRIMARY KEY, session_id TEXT, content TEXT)`)
   db.run(sql`CREATE TABLE test_notice (id TEXT PRIMARY KEY, session_id TEXT, content TEXT)`)
   const delivered: string[] = []
@@ -744,10 +755,12 @@ function withCards(deps: Partial<Parameters<typeof createAccountLedger>[0]> = {}
         return id
       },
       queueNotice(tx, notice) {
+        if (receipt !== 'queued') return receipt
         expect(db.$client.inTransaction).toBe(true)
         tx.run(
           sql`INSERT INTO test_notice VALUES (${notice.key}, ${notice.sessionId}, ${notice.text})`,
         )
+        return 'queued'
       },
       deliverNotice(notice) {
         expect(db.$client.inTransaction).toBe(false)
@@ -1029,7 +1042,9 @@ test('reconnect includes a needs_reauth account held for a different service', a
 })
 
 test('a reconnect updates requested grant audit to the approver whose link completes it', async () => {
-  const endpoint = tokenEndpoint(() => Response.json(tokenFull))
+  const endpoint = tokenEndpoint(() => Response.json(tokenFull), undefined, {
+    canApprove: () => true,
+  })
   await connections.callback(callbackUrl())
   const before = db.select().from(accountGrant).all()
   expect(before.every((row) => row.grantedBy === 'host')).toBe(true)
@@ -1116,27 +1131,35 @@ test.each(['code=fixture-code', 'error=access_denied'])(
   },
 )
 
-test('a failed notice insert rolls completion, grants, and replacement back together', async () => {
-  const proof = withCards({
-    fetch: Object.assign(async () => Response.json(tokenGmailOnly), {
-      preconnect: fetch.preconnect,
-    }),
-  })
-  const { requestId } = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
-  db.run(
-    sql`CREATE TRIGGER refuse_notice BEFORE INSERT ON test_notice BEGIN SELECT RAISE(ABORT, 'notice failed'); END`,
-  )
-  const failure = await connections
-    .callback(callbackUrl(requestId))
-    .catch((error: unknown) => error)
-  expect(failure).toBeInstanceOf(Error)
-  expect(db.select().from(connectionRequest).get()?.state).toBe('authorizing')
-  expect(db.select().from(account).all()).toEqual([])
-  expect(db.select().from(accountGrant).all()).toEqual([])
-  expect(proof.cards()).toHaveLength(1)
-  expect(proof.notices()).toEqual([])
-  expect(proof.resumed).toEqual([])
-})
+test.each(['completed', 'cancelled'] as const)(
+  'a failed notice insert rolls %s, grants, and replacement back together',
+  async (outcome) => {
+    const proof = withCards({
+      fetch: Object.assign(async () => Response.json(tokenGmailOnly), {
+        preconnect: fetch.preconnect,
+      }),
+    })
+    const { requestId } = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
+    db.run(
+      sql`CREATE TRIGGER refuse_notice BEFORE INSERT ON test_notice BEGIN SELECT RAISE(ABORT, 'notice failed'); END`,
+    )
+    const failure = await connections
+      .callback(
+        callbackUrl(
+          requestId,
+          outcome === 'cancelled' ? 'error=access_denied' : 'code=fixture-code',
+        ),
+      )
+      .catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(Error)
+    expect(db.select().from(connectionRequest).get()?.state).toBe('authorizing')
+    expect(db.select().from(account).all()).toEqual([])
+    expect(db.select().from(accountGrant).all()).toEqual([])
+    expect(proof.cards()).toHaveLength(1)
+    expect(proof.notices()).toEqual([])
+    expect(proof.resumed).toEqual([])
+  },
+)
 
 test.each(['failed', 'nothing-granted', 'shared-services-missing'] as const)(
   'retryable %s leaves the card and session alone',
@@ -1178,5 +1201,79 @@ test.each(['failed', 'nothing-granted', 'shared-services-missing'] as const)(
     expect(proof.cards()).toHaveLength(1)
     expect(proof.notices()).toEqual([])
     expect(proof.resumed).toEqual([])
+  },
+)
+
+test.each(['open', 'authorizing'] as const)(
+  'complete accepts the current approver for an %s request and tags terminal requests',
+  async (state) => {
+    withCards({ canApprove: (who) => who.kind === 'human' && who.userId === 'owner' })
+    const { requestId } = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
+    insertAccount(db, { id: 'existing', vendor: 'google', label: 'fixture', services: ['gmail'] })
+    if (state === 'authorizing') {
+      const link = connections.issueLink(requestId, { kind: 'human', userId: 'owner' })
+      connections.openLink(link)
+    }
+    db.update(connectionRequest).set({ authorizedBy: 'human:stale' }).run()
+    for (const who of [agentCaller, { kind: 'human', userId: 'member' }] as const) {
+      expect(() =>
+        transaction(db, (tx) => connections.complete(tx, requestId, 'existing', who)),
+      ).toThrow('only an approver')
+      expect(db.select().from(accountGrant).all()).toEqual([])
+    }
+    const result = transaction(db, (tx) =>
+      connections.complete(tx, requestId, 'existing', { kind: 'human', userId: 'owner' }),
+    )
+    expect(result.kind).toBe('completed')
+    expect(db.select().from(accountGrant).get()?.grantedBy).toBe('human:owner')
+    expect(db.select().from(connectionRequest).get()?.authorizedBy).toBe('human:owner')
+    for (const terminal of ['completed', 'cancelled', 'expired'] as const) {
+      db.update(connectionRequest).set({ state: terminal }).run()
+      expect(
+        transaction(db, (tx) => connections.complete(tx, requestId, 'existing', caller)),
+      ).toEqual({ kind: 'nothing-to-complete' })
+    }
+    db.update(connectionRequest)
+      .set({
+        state: 'open',
+        oauthState: null,
+        pkceVerifier: null,
+        accountId: null,
+        expiresAt: new Date(0),
+      })
+      .run()
+    expect(
+      transaction(db, (tx) => connections.complete(tx, requestId, 'existing', caller)),
+    ).toEqual({ kind: 'nothing-to-complete' })
+    expect(
+      transaction(db, (tx) => connections.complete(tx, 'missing', 'existing', caller)),
+    ).toEqual({ kind: 'nothing-to-complete' })
+  },
+)
+
+test('a completed CLI request is distinguishable from nothing to complete', () => {
+  const id = create()
+  insertAccount(db, { id: 'existing', vendor: 'google', label: 'fixture', services: ['gmail'] })
+  expect(transaction(db, (tx) => connections.complete(tx, id, 'existing', caller))).toEqual({
+    kind: 'completed',
+    delivery: null,
+  })
+  expect(transaction(db, (tx) => connections.complete(tx, id, 'existing', caller))).toEqual({
+    kind: 'nothing-to-complete',
+  })
+})
+
+test.each(['duplicate', 'no_session'] as const)(
+  'completion does not deliver a notice for a %s receipt',
+  async (receipt) => {
+    const proof = withCards({}, receipt)
+    const { requestId } = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
+    insertAccount(db, { id: 'existing', vendor: 'google', label: 'fixture', services: ['gmail'] })
+    const result = transaction(db, (tx) => connections.complete(tx, requestId, 'existing', caller))
+    if (result.kind !== 'completed') throw new Error('did not complete')
+    expect(result.delivery?.noticeReceipt).toBe(receipt)
+    connections.deliverCompletion(result.delivery)
+    expect(proof.resumed).toEqual([])
+    expect(proof.notices()).toEqual([])
   },
 )

@@ -72,7 +72,23 @@ type ConnectionCard = {
   buttons: { action: string; label: string }[]
 }
 type ConnectionNotice = { key: string; sessionId: string; text: string }
-type ConnectionDelivery = { cardMessageId: string | null; notice: ConnectionNotice } | null
+type NoticeReceipt = 'queued' | 'duplicate' | 'no_session'
+type ConnectionDelivery = {
+  cardMessageId: string | null
+  notice: ConnectionNotice
+  noticeReceipt: NoticeReceipt
+} | null
+type CompletionResult =
+  | { kind: 'completed'; delivery: ConnectionDelivery }
+  | { kind: 'nothing-to-complete' }
+const approvingCaller = z.union([
+  z.literal('host').transform(() => ({ kind: 'host' }) as const),
+  z
+    .string()
+    .startsWith('human:')
+    .min(7)
+    .transform((value) => ({ kind: 'human', userId: value.slice(6) }) as const),
+])
 
 export type ConnectionOptions = {
   webPort?: number
@@ -80,7 +96,7 @@ export type ConnectionOptions = {
   cards?: {
     post(tx: Tx, sessionId: string, card: ConnectionCard): string
     replace(tx: Tx, messageId: string, card: ConnectionCard): string
-    queueNotice(tx: Tx, notice: ConnectionNotice): unknown
+    queueNotice(tx: Tx, notice: ConnectionNotice): NoticeReceipt
     deliverNotice(notice: ConnectionNotice): void
     deliver(id: string): Promise<void>
   }
@@ -180,8 +196,8 @@ export function createConnections({
           buttons: [],
         })
       : null
-    cards.queueNotice(tx, notice)
-    return { cardMessageId, notice }
+    const noticeReceipt = cards.queueNotice(tx, notice)
+    return { cardMessageId, notice, noticeReceipt }
   }
 
   const connections = {
@@ -427,15 +443,16 @@ export function createConnections({
         return { kind: 'authorize', url }
       })
     },
-    complete(tx: Tx, requestId: string, accountId: string): ConnectionDelivery {
+    complete(tx: Tx, requestId: string, accountId: string, caller: Caller): CompletionResult {
       const row = tx
         .select()
         .from(connectionRequest)
         .where(eq(connectionRequest.id, requestId))
         .get()
       if (!row || !['open', 'authorizing'].includes(row.state) || row.expiresAt <= new Date())
-        return null
+        return { kind: 'nothing-to-complete' }
       const current = parseConnectionRequest(row)
+      const grantedBy = approver(caller, current.agentGroupId)
       const held = tx.select().from(account).where(eq(account.id, accountId)).get()
       if (!held || held.vendor !== current.vendor || held.status !== 'active')
         throw new ORPCError('BAD_REQUEST', { message: 'account is not available' })
@@ -447,11 +464,11 @@ export function createConnections({
           agentGroupId: current.agentGroupId,
           accountId,
           service,
-          grantedBy: current.authorizedBy ?? current.requestedBy,
+          grantedBy,
         })
         if (!granted.ok) throw new Error(`unable to grant connected account: ${granted.refusal}`)
         tx.update(accountGrant)
-          .set({ grantedBy: current.authorizedBy ?? current.requestedBy, grantedAt: new Date() })
+          .set({ grantedBy, grantedAt: new Date() })
           .where(
             and(
               eq(accountGrant.accountId, accountId),
@@ -462,7 +479,7 @@ export function createConnections({
           .run()
       }
       tx.update(connectionRequest)
-        .set({ state: 'completed', accountId, pkceVerifier: null })
+        .set({ state: 'completed', accountId, pkceVerifier: null, authorizedBy: grantedBy })
         .where(eq(connectionRequest.id, current.id))
         .run()
       const group = tx
@@ -471,17 +488,20 @@ export function createConnections({
         .where(eq(agentGroup.id, current.agentGroupId))
         .get()
       const handle = `${held.vendor}/${held.label}`
-      return updateChat(
-        tx,
-        current,
-        `✅ ${handle} を ${group?.name ?? current.agentGroupId} につなぎました（${services.join(', ')}）`,
-        `Account ${handle} is now connected for ${services.join(', ')}. Continue the task that needed it.`,
-      )
+      return {
+        kind: 'completed',
+        delivery: updateChat(
+          tx,
+          current,
+          `✅ ${handle} を ${group?.name ?? current.agentGroupId} につなぎました（${services.join(', ')}）`,
+          `Account ${handle} is now connected for ${services.join(', ')}. Continue the task that needed it.`,
+        ),
+      }
     },
     deliverCompletion(delivery: ConnectionDelivery): void {
       if (!delivery || !cards) return
       if (delivery.cardMessageId) void cards.deliver(delivery.cardMessageId).catch(() => {})
-      cards.deliverNotice(delivery.notice)
+      if (delivery.noticeReceipt === 'queued') cards.deliverNotice(delivery.notice)
     },
     async callback(url: URL): Promise<CallbackPage> {
       const state = url.searchParams.get('state')
@@ -619,8 +639,17 @@ export function createConnections({
           tx.delete(accountGrant)
             .where(and(eq(accountGrant.accountId, id), notInArray(accountGrant.service, services)))
             .run()
-          const delivery = connections.complete(tx, current.id, id)
-          return { page: pageFor(requestForState(state)), committed: true, delivery }
+          const completion = connections.complete(
+            tx,
+            current.id,
+            id,
+            approvingCaller.parse(current.authorizedBy),
+          )
+          return {
+            page: pageFor(requestForState(state)),
+            committed: completion.kind === 'completed',
+            delivery: completion.kind === 'completed' ? completion.delivery : null,
+          }
         })
         if (result.page.kind === 'shared-services-missing')
           log({

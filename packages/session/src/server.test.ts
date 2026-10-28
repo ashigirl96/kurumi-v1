@@ -574,6 +574,14 @@ test('an agent that posts the notice id first cannot keep the notice from the bo
     outboundId: 'ntf-apr-forged',
     text: 'decoy',
   })
+  await rejects(
+    ledger.channel.post(principal, {
+      id: 'ntf-visible-apr-forged',
+      inReplyTo: queued.inboundId,
+      body: { kind: 'text', text: 'decoy' },
+    }),
+    { code: 'BAD_REQUEST' },
+  )
   const text = 'kurumi: approval apr-forged was approved'
 
   expect(ledger.notify({ key: 'apr-forged', sessionId: queued.sessionId, text })).toBe('queued')
@@ -639,6 +647,13 @@ test('committed cards use the terminal adapter, deduplicate delivery and fail wi
   expect(
     db.select().from(outboundMessage).where(eq(outboundMessage.id, failed)).get()?.status,
   ).toBe('failed')
+  const later = chat.terminal({ agentGroupId: agentId, text: '', follow: true })
+  await later.next()
+  expect((await later.next()).value).toMatchObject({ kind: 'reply', outboundId: failed })
+  await ledger.deliverCard(failed)
+  await ledger.postOutbound({ id: 'after-card', sessionId, text: 'after card' })
+  expect((await later.next()).value).toMatchObject({ kind: 'reply', text: 'after card' })
+  await later.return()
 })
 
 test('channel.post accepts text and rejects an agent-forged card body', () => {
