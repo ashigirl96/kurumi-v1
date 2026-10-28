@@ -90,7 +90,7 @@ test('the body names the refusal as error, keeps its fields and says what to do 
 test.each([
   [
     { code: 'account_not_connected', service: 'anthropic-api' },
-    'no account is granted anthropic-api for this agent group; ask the owner to add one with kurumi account add-key and grant it',
+    'no account is granted anthropic-api for this agent group; call mcp__kurumi__connect_account with services=["anthropic-api"]',
   ],
   [
     { code: 'account_not_granted', service: 'gmail', named: 'google/x', granted: [] },
@@ -134,7 +134,7 @@ test.each([
       agentGroupId: 'g1',
       services: ['anthropic-api'],
     },
-    'ask the owner to add anthropic/main again',
+    'reconnect anthropic/main: call mcp__kurumi__connect_account with services=["anthropic-api"]',
   ],
   [
     { code: 'duplicate_slot', service: 'anthropic-api', header: 'authorization' },
@@ -184,7 +184,7 @@ test('the raw form is the same response as HTTP/1.1 bytes', () => {
   expect(raw.slice(raw.indexOf('\r\n\r\n') + 4)).toBe(body)
 })
 
-test('Google reauthorization names a connect command for the requesting group', () => {
+test('Google reauthorization names the connect tool and every account service', () => {
   const response = refusalResponse({
     code: 'account_needs_reauth',
     service: 'gmail',
@@ -194,7 +194,7 @@ test('Google reauthorization names a connect command for the requesting group', 
   })
   expect(response.status).toBe(403)
   expect(JSON.parse(response.body).next).toContain(
-    'kurumi account connect --services gmail google-calendar --agent-group-id work',
+    'call mcp__kurumi__connect_account with services=["gmail","google-calendar"]',
   )
 })
 
@@ -202,4 +202,11 @@ test('a transient refresh refusal lets the client retry', () => {
   expect(
     refusalResponse({ code: 'account_refresh_failed', service: 'gmail', handle: googleA }).headers,
   ).not.toHaveProperty('x-should-retry')
+})
+
+test('an unconnected Google service directs the agent to its connect tool', () => {
+  const { body } = refusalResponse({ code: 'account_not_connected', service: 'gmail' })
+  expect(JSON.parse(body).next).toBe(
+    'no account is granted gmail for this agent group; call mcp__kurumi__connect_account with services=["gmail"]',
+  )
 })

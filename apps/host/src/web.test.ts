@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, setSystemTime, test } from 'bun:test'
 import { randomBytes } from 'node:crypto'
 
 import { account, connectionRequest } from '@kurumi/account/schema'
@@ -13,6 +13,7 @@ const db = inMemoryDb()
 const ledger = createAccountLedger({ db, vaultKey: randomBytes(32), webPort: 42331 })
 let web: ReturnType<typeof startWeb> | undefined
 afterEach(async () => {
+  setSystemTime()
   await web?.stop(true)
   web = undefined
 })
@@ -216,10 +217,36 @@ test('shared-service refusal names the missing services and explains the next co
     expect(body).toContain('google-calendar')
     expect(body).toContain('next consent will ask for these services')
     expect(body).toContain('only to the groups that already hold them')
-    expect(body).toContain('Press the card again')
+    expect(body).toContain(
+      'kurumi account connect --services gmail google-calendar --agent-group-id work',
+    )
+    expect(body).not.toContain('Press the card')
   } finally {
     await web?.stop(true)
     web = undefined
     localDb.$client.close()
   }
+})
+
+test('a past-due callback shows expiry without changing the request or exchanging code', async () => {
+  insertAgentGroup(db, 'expired-work')
+  ledger.connections.setClient({ clientId: 'fixture', clientSecret: 'fixture' })
+  const id = ledger.connections.createRequest(
+    { agentGroupId: 'expired-work', services: ['gmail'] },
+    { kind: 'host' },
+  )
+  const opened = ledger.connections.openLink(ledger.connections.issueLink(id, { kind: 'host' }))
+  if (opened.kind !== 'authorize') throw new Error('missing authorize URL')
+  setSystemTime(Date.now() + 30 * 60_000)
+  const before = db.select().from(connectionRequest).where(eq(connectionRequest.id, id)).get()
+  web = startWeb({ host: '127.0.0.1', port: 0 }, ledger)
+  const callback = new URL('/oauth/callback', web.url)
+  callback.searchParams.set('state', opened.url.searchParams.get('state')!)
+  callback.searchParams.set('code', 'fixture')
+  const response = await fetch(callback)
+  expect(response.status).toBe(410)
+  expect(await response.text()).toBe('This request expired. Ask again to connect.')
+  expect(db.select().from(connectionRequest).where(eq(connectionRequest.id, id)).get()).toEqual(
+    before,
+  )
 })

@@ -563,7 +563,9 @@ test('a group with no account is refused with a JSON 403 and nothing goes upstre
   expect(JSON.parse(response.body)).toEqual({
     error: 'account_not_connected',
     service: 'anthropic-api',
-    next: expect.stringContaining('kurumi account add-key'),
+    next: expect.stringContaining(
+      'call mcp__kurumi__connect_account with services=["anthropic-api"]',
+    ),
   })
   expect(upstream.requests).toEqual([])
 })

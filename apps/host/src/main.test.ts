@@ -1174,3 +1174,15 @@ test.each(['listening', 'no-listener', 'stopped'] as const)(
     }
   },
 )
+
+test.each(['1000', '59999', '60000.5', 'no', 'Infinity', ''])(
+  'an invalid connect request TTL %s refuses startup and names its variable',
+  async (value) => {
+    const home = homeForTest()
+    const host = await spawnHost(home, undefined, { KURUMI_CONNECT_REQUEST_TTL_MS: value })
+    const error = await new Response(host.stderr).text()
+    expect(await host.exited).toBe(1)
+    expect(error).toContain('KURUMI_CONNECT_REQUEST_TTL_MS')
+    expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
+  },
+)

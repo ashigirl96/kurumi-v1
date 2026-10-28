@@ -34,7 +34,7 @@ L kurumi <n> db query 'select kind, status from outbound_message'
 
 replyとカードのpress行を確認する。リンクはpressのstdoutだけに出て、cardの保存行やtool応答には出ない。存在しないref、CLIから作ったrequest、期限切れ・終了したrequest、不明なactionはnoticeになり、link行を作らない。terminalのcallerはhostなので、非承認者の拒否はhuman callerのunit testで確認する。認可中に別の承認者がリンクを開くと、その承認者の新しいstateとPKCEでやり直す。以前の承認者のcallbackではgrantを作らない。同じ承認者の複数リンクはstateを共有する。noticeを返すpressは非ゼロで終了し、同じnoticeを1回だけ表示する。
 
-再接続はこのgroupにgrantのあるすべての`needs_reauth` Google accountのserviceを同意対象に含め、groupには要求分だけを付与する。狭い同意が別groupのgrantを失わせる場合は保存を拒否し、不足serviceを名前で示す。requestを`open`に戻し、同意対象だけを広げる。もう一度カードをpressすると、それらも求める同意に進み、元のgroupだけがそのgrantを保つ。Google handleを含む出力はアドレスを伏せて保存する。
+再接続はこのgroupにgrantのあるすべての`needs_reauth` Google accountのserviceを同意対象に含め、groupには要求分だけを付与する。狭い同意が別groupのgrantを失わせる場合は保存を拒否し、不足serviceを名前で示す。requestを`open`に戻し、同意対象だけを広げる。もう一度カードをpressすると、それらも求める同意に進み、元のgroupだけがそのgrantを保つ。カードの無いCLI requestでは、拒否ページに要求分と不足分を含む`kurumi account connect --services <services> --agent-group-id <group>`を表示する。Google handleを含む出力はアドレスを伏せて保存する。
 
 CLIから接続を始めるときは、次の順で実行する。`<group-id>`には`agent create`が返したidを使う。
 
@@ -60,7 +60,7 @@ docker exec <container-id> curl -sS -D - -o /dev/null https://gmail.googleapis.c
 
 200と`x-kurumi-account: google/<test-account>`を確認する。Gmail本文にはアドレスが入るため保存せず、headerと`account list`の出力もアドレスを伏せてからevidenceに保存する。callbackの再読込後も`host.log`の`account.connect.completed`は1行で、`transactionMs`にGoogleとの通信を除いた保存時間が残る。Calendarを許可しなかった場合はページに`Not granted: google-calendar`が出て、Calendarへのprobeは`account_not_connected`になる。
 
-使用済みリンクや不明・期限切れのstateは410で再実行を案内する。`--cancel`ではcallbackがキャンセルを表示し、requestは`cancelled`になりaccountは作られない。期限内なら、別のtabの遅い応答や再読込でもキャンセルを表示する。何も許可されなかった場合は`Nothing was granted`を表示し、既存accountも変更しない。失敗後は同じcallbackを再読込せず、`L kurumi <n> account connect --services gmail --agent-group-id <group-id>`で新しいrequestとリンクを作る。検証後は`L down <n>`を実行する。
+使用済みリンクと不明なstateは従来の410で再実行を案内する。期限切れのrequestは専用の410で期限切れと再依頼を案内し、code交換もgrantも行わない。`--cancel`ではcallbackがキャンセルを表示し、requestは`cancelled`になりaccountは作られない。期限内なら、別のtabの遅い応答や再読込でもキャンセルを表示する。何も許可されなかった場合は`Nothing was granted`を表示し、既存accountも変更しない。失敗後は同じcallbackを再読込せず、`L kurumi <n> account connect --services gmail --agent-group-id <group-id>`で新しいrequestとリンクを作る。検証後は`L down <n>`を実行する。
 
 accountの指定は`L consent <n> '<connect-link>' --account 2`、部分同意は`--uncheck google-calendar`、拒否は`--cancel`を付ける。driverはscope checkboxごとにserviceと設定後の状態を出力する。
 
@@ -71,7 +71,7 @@ L kurumi <n> db query 'select id, status, access_expires_at from account where v
 L kurumi <n> gateway log
 ```
 
-`unexpected_response`を除くOAuthの4xx（`invalid_grant`、`invalid_client`、`unauthorized_client`など）ではstatusが`needs_reauth`になり、probeは403の`account_needs_reauth`を返す。本文の`next`にある、accountが持つ全serviceを含む`kurumi account connect --services <services> --agent-group-id <group-id>`を`L kurumi <n>`経由で実行し、同じGoogle accountで同意すると`active`に戻る。network障害、5xx、30秒のtimeoutではstatusを変えず、503の`account_refresh_failed`を返す。`x-should-retry: false`は付かず、次のprobeはrefreshを再試行する。code交換にも同じ30秒のtimeoutがある。
+`unexpected_response`を除くOAuthの4xx（`invalid_grant`、`invalid_client`、`unauthorized_client`など）ではstatusが`needs_reauth`になり、probeは403の`account_needs_reauth`を返す。本文の`next`は、accountが持つ全serviceを含む`mcp__kurumi__connect_account`の呼び出しをagentに案内する。同じGoogle accountで同意すると`active`に戻る。network障害、5xx、30秒のtimeoutではstatusを変えず、503の`account_refresh_failed`を返す。`x-should-retry: false`は付かず、次のprobeはrefreshを再試行する。code交換にも同じ30秒のtimeoutがある。
 
 grantをrevokeすると、有効期限内のaccess tokenでもGoogleは401を返す。gatewayはその応答を返し、注入したOAuth情報が保存中のものと同じ場合だけ期限を切る。次のprobeでrefreshが`invalid_grant`となり、403の`account_needs_reauth`を返す。先に完了した再接続やrefreshのtokenを、遅れて来た401で失効させない。再接続がrefresh中に完了した場合も、現在のgrantと有効なtokenを読み直して使う。
 
@@ -80,6 +80,33 @@ revokeの自己検証は、そのaccountを専有する`alone` laneでのみ行�
 - スクリーンショットは `/tmp/kurumi-verify/lane-<n>/evidence/consent-*.png`。同じ helper がページ内のアドレス、入力値、placeholder、SVG、open shadow root、URL と iframe を撮影前と各 frame でぼかす。viewport だけを保存するため、ブラウザの URL バーは画像に含まれない。失敗時もその画面を保存する。
 - driver は正常終了、失敗、SIGINT、SIGTERM で `kurumi-verify-<n>` session を閉じる。検証後は成功・失敗とも `L down <n>` を流す。`down` もこの session を閉じる。
 - helper の unit test は `bun test ./.agents/skills/verify`。先頭の `./` は Bun に directory として渡すために必要。`bun run check` にも含まれる。
+
+期限切れと既存accountの再利用は、同じlaneの`work`と`home`で確かめる。`up`に`KURUMI_CONNECT_REQUEST_TTL_MS=60000`を渡し、Google clientはリンクを出す前に設定する。60000未満、整数でない値はhostの起動時に変数名を含むerrorになる。既定は30分。
+
+```sh
+KURUMI_CONNECT_REQUEST_TTL_MS=60000 L up <n>
+L doctor <n>
+L add-key <n>
+L google-client <n>
+L kurumi <n> agent create --name work
+L kurumi <n> agent create --name home
+L chat <n> work 'Gmailを接続して。接続後にprofileを読んで。'
+```
+
+カードを押さず、chatを接続したまま最長2分待つ。元のrefに`期限切れです。もう一度頼んでください`が出て、`connection_request`は`expired`、`pkce_verifier`はnullになる。agentへのsystem noticeは無い。host logの`account.connect.expired`には`count`と`durationMs`がある。hostを止めて期限を越した場合も、次の起動時にsweepする。
+
+再び`work`に頼むと新しいカードが出る。期限内に`connect`をpressし、`L consent <n> '<private-connect-link>' --account 2`でgmailだけ同意する。続いて`home`に同じ依頼を送ると、カードは接続ボタンの後に`google/<test-account> を使う`を表示する。カードにある`use:<accountId>`をpressすると、追加の同意なしでhomeのgrant、✅置換、system noticeが同じtransactionで保存され、agentが続きを始める。CLIは成功時もnoticeを表示してexit 1なので、結果はgrantと再開で確認する。
+
+```sh
+L chat <n> home 'Gmailを接続して。接続後にprofileを読んで。'
+L kurumi <n> chat press <home-card-ref> use:<accountId>
+L kurumi <n> db query 'select agent_group_id, service, granted_by from account_grant'
+L kurumi <n> db query 'select state, pkce_verifier is null as verifier_cleared from connection_request'
+L kurumi <n> gateway log
+L down <n>
+```
+
+再利用はactiveなGoogle accountが要求serviceを全て持ち、その全てがgroupに付与済みでない場合に提案する。press時にもref、期限、承認者、coverageを確認する。期限切れ、非承認者、削除済み・再認可が必要・coverageが狭くなったaccountはnoticeで拒否し、何も保存しない。`account_not_connected`と`account_needs_reauth`の`next`にはmodelに見える`mcp__kurumi__connect_account`とservice配列を返す。
 
 ## Gotchas
 

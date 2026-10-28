@@ -425,7 +425,7 @@ test.each(['unknown', 'expired', 'cancelled', 'open', 'missing-code', 'duplicate
     const page = await connections.callback(url)
     expect(endpoint.exchanges()).toBe(0)
     expect(page).toEqual({
-      kind: mode === 'cancelled' ? 'cancelled' : 'unavailable',
+      kind: mode === 'cancelled' ? 'cancelled' : mode === 'expired' ? 'expired' : 'unavailable',
     })
     expect(db.select().from(account).all()).toEqual([])
   },
@@ -469,7 +469,7 @@ test.each(['client-change', 'expires'] as const)(
         .run()
     delayed.resolve(Response.json(tokenFull))
     expect(await pending).toEqual({
-      kind: mode === 'client-change' ? 'cancelled' : 'unavailable',
+      kind: mode === 'client-change' ? 'cancelled' : 'expired',
     })
     expect(db.select().from(account).all()).toEqual([])
     expect(db.select().from(accountGrant).all()).toEqual([])
@@ -616,7 +616,7 @@ test.each(['success', 'failure'] as const)(
     db.update(connectionRequest)
       .set({ expiresAt: new Date(0) })
       .run()
-    expect(await connections.callback(cancel)).toEqual({ kind: 'unavailable' })
+    expect(await connections.callback(cancel)).toEqual({ kind: 'expired' })
   },
 )
 
@@ -998,6 +998,8 @@ test('narrow consent explains the shared services and widens only OAuth for a su
   expect(await connections.callback(callbackUrl(id))).toEqual({
     kind: 'shared-services-missing',
     services: ['google-calendar'],
+    retry:
+      'Run kurumi account connect --services gmail google-calendar --agent-group-id work to retry.',
   })
   expect(db.select().from(accountGrant).all()).toEqual(before)
   expect(db.select().from(account).get()).toEqual(held)
@@ -1277,3 +1279,216 @@ test.each(['duplicate', 'no_session'] as const)(
     expect(proof.notices()).toEqual([])
   },
 )
+
+test('the sweep expires open and authorizing requests atomically, clears verifiers and replaces cards without notices', async () => {
+  const logs: unknown[] = []
+  const proof = withCards({ log: (entry) => logs.push(entry) })
+  const { requestId } = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
+  const pending = create()
+  const late = callbackUrl(pending)
+  const live = create()
+  const terminal = create()
+  db.update(connectionRequest)
+    .set({ state: 'cancelled' })
+    .where(eq(connectionRequest.id, terminal))
+    .run()
+  for (const id of [requestId, pending, terminal])
+    db.update(connectionRequest)
+      .set({ expiresAt: new Date(0) })
+      .where(eq(connectionRequest.id, id))
+      .run()
+  const result = connections.expireRequests()
+  expect(result.count).toBe(2)
+  expect(result.durationMs).toBeGreaterThanOrEqual(0)
+  expect(logs).toContainEqual({ kind: 'account.connect.expired', ...result })
+  for (const id of [requestId, pending])
+    expect(
+      db.select().from(connectionRequest).where(eq(connectionRequest.id, id)).get(),
+    ).toMatchObject({ state: 'expired', pkceVerifier: null })
+  expect(
+    db.select().from(connectionRequest).where(eq(connectionRequest.id, live)).get()?.state,
+  ).toBe('open')
+  expect(
+    db.select().from(connectionRequest).where(eq(connectionRequest.id, terminal)).get()?.state,
+  ).toBe('cancelled')
+  expect(JSON.parse(proof.cards()[1]!.content)).toMatchObject({
+    ref: requestId,
+    title: '期限切れです。もう一度頼んでください',
+    buttons: [],
+  })
+  expect(proof.delivered).toContain(`replace-${requestId}`)
+  expect(proof.notices()).toEqual([])
+  expect(proof.resumed).toEqual([])
+  const before = db.select().from(connectionRequest).all()
+  expect(await connections.callback(late)).toEqual({ kind: 'expired' })
+  expect(db.select().from(connectionRequest).all()).toEqual(before)
+  expect(db.select().from(accountGrant).all()).toEqual([])
+  expect(connections.expireRequests().count).toBe(0)
+  expect(proof.cards()).toHaveLength(2)
+})
+
+test('a failed expiry replacement rolls the whole sweep back', async () => {
+  withCards()
+  const { requestId } = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
+  const pending = create()
+  authorize(connections.issueLink(pending, caller))
+  db.update(connectionRequest)
+    .set({ expiresAt: new Date(0) })
+    .run()
+  const before = db.select().from(connectionRequest).all()
+  db.run(
+    sql`CREATE TRIGGER refuse_expiry BEFORE INSERT ON test_card BEGIN SELECT RAISE(ABORT, 'expiry failed'); END`,
+  )
+  expect(() => connections.expireRequests()).toThrow('INSERT INTO test_card')
+  expect(db.select().from(connectionRequest).all()).toEqual(before)
+  expect(
+    db.select().from(connectionRequest).where(eq(connectionRequest.id, requestId)).get()?.state,
+  ).toBe('open')
+})
+
+test('reuse offers only active accounts covering every service and missing a requested group grant, then completes without OAuth', async () => {
+  const proof = withCards({
+    canApprove: (who) => who.kind === 'human' && who.userId === 'owner',
+    fetch: Object.assign(
+      async () => {
+        throw new Error('must not consent')
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  insertAgentGroup(db, 'home')
+  for (const [id, services, status] of [
+    ['reuse', ['gmail', 'google-calendar'], 'active'],
+    ['partial-grant', ['gmail', 'google-calendar'], 'active'],
+    ['already-granted', ['gmail', 'google-calendar'], 'active'],
+    ['narrow', ['gmail'], 'active'],
+    ['reauth', ['gmail', 'google-calendar'], 'needs_reauth'],
+  ] as const)
+    insertAccount(db, { id, vendor: 'google', label: id, services: [...services], status })
+  transaction(db, (tx) => {
+    const ledger = createAccountLedger({ db, vaultKey })
+    for (const accountId of ['reuse', 'partial-grant', 'already-granted'])
+      for (const service of ['gmail', 'google-calendar'] as const)
+        if (accountId !== 'partial-grant' || service === 'gmail')
+          ledger.grant(tx, {
+            accountId,
+            agentGroupId: accountId === 'reuse' ? 'home' : 'work',
+            service,
+            grantedBy: 'host',
+          })
+  })
+  const { requestId } = await connections.connectAgent(
+    { services: ['gmail', 'google-calendar'] },
+    agentCaller,
+  )
+  const card = JSON.parse(proof.cards()[0]!.content)
+  expect(card.buttons).toEqual([
+    { action: 'connect', label: '接続する' },
+    { action: 'use:reuse', label: 'google/reuse を使う' },
+    { action: 'use:partial-grant', label: 'google/partial-grant を使う' },
+  ])
+  expect(
+    connections.press({ ref: requestId, action: 'use:reuse' }, { kind: 'human', userId: 'owner' }),
+  ).toEqual({ kind: 'notice', text: '接続しました' })
+  expect(db.select().from(connectionRequest).get()).toMatchObject({
+    state: 'completed',
+    accountId: 'reuse',
+    authorizedBy: 'human:owner',
+  })
+  expect(
+    db.select().from(accountGrant).where(eq(accountGrant.accountId, 'reuse')).all(),
+  ).toHaveLength(4)
+  expect(
+    db
+      .select()
+      .from(accountGrant)
+      .where(eq(accountGrant.agentGroupId, 'work'))
+      .all()
+      .filter((row) => row.accountId === 'reuse')
+      .every((row) => row.grantedBy === 'human:owner'),
+  ).toBe(true)
+  expect(db.select().from(connectLink).all()).toEqual([])
+  expect(proof.notices()).toHaveLength(1)
+  expect(proof.resumed).toEqual([requestId])
+  expect(proof.delivered).toContain(`replace-${requestId}`)
+  expect(proof.cards()[1]?.content).toContain('✅ google/reuse')
+  expect(connections.press({ ref: requestId, action: 'use:reuse' }, caller).kind).toBe('notice')
+  expect(proof.notices()).toHaveLength(1)
+})
+
+test.each([
+  'member',
+  'agent',
+  'expired',
+  'terminal',
+  'cli',
+  'missing',
+  'reauth',
+  'narrow',
+  'vendor',
+] as const)(
+  'reuse refuses %s without writing grants, links, replacements or notices',
+  async (mode) => {
+    const proof = withCards()
+    insertAccount(db, {
+      id: 'reuse',
+      vendor: 'google',
+      label: 'reuse',
+      services: ['gmail', 'google-calendar'],
+    })
+    const { requestId } = await connections.connectAgent(
+      { services: ['gmail', 'google-calendar'] },
+      agentCaller,
+    )
+    let ref = requestId
+    if (mode === 'cli') ref = create()
+    if (mode === 'expired')
+      db.update(connectionRequest)
+        .set({ expiresAt: new Date(0) })
+        .run()
+    if (mode === 'terminal') db.update(connectionRequest).set({ state: 'cancelled' }).run()
+    if (mode === 'missing') db.delete(account).run()
+    if (mode === 'reauth') db.update(account).set({ status: 'needs_reauth' }).run()
+    if (mode === 'narrow')
+      db.update(account)
+        .set({ services: ['gmail'] })
+        .run()
+    if (mode === 'vendor') {
+      db.delete(account).run()
+      insertAccount(db, {
+        id: 'reuse',
+        vendor: 'anthropic',
+        label: 'reuse',
+        services: ['anthropic-api'],
+      })
+    }
+    const before = db.select().from(connectionRequest).all()
+    const who =
+      mode === 'member'
+        ? { kind: 'human' as const, userId: 'member' }
+        : mode === 'agent'
+          ? agentCaller
+          : caller
+    expect(connections.press({ ref, action: 'use:reuse' }, who).kind).toBe('notice')
+    expect(db.select().from(connectionRequest).all()).toEqual(before)
+    expect(db.select().from(accountGrant).all()).toEqual([])
+    expect(db.select().from(connectLink).all()).toEqual([])
+    expect(proof.cards()).toHaveLength(1)
+    expect(proof.notices()).toEqual([])
+    expect(proof.resumed).toEqual([])
+  },
+)
+
+test('reuse completion rolls back grants and state when card replacement fails', async () => {
+  withCards()
+  insertAccount(db, { id: 'reuse', vendor: 'google', label: 'reuse', services: ['gmail'] })
+  const { requestId } = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
+  db.run(
+    sql`CREATE TRIGGER refuse_reuse BEFORE INSERT ON test_card BEGIN SELECT RAISE(ABORT, 'reuse failed'); END`,
+  )
+  expect(() => connections.press({ ref: requestId, action: 'use:reuse' }, caller)).toThrow(
+    'INSERT INTO test_card',
+  )
+  expect(db.select().from(accountGrant).all()).toEqual([])
+  expect(db.select().from(connectionRequest).get()?.state).toBe('open')
+})
