@@ -67,6 +67,7 @@ export type SessionRuntime = {
     }
 )
 const REVISION_PLACEHOLDER = { agentGroupId: '<agent-group>', sessionToken: '<session-token>' }
+const MAX_INBOUND_TRIES = 3
 
 export function containerRevision(input: {
   image: string
@@ -98,6 +99,13 @@ export type RuntimeLog =
       containerId: string
       attempt: number
       delayMs: number
+      monotonicMs: number
+    }
+  | {
+      kind: 'session.inbound.exhausted'
+      sessionId: string
+      inboundId: string
+      tries: number
       monotonicMs: number
     }
   | { kind: 'session.notify'; sessionId: string; inboundId: string; monotonicMs: number }
@@ -299,16 +307,41 @@ export function createSessionLedger({
       const row = tx.select().from(container).where(eq(container.id, id)).get()
       if (!row || row.status === 'stopping') return null
       tx.update(container).set({ status: 'stopping' }).where(eq(container.id, id)).run()
-      tx.update(inboundMessage)
-        .set({ status: 'pending', claimedBy: null })
+      const message = tx
+        .select()
+        .from(inboundMessage)
         .where(
           and(
             eq(inboundMessage.sessionId, row.sessionId),
-            eq(inboundMessage.claimedBy, id),
-            eq(inboundMessage.status, 'processing'),
+            inArray(inboundMessage.status, ['pending', 'processing']),
           ),
         )
-        .run()
+        .orderBy(inboundMessage.seq)
+        .get()
+      if (
+        message &&
+        (message.status === 'processing'
+          ? message.claimedBy === id
+          : !message.processAfter || message.processAfter.getTime() <= Date.now())
+      ) {
+        const tries = message.tries + (message.status === 'pending' ? 1 : 0)
+        tx.update(inboundMessage)
+          .set({
+            status: tries >= MAX_INBOUND_TRIES ? 'failed' : 'pending',
+            claimedBy: null,
+            tries,
+          })
+          .where(eq(inboundMessage.id, message.id))
+          .run()
+        if (tries >= MAX_INBOUND_TRIES)
+          runtimeLog?.({
+            kind: 'session.inbound.exhausted',
+            sessionId: row.sessionId,
+            inboundId: message.id,
+            tries,
+            monotonicMs: performance.now(),
+          })
+      }
       return row
     })
     if (retired && !stopped) {
@@ -390,8 +423,14 @@ export function createSessionLedger({
           inArray(inboundMessage.status, ['pending', 'processing']),
         ),
       )
+      .orderBy(inboundMessage.seq)
       .get()
-    if (!pending || !runtime.egress.admission().open) return
+    if (
+      !pending ||
+      (pending.processAfter && pending.processAfter.getTime() > Date.now()) ||
+      !runtime.egress.admission().open
+    )
+      return
     const current = db
       .select()
       .from(session)

@@ -323,6 +323,9 @@ test('three container deaths fail only the poisonous inbound, even across a host
     tries: 3,
     claimedBy: null,
   })
+  expect(logs.filter((entry) => entry.kind === 'session.inbound.exhausted')).toEqual([
+    expect.objectContaining({ inboundId: accepted.inboundId, tries: 3 }),
+  ])
   await ledger.routeInbound(poison)
   await Bun.sleep(1300)
   expect(driver.runs).toHaveLength(3)
@@ -336,6 +339,33 @@ test('three container deaths fail only the poisonous inbound, even across a host
   await ledger.channel.complete(who, { ids: [next.inboundId] })
   expect(db.select().from(inboundMessage).all()).toMatchObject([
     { id: accepted.inboundId, status: 'failed', tries: 3 },
+    { id: next.inboundId, status: 'completed', tries: 1 },
+  ])
+})
+
+test('an exhausted inbound leaves already queued work with its own full budget', async () => {
+  await ledger.start()
+  const poison = await ledger.routeInbound(event('poison'))
+  const next = await ledger.routeInbound(event('healthy'))
+  for (let index = 0; index < 3; index++) {
+    await until(() => driver.runs.length === index + 1)
+    const who = principal(index)
+    await ledger.channel.pull(who, { waitMs: 0 })
+    await driver.kill(who.containerId, 0)
+  }
+  expect(db.select().from(inboundMessage).all()).toMatchObject([
+    { id: poison.inboundId, status: 'failed', tries: 3 },
+    { id: next.inboundId, status: 'pending', tries: 0 },
+  ])
+  await until(() => driver.runs.length === 4)
+  const who = principal(3)
+  expect((await ledger.channel.pull(who, { waitMs: 0 })).messages[0]?.id).toBe(next.inboundId)
+  await ledger.channel.complete(who, { ids: [next.inboundId] })
+  await driver.kill(who.containerId, 0)
+  await Bun.sleep(400)
+  expect(driver.runs).toHaveLength(4)
+  expect(db.select().from(inboundMessage).all()).toMatchObject([
+    { id: poison.inboundId, status: 'failed', tries: 3 },
     { id: next.inboundId, status: 'completed', tries: 1 },
   ])
 })
