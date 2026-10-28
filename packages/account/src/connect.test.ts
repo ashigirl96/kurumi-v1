@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, setSystemTime, test } from 'bun:test'
 import { randomBytes } from 'node:crypto'
 
 import { transaction } from '@kurumi/rpc/server'
-import { eq } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 
 import { serviceIds, vendorOf } from './catalog.ts'
 import { parseConnectionRequest, type createConnections } from './connect.ts'
@@ -52,11 +52,15 @@ function authorize(token: string): URL {
   return result.url
 }
 
-test('connect accepts every Google service in the catalog and refuses other vendors', () => {
+test('connect validates catalog services and names supported services for other vendors', () => {
   for (const service of serviceIds) {
     expect(
       ConnectInputSchema.safeParse({ agentGroupId: 'work', services: [service] }).success,
-    ).toBe(vendorOf(service) === 'google')
+    ).toBe(true)
+    if (vendorOf(service) !== 'google')
+      expect(() =>
+        connections.createRequest({ services: [service], agentGroupId: 'work' }, caller),
+      ).toThrow('gmail と google-calendar')
   }
 })
 
@@ -131,17 +135,14 @@ test('the partial unique index admits only one live request per session and vend
   connections.createRequest({ ...input, sessionId: 'session-1' }, caller)
 })
 
-test('only group approvers may create requests or mint links, and agents never may', () => {
+test('only group approvers may create CLI requests or mint links', () => {
   const id = create()
   connections = makeConnections({
     db,
     vaultKey,
     canApprove: (who, group) => who.kind === 'human' && who.userId === 'owner' && group === 'work',
   })
-  for (const who of [
-    { kind: 'human', userId: 'member' },
-    { kind: 'agent', agentGroupId: 'work', sessionId: 's' },
-  ] as const) {
+  for (const who of [{ kind: 'human', userId: 'member' }] as const) {
     expect(() => connections.createRequest(input, who)).toThrow('only an approver')
     expect(() => connections.issueLink(id, who)).toThrow('only an approver')
   }
@@ -205,7 +206,9 @@ test('bad inputs and missing groups or clients leave no request or link', () => 
   expect(() => connections.connect({ ...input, agentGroupId: 'missing' }, caller)).toThrow(
     'not found',
   )
-  expect(ConnectInputSchema.safeParse({ ...input, services: ['github'] }).success).toBe(false)
+  expect(() => connections.createRequest({ ...input, services: ['github'] }, caller)).toThrow(
+    'gmail と google-calendar',
+  )
   db.delete(oauthClient).run()
   expect(() => connections.connect(input, caller)).toThrow('set-client')
   expect(db.select().from(connectionRequest).all()).toEqual([])
@@ -709,4 +712,233 @@ test('a code bug is logged by name and is not converted to the retryable failure
   const failure = await connections.callback(callbackUrl(id)).catch((error: unknown) => error)
   expect(failure).toBeInstanceOf(TypeError)
   expect(events).toEqual([{ kind: 'account.connect.failed', requestId: id, reason: 'TypeError' }])
+})
+
+const agentCaller = { kind: 'agent', agentGroupId: 'work', sessionId: 'ses-work' } as const
+function withCards(deps: Partial<Parameters<typeof createAccountLedger>[0]> = {}) {
+  db.run(sql`CREATE TABLE test_card (id TEXT PRIMARY KEY, session_id TEXT, content TEXT)`)
+  const delivered: string[] = []
+  connections = makeConnections({
+    db,
+    vaultKey,
+    ...deps,
+    cards: {
+      post(tx, sessionId, card) {
+        expect(db.$client.inTransaction).toBe(true)
+        const id = `card-${card.ref}`
+        tx.run(sql`INSERT INTO test_card VALUES (${id}, ${sessionId}, ${JSON.stringify(card)})`)
+        return id
+      },
+      async deliver(id) {
+        expect(db.$client.inTransaction).toBe(false)
+        delivered.push(id)
+      },
+    },
+  })
+  return { delivered, cards: () => db.all<{ content: string }>(sql`SELECT content FROM test_card`) }
+}
+
+test('agent connect binds the authenticated group and session, reuses the request and posts one URL-free card', async () => {
+  const proof = withCards()
+  const result = await connections.connectAgent(
+    { services: ['gmail'], agentGroupId: 'forged' },
+    agentCaller,
+  )
+  expect(await connections.connectAgent({ services: ['gmail', 'gmail'] }, agentCaller)).toEqual(
+    result,
+  )
+  expect(result.kind).toBe('card_posted')
+  expect(JSON.stringify(result)).not.toContain('http')
+  expect(proof.cards()).toHaveLength(1)
+  expect(proof.cards()[0]?.content).toContain('work')
+  expect(proof.cards()[0]?.content).not.toContain('http')
+  expect(db.select().from(connectionRequest).get()).toMatchObject({
+    id: result.requestId,
+    agentGroupId: 'work',
+    sessionId: 'ses-work',
+    cardMessageId: `card-${result.requestId}`,
+  })
+  expect(db.select().from(connectLink).all()).toEqual([])
+})
+
+test('agent connect expires overdue requests and cancels a live request when services change', async () => {
+  withCards()
+  const first = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
+  const second = await connections.connectAgent(
+    { services: ['gmail', 'google-calendar'] },
+    agentCaller,
+  )
+  expect(second.requestId).not.toBe(first.requestId)
+  expect(
+    db.select().from(connectionRequest).where(eq(connectionRequest.id, first.requestId)).get()
+      ?.state,
+  ).toBe('cancelled')
+  db.update(connectionRequest)
+    .set({ expiresAt: new Date(0) })
+    .where(eq(connectionRequest.id, second.requestId))
+    .run()
+  const third = await connections.connectAgent(
+    { services: ['gmail', 'google-calendar'] },
+    agentCaller,
+  )
+  expect(third.requestId).not.toBe(second.requestId)
+  expect(
+    db.select().from(connectionRequest).where(eq(connectionRequest.id, second.requestId)).get()
+      ?.state,
+  ).toBe('expired')
+})
+
+test('failed card insertion rolls the request back', async () => {
+  withCards()
+  db.run(
+    sql`CREATE TRIGGER refuse_card BEFORE INSERT ON test_card BEGIN SELECT RAISE(ABORT, 'card failed'); END`,
+  )
+  const failure = await connections
+    .connectAgent({ services: ['gmail'] }, agentCaller)
+    .catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(Error)
+  expect(db.select().from(connectionRequest).all()).toEqual([])
+})
+
+test('press refuses non-approvers, CLI-only refs, unknown refs, bad actions and expired or terminal requests without links', async () => {
+  withCards({ canApprove: (who, group) => who.kind === 'host' && group === 'work' })
+  const { requestId } = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
+  const press = (
+    ref: string,
+    action = 'connect',
+    who: Parameters<typeof connections.press>[1] = caller,
+  ) => connections.press({ ref, action }, who)
+  expect(press(requestId, 'connect', { kind: 'human', userId: 'member' })).toEqual({
+    kind: 'notice',
+    text: 'この group の承認者だけが接続できます',
+  })
+  expect(press(requestId, 'connect', agentCaller).kind).toBe('notice')
+  expect(press(create()).kind).toBe('notice')
+  expect(press('unknown').kind).toBe('notice')
+  expect(press(requestId, 'forged').kind).toBe('notice')
+  for (const state of ['cancelled', 'completed', 'expired'] as const) {
+    db.update(connectionRequest).set({ state }).where(eq(connectionRequest.id, requestId)).run()
+    expect(press(requestId).kind).toBe('notice')
+  }
+  db.update(connectionRequest)
+    .set({ state: 'open', expiresAt: new Date(0) })
+    .where(eq(connectionRequest.id, requestId))
+    .run()
+  expect(press(requestId).kind).toBe('notice')
+  expect(db.select().from(connectLink).all()).toEqual([])
+})
+
+test('a human approver’s card link grants only to the card group and records the approver', async () => {
+  withCards({
+    canApprove: (who) => who.kind === 'human' && who.userId === 'owner',
+    fetch: Object.assign(async () => Response.json(tokenFull), { preconnect: fetch.preconnect }),
+  })
+  insertAgentGroup(db, 'home')
+  const { requestId } = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
+  const reply = connections.press(
+    { ref: requestId, action: 'connect' },
+    { kind: 'human', userId: 'owner' },
+  )
+  if (reply.kind !== 'private-link') throw new Error('missing private link')
+  const url = authorize(new URL(reply.url).pathname.split('/').at(-1)!)
+  expect(
+    await connections.callback(
+      new URL(
+        `http://127.0.0.1/oauth/callback?state=${url.searchParams.get('state')}&code=fixture-code`,
+      ),
+    ),
+  ).toMatchObject({ kind: 'completed' })
+  expect(db.select().from(accountGrant).all()).toMatchObject([
+    { agentGroupId: 'work', service: 'gmail', grantedBy: 'human:owner' },
+  ])
+})
+
+test('an authorizing request cannot attribute a different approver’s consent to the first approver', () => {
+  const id = create()
+  connections = makeConnections({ db, vaultKey, canApprove: () => true })
+  const first = connections.issueLink(id, { kind: 'human', userId: 'first' })
+  const other = connections.issueLink(id, { kind: 'human', userId: 'other' })
+  authorize(first)
+  expect(connections.openLink(other)).toEqual({ kind: 'unavailable' })
+})
+
+test('reconnect requests all held services but grants only the services asked for', async () => {
+  tokenEndpoint(() => Response.json(tokenFull))
+  await connections.callback(callbackUrl())
+  const held = db.select().from(account).get()!
+  db.update(account).set({ status: 'needs_reauth' }).run()
+  db.delete(accountGrant).run()
+  db.insert(accountGrant)
+    .values({
+      accountId: held.id,
+      agentGroupId: 'work',
+      vendor: 'google',
+      service: 'gmail',
+      grantedBy: 'host',
+      grantedAt: new Date(),
+    })
+    .run()
+  const id = connections.createRequest({ services: ['gmail'], agentGroupId: 'work' }, caller)
+  const url = authorize(connections.issueLink(id, caller))
+  expect(url.searchParams.get('scope')).toContain('calendar')
+  await connections.callback(
+    new URL(
+      `http://127.0.0.1/oauth/callback?state=${url.searchParams.get('state')}&code=fixture-code`,
+    ),
+  )
+  expect(
+    db
+      .select()
+      .from(accountGrant)
+      .all()
+      .map(({ service }) => service),
+  ).toEqual(['gmail'])
+})
+
+test('narrow consent cannot delete another group’s grants or replace its account material', async () => {
+  let reply = tokenFull
+  tokenEndpoint(() => Response.json(reply))
+  await connections.callback(callbackUrl())
+  insertAgentGroup(db, 'home')
+  const held = db.select().from(account).get()!
+  db.insert(accountGrant)
+    .values({
+      accountId: held.id,
+      agentGroupId: 'home',
+      vendor: 'google',
+      service: 'google-calendar',
+      grantedBy: 'host',
+      grantedAt: new Date(),
+    })
+    .run()
+  const before = db.select().from(accountGrant).all()
+  reply = tokenGmailOnly
+  expect(await connections.callback(callbackUrl())).toEqual({ kind: 'failed' })
+  expect(db.select().from(accountGrant).all()).toEqual(before)
+  expect(db.select().from(account).get()).toEqual(held)
+})
+
+test('a reconnect updates requested grant audit to the approver whose link completes it', async () => {
+  const endpoint = tokenEndpoint(() => Response.json(tokenFull))
+  await connections.callback(callbackUrl())
+  const before = db.select().from(accountGrant).all()
+  expect(before.every((row) => row.grantedBy === 'host')).toBe(true)
+  const id = create()
+  const other = makeConnections({ db, vaultKey, canApprove: () => true })
+  const opened = other.openLink(other.issueLink(id, { kind: 'human', userId: 'new-owner' }))
+  if (opened.kind !== 'authorize') throw new Error('missing authorize URL')
+  const state = opened.url.searchParams.get('state')
+  expect(
+    await connections.callback(
+      new URL(`http://127.0.0.1/oauth/callback?state=${state}&code=next-code`),
+    ),
+  ).toMatchObject({ kind: 'completed' })
+  expect(endpoint.exchanges()).toBe(2)
+  expect(
+    db
+      .select()
+      .from(accountGrant)
+      .all()
+      .every((row) => row.grantedBy === 'human:new-owner'),
+  ).toBe(true)
 })

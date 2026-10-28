@@ -100,6 +100,8 @@ export const connectionRequest = sqliteTable(
     vendor: text('vendor', { enum: ['google'] }).notNull(),
     services: text('services', { mode: 'json' }).$type<ServiceId[]>().notNull(),
     sessionId: text('session_id'),
+    oauthServices: text('oauth_services', { mode: 'json' }).$type<ServiceId[]>(),
+    authorizedBy: text('authorized_by'),
     state: text('state', {
       enum: ['open', 'authorizing', 'completed', 'expired', 'cancelled'],
     }).notNull(),

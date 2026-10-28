@@ -12,11 +12,29 @@ hostが発行した接続リンクを開き、指定したaccountで同意かキ
 - callbackはGoogleのcodeを交換し、暗号化したOAuth accountと、要求したserviceのうち許可された分のgrantを保存する。部分同意では許可されなかったserviceもページに表示する。
 - 完了・キャンセル後のcallbackの再読込はcodeを交換せず、それぞれ成功・キャンセルを表示する。`access_denied`だけがキャンセルになり、ほかのOAuthエラーは接続失敗を表示する。交換失敗や、要求したserviceが一つも許可されなかった場合は`open`に戻る。利用者は`account connect`をもう一度実行し、新しい接続リンクからやり直す。
 
+- chatで接続を頼むと、`connect_account`がgroup名・Google・要求serviceを示すカードを投稿する。カードとtool応答にURLは含まれない。承認者が`kurumi chat press <ref> connect`を実行すると、そのコマンドだけに5分・1回限りのリンクを返す。
+- 同じsessionで同じserviceを頼むとrequestとカードを再利用する。serviceが変わると旧requestをキャンセルし、期限切れなら新しいrequestを作る。
+
 ## How to get to it (user POV)
 
 `L kurumi <n> account connect --services gmail --agent-group-id <group-id>`から接続リンクを得る。接続リンクは、この lane の `http://127.0.0.1:<web port>/connect/<token>` に限る。
 
 ## Driving it with lane.sh
+
+chatからは、`L add-key <n>`とagent作成後、`L google-client <n>`を先に実行し、次の順で進める。
+
+```sh
+L chat <n> work 'Gmail つないで'
+L kurumi <n> chat press <card-ref> connect
+L consent <n> '<private-connect-link>' --account 2
+L kurumi <n> account list
+L kurumi <n> db query 'select agent_group_id, service, granted_by from account_grant'
+L kurumi <n> db query 'select kind, status from outbound_message'
+```
+
+replyとカードのpress行を確認する。リンクはpressのstdoutだけに出て、cardの保存行やtool応答には出ない。存在しないref、CLIから作ったrequest、期限切れ・終了したrequest、不明なactionはnoticeになり、link行を作らない。terminalのcallerはhostなので、非承認者の拒否はhuman callerのunit testで確認する。認可中は最初にリンクを開いた承認者に固定し、別承認者のリンクは利用不可になる。同じ承認者の複数リンクはstateを共有する。
+
+再接続は`needs_reauth`のaccountが持つserviceを同意対象に含め、groupには要求分だけを付与する。狭い同意が別groupのgrantを失わせる場合は保存を拒否する。Google handleを含む出力はアドレスを伏せて保存する。
 
 CLIから接続を始めるときは、次の順で実行する。`<group-id>`には`agent create`が返したidを使う。
 

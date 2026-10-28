@@ -2,12 +2,12 @@ import { randomBytes } from 'node:crypto'
 
 import { agentGroup } from '@kurumi/agent/schema'
 import type { Caller } from '@kurumi/rpc/contract'
-import { transaction, type Db } from '@kurumi/rpc/server'
+import { transaction, type Db, type Tx } from '@kurumi/rpc/server'
 import { ORPCError } from '@orpc/server'
-import { and, eq, gt, inArray, notInArray } from 'drizzle-orm'
+import { and, eq, gt, inArray, lte, ne, notInArray } from 'drizzle-orm'
 import { z } from 'zod'
 
-import { catalog, IdentifyError, servicesCovered, type ServiceId } from './catalog.ts'
+import { catalog, IdentifyError, servicesCovered, vendorOf, type ServiceId } from './catalog.ts'
 import { ConnectInputSchema, GoogleClientSchema } from './contract.ts'
 import { grant } from './grant.ts'
 import { accountMaterial } from './material.ts'
@@ -67,6 +67,20 @@ const requestTtl = 30 * 60_000
 export type ConnectionOptions = {
   webPort?: number
   canApprove?: (caller: Caller, agentGroupId: string) => boolean
+  cards?: {
+    post(
+      tx: Tx,
+      sessionId: string,
+      card: {
+        owner: 'account.connect'
+        ref: string
+        title: string
+        body: string
+        buttons: { action: string; label: string }[]
+      },
+    ): string
+    deliver(id: string): Promise<void>
+  }
   fetch?: typeof fetch
   log?: (
     event:
@@ -96,6 +110,7 @@ export function createConnections({
   vaultKey,
   webPort = 4001,
   canApprove = (caller) => caller.kind === 'host',
+  cards,
   fetch: fetchImpl = fetch,
   log = () => {},
 }: {
@@ -168,29 +183,121 @@ export function createConnections({
       input: z.infer<typeof ConnectInputSchema> & { sessionId?: string },
       caller: Caller,
     ): string {
-      const requestedBy = approver(caller, input.agentGroupId)
       const parsed = ConnectInputSchema.parse(input)
+      if (parsed.services.some((service) => vendorOf(service) !== 'google'))
+        throw new ORPCError('BAD_REQUEST', {
+          message: '接続できるサービスは gmail と google-calendar です',
+        })
+      const groupId = caller.kind === 'agent' ? caller.agentGroupId : parsed.agentGroupId
+      if (!groupId) throw new ORPCError('BAD_REQUEST', { message: 'agentGroupId is required' })
+      const requestedBy =
+        caller.kind === 'agent' ? `agent:${caller.agentGroupId}` : approver(caller, groupId)
+      const sessionId = caller.kind === 'agent' ? caller.sessionId : (input.sessionId ?? null)
+      const services = [...new Set(parsed.services)].toSorted()
+      if (caller.kind === 'agent' && !cards)
+        throw new ORPCError('SERVICE_UNAVAILABLE', { message: 'Connect Cards are unavailable' })
       return transaction(db, (tx) => {
-        if (!tx.select().from(agentGroup).where(eq(agentGroup.id, parsed.agentGroupId)).get())
-          throw new ORPCError('NOT_FOUND', { message: 'agent group not found' })
+        const group = tx.select().from(agentGroup).where(eq(agentGroup.id, groupId)).get()
+        if (!group) throw new ORPCError('NOT_FOUND', { message: 'agent group not found' })
         clientOf()
-        const id = `cr-${Bun.randomUUIDv7()}`
         const now = new Date()
+        if (caller.kind === 'agent') {
+          const live = and(
+            eq(connectionRequest.agentGroupId, groupId),
+            eq(connectionRequest.vendor, 'google'),
+            eq(connectionRequest.sessionId, caller.sessionId),
+            inArray(connectionRequest.state, ['open', 'authorizing']),
+          )
+          tx.update(connectionRequest)
+            .set({ state: 'expired' })
+            .where(and(live, lte(connectionRequest.expiresAt, now)))
+            .run()
+          const existing = tx.select().from(connectionRequest).where(live).get()
+          if (existing) {
+            if (JSON.stringify(existing.services.toSorted()) === JSON.stringify(services))
+              return existing.id
+            tx.update(connectionRequest)
+              .set({ state: 'cancelled' })
+              .where(eq(connectionRequest.id, existing.id))
+              .run()
+          }
+        }
+        const reconnect = tx
+          .select({ services: account.services })
+          .from(account)
+          .innerJoin(accountGrant, eq(account.id, accountGrant.accountId))
+          .where(
+            and(
+              eq(account.vendor, 'google'),
+              eq(account.status, 'needs_reauth'),
+              eq(accountGrant.agentGroupId, groupId),
+              inArray(accountGrant.service, services),
+            ),
+          )
+          .all()
+        const oauthServices = [
+          ...new Set([...services, ...reconnect.flatMap((row) => row.services)]),
+        ]
+        const id = `cr-${Bun.randomUUIDv7()}`
         tx.insert(connectionRequest)
           .values({
             id,
-            ...parsed,
-            services: [...new Set(parsed.services)],
+            agentGroupId: groupId,
+            services,
+            oauthServices,
             vendor: 'google',
-            sessionId: input.sessionId ?? null,
+            sessionId,
             state: 'open',
             requestedBy,
             createdAt: now,
             expiresAt: new Date(now.getTime() + requestTtl),
           })
           .run()
+        if (caller.kind === 'agent' && cards) {
+          const cardMessageId = cards.post(tx, caller.sessionId, {
+            owner: 'account.connect',
+            ref: id,
+            title: `${group.name} に Google を接続`,
+            body: `接続するサービス: ${services.join(', ')}`,
+            buttons: [{ action: 'connect', label: '接続する' }],
+          })
+          tx.update(connectionRequest)
+            .set({ cardMessageId })
+            .where(eq(connectionRequest.id, id))
+            .run()
+        }
         return id
       })
+    },
+    async connectAgent(
+      input: z.infer<typeof ConnectInputSchema>,
+      caller: Extract<Caller, { kind: 'agent' }>,
+    ) {
+      const requestId = connections.createRequest(input, caller)
+      const row = db
+        .select()
+        .from(connectionRequest)
+        .where(eq(connectionRequest.id, requestId))
+        .get()
+      if (row?.cardMessageId) await cards?.deliver(row.cardMessageId)
+      return { kind: 'card_posted' as const, requestId }
+    },
+    press(
+      { ref, action }: { ref: string; action: string },
+      caller: Caller,
+    ): { kind: 'private-link'; url: string } | { kind: 'notice'; text: string } {
+      const row = db.select().from(connectionRequest).where(eq(connectionRequest.id, ref)).get()
+      if (
+        action !== 'connect' ||
+        !row?.cardMessageId ||
+        !['open', 'authorizing'].includes(row.state) ||
+        row.expiresAt <= new Date()
+      )
+        return { kind: 'notice', text: 'このカードは利用できません。もう一度接続を頼んでください' }
+      if (caller.kind === 'agent' || !canApprove(caller, row.agentGroupId))
+        return { kind: 'notice', text: 'この group の承認者だけが接続できます' }
+      const token = connections.issueLink(row.id, caller)
+      return { kind: 'private-link', url: `http://127.0.0.1:${webPort}/connect/${token}` }
     },
     issueLink(requestId: string, caller: Caller): ConnectToken {
       return transaction(db, (tx) => {
@@ -249,6 +356,11 @@ export function createConnections({
           request.expiresAt <= now
         )
           return { kind: 'unavailable' }
+        if (
+          request.state === 'authorizing' &&
+          (request.authorizedBy ?? request.requestedBy) !== link.mintedFor
+        )
+          return { kind: 'unavailable' }
         const client = clientOf()
         const oauthState = request.state === 'authorizing' ? request.oauthState : createState()
         const verifier =
@@ -257,7 +369,7 @@ export function createConnections({
             : createPkce().verifier
         const url = authorizeUrl({
           vendor: request.vendor,
-          services: request.services,
+          services: request.oauthServices ?? request.services,
           client,
           redirectUri,
           state: oauthState,
@@ -267,6 +379,7 @@ export function createConnections({
           tx.update(connectionRequest)
             .set({
               state: 'authorizing',
+              authorizedBy: link.mintedFor,
               oauthState,
               pkceVerifier: seal(vaultKey, request.id, verifier),
             })
@@ -338,6 +451,25 @@ export function createConnections({
             .from(account)
             .where(and(eq(account.vendor, request.vendor), eq(account.subject, identity.subject)))
             .get()
+          if (
+            previous &&
+            tx
+              .select()
+              .from(accountGrant)
+              .where(
+                and(
+                  eq(accountGrant.accountId, previous.id),
+                  ne(accountGrant.agentGroupId, current.agentGroupId),
+                  notInArray(accountGrant.service, services),
+                ),
+              )
+              .get()
+          )
+            throw new OAuthError(
+              'Consent would remove another group’s services',
+              'shared_services_missing',
+              502,
+            )
           const id = previous?.id ?? `acc-${Bun.randomUUIDv7()}`
           if (material.kind === 'oauth' && material.refreshToken === null && previous) {
             const stored = accountMaterial.parse(JSON.parse(open(vaultKey, id, previous.material)))
@@ -370,10 +502,23 @@ export function createConnections({
               agentGroupId: current.agentGroupId,
               accountId: id,
               service,
-              grantedBy: current.requestedBy,
+              grantedBy: current.authorizedBy ?? current.requestedBy,
             })
             if (!granted.ok)
               throw new Error(`unable to grant connected account: ${granted.refusal}`)
+            tx.update(accountGrant)
+              .set({
+                grantedBy: current.authorizedBy ?? current.requestedBy,
+                grantedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(accountGrant.accountId, id),
+                  eq(accountGrant.agentGroupId, current.agentGroupId),
+                  eq(accountGrant.service, service),
+                ),
+              )
+              .run()
           }
           tx.update(connectionRequest)
             .set({ state: 'completed', accountId: id, pkceVerifier: null })
@@ -415,7 +560,7 @@ export function createConnections({
             return pageFor(current)
           if (attempts.get(state) === 1)
             tx.update(connectionRequest)
-              .set({ state: 'open', oauthState: null, pkceVerifier: null })
+              .set({ state: 'open', oauthState: null, pkceVerifier: null, authorizedBy: null })
               .where(eq(connectionRequest.id, current.id))
               .run()
           return {

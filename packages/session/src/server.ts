@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 
 import type { AgentLedger } from '@kurumi/agent/server'
+import { CardSchema, type Card } from '@kurumi/chat/contract'
 import type { ChatLedger, InboundEvent, InboundReceipt } from '@kurumi/chat/server'
 import { transaction, type Db, type Tx, type KurumiContext } from '@kurumi/rpc/server'
 import { implement, ORPCError } from '@orpc/server'
@@ -88,6 +89,7 @@ export type RuntimeLog =
       kind: 'session.outbound.delivered'
       inboundId: string | null
       outboundId: string
+      messageKind: 'text' | 'card'
       monotonicMs: number
     }
   | {
@@ -117,6 +119,8 @@ export type SessionLedger = {
   stop(): Promise<void>
   routeInbound(event: InboundEvent): Promise<InboundReceipt>
   postOutbound(input: OutboundInput): Promise<void>
+  postCard(tx: Tx, sessionId: string, card: Card): string
+  deliverCard(id: string): Promise<void>
   /** Starts a turn with `text` as a system message, once per key, and shows the same text in the chat. */
   notify(notice: SessionNotice): NoticeReceipt
   authenticate(token: string): AgentPrincipal | null
@@ -511,6 +515,7 @@ export function createSessionLedger({
         .get()
       if (existing) {
         if (
+          existing.kind !== 'text' ||
           existing.sessionId !== input.sessionId ||
           existing.content !== input.text ||
           existing.inReplyTo !== (input.inReplyTo ?? null)
@@ -551,21 +556,33 @@ export function createSessionLedger({
       await deliveries.get(input.id)
       return
     }
+    await deliverStored(input.id)
+  }
+
+  async function deliverStored(id: string) {
+    const pending = deliveries.get(id)
+    if (pending) return pending
+    const row = db.select().from(outboundMessage).where(eq(outboundMessage.id, id)).get()
+    if (!row || row.status === 'delivered') return
+    const current = db.select().from(session).where(eq(session.id, row.sessionId)).get()
     const task = (async () => {
       let platformMessageId: string | null = null
       try {
-        const target = current.messagingGroupId
+        const target = current?.messagingGroupId
           ? chatLedger.targetOf(current.messagingGroupId, current.threadId)
           : null
         const adapter = target ? chatLedger.adapter(target) : null
         if (target && adapter)
-          platformMessageId = (await adapter.post(target, { id: input.id, text: input.text }))
-            .platformMessageId
+          platformMessageId = (
+            await (row.kind === 'card'
+              ? adapter.postCard(target, { id, card: CardSchema.parse(JSON.parse(row.content)) })
+              : adapter.post(target, { id, text: row.content }))
+          ).platformMessageId
       } catch {}
       transaction(db, (tx) => {
         tx.update(outboundMessage)
           .set({ status: platformMessageId === null ? 'failed' : 'delivered', platformMessageId })
-          .where(eq(outboundMessage.id, input.id))
+          .where(eq(outboundMessage.id, id))
           .run()
       })
       if (platformMessageId === null)
@@ -574,16 +591,17 @@ export function createSessionLedger({
         })
       runtimeLog?.({
         kind: 'session.outbound.delivered',
-        inboundId: input.inReplyTo ?? null,
-        outboundId: input.id,
+        inboundId: row.inReplyTo,
+        outboundId: id,
+        messageKind: row.kind === 'card' ? 'card' : 'text',
         monotonicMs: performance.now(),
       })
     })()
-    deliveries.set(input.id, task)
+    deliveries.set(id, task)
     try {
       await task
     } finally {
-      deliveries.delete(input.id)
+      deliveries.delete(id)
     }
   }
 
@@ -702,6 +720,38 @@ export function createSessionLedger({
       return row && liveness.has(row.containerId)
         ? { ...row, sessionId: sessionId.parse(row.sessionId), __brand: 'AgentPrincipal' }
         : null
+    },
+    postCard(tx, destinationId, card) {
+      if (!tx.select().from(session).where(eq(session.id, destinationId)).get())
+        throw new ORPCError('NOT_FOUND')
+      const id = `out-${crypto.randomUUID()}`
+      const seq =
+        (tx
+          .select({ seq: sql<number>`coalesce(max(${outboundMessage.seq}), 0)` })
+          .from(outboundMessage)
+          .where(eq(outboundMessage.sessionId, destinationId))
+          .get()?.seq ?? 0) + 1
+      tx.insert(outboundMessage)
+        .values({
+          id,
+          sessionId: destinationId,
+          seq,
+          kind: 'card',
+          content: JSON.stringify(CardSchema.parse(card)),
+          status: 'queued',
+          attempts: 1,
+          createdAt: new Date(),
+        })
+        .run()
+      return id
+    },
+    async deliverCard(id) {
+      if (stopped) throw new ORPCError('SERVICE_UNAVAILABLE')
+      try {
+        await deliverStored(id)
+      } catch (error) {
+        if (!(error instanceof ORPCError) || error.code !== 'SERVICE_UNAVAILABLE') throw error
+      }
     },
     async postOutbound(input) {
       if (stopped) throw new ORPCError('SERVICE_UNAVAILABLE')

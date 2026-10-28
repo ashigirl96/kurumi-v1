@@ -5,7 +5,7 @@ import { isContractProcedure, type AnyContractRouter } from '@orpc/contract'
 import { z } from 'zod'
 import * as zm from 'zod/mini'
 
-import { cliContract, runCommand, type Stdin } from './main.ts'
+import { chat, cliContract, runCommand, type Stdin } from './main.ts'
 
 type Call = { path: readonly string[]; input: unknown }
 
@@ -632,4 +632,20 @@ describe('gateway', () => {
 
     expect(stdout).toBe('admission   open\nagent port  127.0.0.1:4000\nca sha256   AB:CD\n')
   })
+})
+
+test.each([
+  { kind: 'private-link', url: 'http://127.0.0.1:42331/connect/test-token' },
+  { kind: 'notice', text: 'この group の承認者だけが接続できます' },
+] as const)('chat press prints only its private reply: $kind', async (reply) => {
+  expect(
+    await chat(['press', 'cr-test', 'connect'], {
+      async call(path, input) {
+        calls.push({ path, input })
+        return reply
+      },
+    }),
+  ).toBe(0)
+  expect(calls).toEqual([{ path: ['chat', 'press'], input: { ref: 'cr-test', action: 'connect' } }])
+  expect(stdout).toBe(`${reply.kind === 'private-link' ? reply.url : reply.text}\n`)
 })
