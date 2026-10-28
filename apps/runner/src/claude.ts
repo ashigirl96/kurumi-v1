@@ -127,7 +127,11 @@ async function attempt(turn: Turn, continuation: string | null): Promise<string 
         message.session_id !== continuation
       )
         await turn.remember(message.session_id)
-      if (message.type === 'assistant' && message.error === undefined) {
+      if (
+        message.type === 'assistant' &&
+        message.parent_tool_use_id == null &&
+        message.error === undefined
+      ) {
         const text = textOf(message)
         if (text) await turn.reply(text)
       }
