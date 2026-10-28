@@ -395,6 +395,18 @@ export async function startAgentPort<Principal extends object>(deps: {
     reauthenticate.unref()
     aborted.signal.addEventListener('abort', () => clearInterval(reauthenticate), { once: true })
     client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+    if (!listener) {
+      deps.forward.log?.({
+        decision: 'passed',
+        principal,
+        at,
+        host: target.host,
+        method: 'CONNECT',
+        path: req.url ?? '',
+        status: 200,
+        durationMs: Math.round(performance.now() - started),
+      })
+    }
     if (head.length) outbound.write(head)
     const done = (error: NodeJS.ErrnoException | null) => {
       if (error) {
