@@ -293,6 +293,87 @@ test('repeated early exits increase backoff and completed work resets it', async
   ).toEqual([250, 500, 250])
 })
 
+test('three container deaths fail only the poisonous inbound, even across a host restart', async () => {
+  await ledger.start()
+  const poison = event('poison')
+  const accepted = await ledger.routeInbound(poison)
+  for (let index = 0; index < 2; index++) {
+    await until(() => driver.runs.length === index + 1)
+    await ledger.channel.pull(principal(index), { waitMs: 0 })
+    await driver.kill(principal(index).containerId, 0)
+    await until(() => db.select().from(container).all().length === 0)
+  }
+  await ledger.stop()
+  ledger = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: configured,
+    runtimeLog: (entry) => logs.push(entry),
+  })
+  await ledger.start()
+  await until(() => driver.runs.length === 3)
+  const last = principal(2)
+  await ledger.channel.pull(last, { waitMs: 0 })
+  await driver.kill(last.containerId, 0)
+  await driver.kill(last.containerId, 0)
+  expect(db.select().from(inboundMessage).get()).toMatchObject({
+    id: accepted.inboundId,
+    status: 'failed',
+    tries: 3,
+    claimedBy: null,
+  })
+  await ledger.routeInbound(poison)
+  await Bun.sleep(1300)
+  expect(driver.runs).toHaveLength(3)
+  const next = await ledger.routeInbound(event('healthy'))
+  expect(next.sessionId).toBe(accepted.sessionId)
+  await until(() => driver.runs.length === 4)
+  const who = principal(3)
+  expect((await ledger.channel.pull(who, { waitMs: 0 })).messages.map(({ id }) => id)).toEqual([
+    next.inboundId,
+  ])
+  await ledger.channel.complete(who, { ids: [next.inboundId] })
+  expect(db.select().from(inboundMessage).all()).toMatchObject([
+    { id: accepted.inboundId, status: 'failed', tries: 3 },
+    { id: next.inboundId, status: 'completed', tries: 1 },
+  ])
+})
+
+test('startup failures consume the inbound budget without needing a claim', async () => {
+  driver.result = { ok: false, reason: 'cannot start' }
+  await ledger.start()
+  await ledger.routeInbound(event('work'))
+  await until(() => driver.runs.length === 3)
+  await until(() => db.select().from(container).all().length === 0)
+  expect(db.select().from(inboundMessage).get()).toMatchObject({
+    status: 'failed',
+    tries: 3,
+    claimedBy: null,
+  })
+  await Bun.sleep(1300)
+  expect(driver.runs).toHaveLength(3)
+})
+
+test('idle container deaths do not charge deferred input or launch it before it is due', async () => {
+  const accepted = await ledger.routeInbound(event('work'))
+  const who = principal()
+  await ledger.channel.pull(who, { waitMs: 0 })
+  await ledger.channel.complete(who, { ids: [accepted.inboundId] })
+  const later = await ledger.routeInbound(event('later'))
+  db.update(inboundMessage)
+    .set({ processAfter: new Date(Date.now() + 60_000) })
+    .where(eq(inboundMessage.id, later.inboundId))
+    .run()
+  await ledger.start()
+  await driver.kill(who.containerId, 0)
+  await Bun.sleep(400)
+  expect(driver.runs).toHaveLength(1)
+  expect(
+    db.select().from(inboundMessage).where(eq(inboundMessage.id, later.inboundId)).get(),
+  ).toMatchObject({ status: 'pending', tries: 0 })
+})
+
 test('state and heartbeat remain session scoped and reject revoked incarnations', async () => {
   await ledger.routeInbound(event('work'))
   const who = principal()
