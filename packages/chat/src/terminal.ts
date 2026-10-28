@@ -40,7 +40,9 @@ export function createTerminalAdapter(): TerminalAdapter {
         ...body.card.buttons.map(
           (button) => `${button.label}: kurumi chat press ${body.card.ref} ${button.action}`,
         ),
-      ].join('\n'),
+      ]
+        .filter((line) => line.length > 0)
+        .join('\n'),
     })
 
   return {
