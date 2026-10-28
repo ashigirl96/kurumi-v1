@@ -717,7 +717,9 @@ test('a code bug is logged by name and is not converted to the retryable failure
 const agentCaller = { kind: 'agent', agentGroupId: 'work', sessionId: 'ses-work' } as const
 function withCards(deps: Partial<Parameters<typeof createAccountLedger>[0]> = {}) {
   db.run(sql`CREATE TABLE test_card (id TEXT PRIMARY KEY, session_id TEXT, content TEXT)`)
+  db.run(sql`CREATE TABLE test_notice (id TEXT PRIMARY KEY, session_id TEXT, content TEXT)`)
   const delivered: string[] = []
+  const resumed: string[] = []
   connections = makeConnections({
     db,
     vaultKey,
@@ -729,13 +731,41 @@ function withCards(deps: Partial<Parameters<typeof createAccountLedger>[0]> = {}
         tx.run(sql`INSERT INTO test_card VALUES (${id}, ${sessionId}, ${JSON.stringify(card)})`)
         return id
       },
+      replace(tx, messageId, card) {
+        expect(db.$client.inTransaction).toBe(true)
+        const original = tx.all<{ session_id: string }>(
+          sql`SELECT session_id FROM test_card WHERE id = ${messageId}`,
+        )[0]
+        if (!original) throw new Error('missing card')
+        const id = `replace-${card.ref}`
+        tx.run(
+          sql`INSERT INTO test_card VALUES (${id}, ${original.session_id}, ${JSON.stringify({ ...card, replaces: messageId })})`,
+        )
+        return id
+      },
+      queueNotice(tx, notice) {
+        expect(db.$client.inTransaction).toBe(true)
+        tx.run(
+          sql`INSERT INTO test_notice VALUES (${notice.key}, ${notice.sessionId}, ${notice.text})`,
+        )
+      },
+      deliverNotice(notice) {
+        expect(db.$client.inTransaction).toBe(false)
+        resumed.push(notice.key)
+      },
       async deliver(id) {
         expect(db.$client.inTransaction).toBe(false)
         delivered.push(id)
       },
     },
   })
-  return { delivered, cards: () => db.all<{ content: string }>(sql`SELECT content FROM test_card`) }
+  return {
+    delivered,
+    resumed,
+    cards: () => db.all<{ content: string }>(sql`SELECT content FROM test_card`),
+    notices: () =>
+      db.all<{ id: string; session_id: string; content: string }>(sql`SELECT * FROM test_notice`),
+  }
 }
 
 test('agent connect binds the authenticated group and session, reuses the request and posts one URL-free card', async () => {
@@ -1022,3 +1052,131 @@ test('a reconnect updates requested grant audit to the approver whose link compl
       .every((row) => row.grantedBy === 'human:new-owner'),
   ).toBe(true)
 })
+
+test.each(['completed', 'cancelled'] as const)(
+  'a %s callback replaces and resumes once, including concurrent callbacks and reload',
+  async (outcome) => {
+    const proof = withCards({
+      fetch: Object.assign(async () => Response.json(tokenGmailOnly), {
+        preconnect: fetch.preconnect,
+      }),
+    })
+    const { requestId } = await connections.connectAgent(
+      { services: ['gmail', 'google-calendar'] },
+      agentCaller,
+    )
+    const url = callbackUrl(
+      requestId,
+      outcome === 'cancelled' ? 'error=access_denied' : 'code=fixture-code',
+    )
+    const pages = await Promise.all([connections.callback(url), connections.callback(url)])
+    expect(pages[0]?.kind).toBe(outcome)
+    expect(pages[1]).toEqual(pages[0])
+    expect(await connections.callback(url)).toEqual(pages[0])
+    expect(proof.cards()).toHaveLength(2)
+    const replacement = JSON.parse(proof.cards()[1]!.content)
+    expect(replacement).toMatchObject({
+      ref: requestId,
+      replaces: `card-${requestId}`,
+      body: '',
+      buttons: [],
+    })
+    expect(replacement.title).toBe(
+      outcome === 'completed'
+        ? '✅ google/alice@example.com を work につなぎました（gmail）'
+        : '接続をキャンセルしました',
+    )
+    expect(proof.notices()).toEqual([
+      {
+        id: requestId,
+        session_id: agentCaller.sessionId,
+        content:
+          outcome === 'completed'
+            ? 'Account google/alice@example.com is now connected for gmail. Continue the task that needed it.'
+            : 'The approver cancelled the account connection. Do not retry without their request.',
+      },
+    ])
+    expect(proof.resumed).toEqual([requestId])
+    expect(proof.delivered).toEqual([`card-${requestId}`, `replace-${requestId}`])
+  },
+)
+
+test.each(['code=fixture-code', 'error=access_denied'])(
+  'CLI completion or cancellation writes no chat rows: %s',
+  async (query) => {
+    const proof = withCards({
+      fetch: Object.assign(async () => Response.json(tokenGmailOnly), {
+        preconnect: fetch.preconnect,
+      }),
+    })
+    await connections.callback(callbackUrl(create(), query))
+    expect(proof.cards()).toEqual([])
+    expect(proof.notices()).toEqual([])
+    expect(proof.resumed).toEqual([])
+  },
+)
+
+test('a failed notice insert rolls completion, grants, and replacement back together', async () => {
+  const proof = withCards({
+    fetch: Object.assign(async () => Response.json(tokenGmailOnly), {
+      preconnect: fetch.preconnect,
+    }),
+  })
+  const { requestId } = await connections.connectAgent({ services: ['gmail'] }, agentCaller)
+  db.run(
+    sql`CREATE TRIGGER refuse_notice BEFORE INSERT ON test_notice BEGIN SELECT RAISE(ABORT, 'notice failed'); END`,
+  )
+  const failure = await connections
+    .callback(callbackUrl(requestId))
+    .catch((error: unknown) => error)
+  expect(failure).toBeInstanceOf(Error)
+  expect(db.select().from(connectionRequest).get()?.state).toBe('authorizing')
+  expect(db.select().from(account).all()).toEqual([])
+  expect(db.select().from(accountGrant).all()).toEqual([])
+  expect(proof.cards()).toHaveLength(1)
+  expect(proof.notices()).toEqual([])
+  expect(proof.resumed).toEqual([])
+})
+
+test.each(['failed', 'nothing-granted', 'shared-services-missing'] as const)(
+  'retryable %s leaves the card and session alone',
+  async (outcome) => {
+    const proof = withCards({
+      fetch: Object.assign(
+        async () =>
+          Response.json(outcome === 'failed' ? { error: 'invalid_grant' } : tokenGmailOnly, {
+            status: outcome === 'failed' ? 400 : 200,
+          }),
+        { preconnect: fetch.preconnect },
+      ),
+    })
+    if (outcome === 'shared-services-missing') {
+      insertAgentGroup(db, 'home')
+      insertAccount(db, {
+        id: 'shared',
+        vendor: 'google',
+        label: 'alice@example.com',
+        services: ['gmail', 'google-calendar'],
+      })
+      db.update(account).set({ subject: '100000000000000000001' }).run()
+      db.insert(accountGrant)
+        .values({
+          accountId: 'shared',
+          agentGroupId: 'home',
+          vendor: 'google',
+          service: 'google-calendar',
+          grantedBy: 'host',
+          grantedAt: new Date(),
+        })
+        .run()
+    }
+    const { requestId } = await connections.connectAgent(
+      { services: [outcome === 'nothing-granted' ? 'google-calendar' : 'gmail'] },
+      agentCaller,
+    )
+    expect((await connections.callback(callbackUrl(requestId))).kind).toBe(outcome)
+    expect(proof.cards()).toHaveLength(1)
+    expect(proof.notices()).toEqual([])
+    expect(proof.resumed).toEqual([])
+  },
+)

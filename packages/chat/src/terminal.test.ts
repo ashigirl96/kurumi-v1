@@ -38,3 +38,22 @@ test('cards and replacements reach subscribers as URL-free text replies with pre
     adapter.stop()
   }
 })
+
+test('a completed card prints the same ref and only the replacement line', async () => {
+  const adapter = createTerminalAdapter()
+  const stream = adapter.subscribe(target)
+  try {
+    await adapter.replaceCard(target, {
+      id: 'out-card',
+      card: { ...card, title: '接続をキャンセルしました', body: '', buttons: [] },
+    })
+    expect((await stream.next()).value).toEqual({
+      kind: 'reply',
+      outboundId: 'out-card',
+      text: 'cr-test\n接続をキャンセルしました',
+    })
+  } finally {
+    await stream.return?.()
+    adapter.stop()
+  }
+})

@@ -256,6 +256,9 @@ export async function startHost(config: HostConfig) {
       webPort: config.web.port,
       cards: {
         post: (tx, sessionId, card) => sessionLedger.postCard(tx, sessionId, card),
+        replace: (tx, id, card) => sessionLedger.replaceCard(tx, id, card),
+        queueNotice: (tx, notice) => sessionLedger.queueNotice(tx, notice),
+        deliverNotice: (notice) => sessionLedger.deliverNotice(notice),
         deliver: (id) => sessionLedger.deliverCard(id),
       },
       log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),

@@ -64,21 +64,24 @@ const clientAad = 'oauth-client:google'
 const linkTtl = 5 * 60_000
 const requestTtl = 30 * 60_000
 
+type ConnectionCard = {
+  owner: 'account.connect'
+  ref: string
+  title: string
+  body: string
+  buttons: { action: string; label: string }[]
+}
+type ConnectionNotice = { key: string; sessionId: string; text: string }
+type ConnectionDelivery = { cardMessageId: string | null; notice: ConnectionNotice } | null
+
 export type ConnectionOptions = {
   webPort?: number
   canApprove?: (caller: Caller, agentGroupId: string) => boolean
   cards?: {
-    post(
-      tx: Tx,
-      sessionId: string,
-      card: {
-        owner: 'account.connect'
-        ref: string
-        title: string
-        body: string
-        buttons: { action: string; label: string }[]
-      },
-    ): string
+    post(tx: Tx, sessionId: string, card: ConnectionCard): string
+    replace(tx: Tx, messageId: string, card: ConnectionCard): string
+    queueNotice(tx: Tx, notice: ConnectionNotice): unknown
+    deliverNotice(notice: ConnectionNotice): void
     deliver(id: string): Promise<void>
   }
   fetch?: typeof fetch
@@ -100,6 +103,8 @@ type CallbackPage =
   | { kind: 'completed'; granted: ServiceId[]; missing: ServiceId[] }
   | { kind: 'shared-services-missing'; services: ServiceId[] }
   | { kind: 'cancelled' | 'unavailable' | 'failed' | 'nothing-granted' }
+
+type CallbackResult = { page: CallbackPage; committed: boolean; delivery: ConnectionDelivery }
 
 export function googleClient(db: Db, vaultKey: Uint8Array) {
   const row = db.select().from(oauthClient).where(eq(oauthClient.vendor, 'google')).get()
@@ -156,6 +161,27 @@ export function createConnections({
       granted,
       missing: request.services.filter((service) => !granted.includes(service)),
     }
+  }
+
+  function updateChat(
+    tx: Tx,
+    request: ConnectionRequest,
+    text: string,
+    noticeText: string,
+  ): ConnectionDelivery {
+    if (!request.sessionId || !cards) return null
+    const notice = { key: request.id, sessionId: request.sessionId, text: noticeText }
+    const cardMessageId = request.cardMessageId
+      ? cards.replace(tx, request.cardMessageId, {
+          owner: 'account.connect',
+          ref: request.id,
+          title: text,
+          body: '',
+          buttons: [],
+        })
+      : null
+    cards.queueNotice(tx, notice)
+    return { cardMessageId, notice }
   }
 
   const connections = {
@@ -401,6 +427,62 @@ export function createConnections({
         return { kind: 'authorize', url }
       })
     },
+    complete(tx: Tx, requestId: string, accountId: string): ConnectionDelivery {
+      const row = tx
+        .select()
+        .from(connectionRequest)
+        .where(eq(connectionRequest.id, requestId))
+        .get()
+      if (!row || !['open', 'authorizing'].includes(row.state) || row.expiresAt <= new Date())
+        return null
+      const current = parseConnectionRequest(row)
+      const held = tx.select().from(account).where(eq(account.id, accountId)).get()
+      if (!held || held.vendor !== current.vendor || held.status !== 'active')
+        throw new ORPCError('BAD_REQUEST', { message: 'account is not available' })
+      const services = current.services.filter((service) => held.services.includes(service))
+      if (!services.length)
+        throw new ORPCError('BAD_REQUEST', { message: 'account covers no requested services' })
+      for (const service of services) {
+        const granted = grant(tx, {
+          agentGroupId: current.agentGroupId,
+          accountId,
+          service,
+          grantedBy: current.authorizedBy ?? current.requestedBy,
+        })
+        if (!granted.ok) throw new Error(`unable to grant connected account: ${granted.refusal}`)
+        tx.update(accountGrant)
+          .set({ grantedBy: current.authorizedBy ?? current.requestedBy, grantedAt: new Date() })
+          .where(
+            and(
+              eq(accountGrant.accountId, accountId),
+              eq(accountGrant.agentGroupId, current.agentGroupId),
+              eq(accountGrant.service, service),
+            ),
+          )
+          .run()
+      }
+      tx.update(connectionRequest)
+        .set({ state: 'completed', accountId, pkceVerifier: null })
+        .where(eq(connectionRequest.id, current.id))
+        .run()
+      const group = tx
+        .select()
+        .from(agentGroup)
+        .where(eq(agentGroup.id, current.agentGroupId))
+        .get()
+      const handle = `${held.vendor}/${held.label}`
+      return updateChat(
+        tx,
+        current,
+        `✅ ${handle} を ${group?.name ?? current.agentGroupId} につなぎました（${services.join(', ')}）`,
+        `Account ${handle} is now connected for ${services.join(', ')}. Continue the task that needed it.`,
+      )
+    },
+    deliverCompletion(delivery: ConnectionDelivery): void {
+      if (!delivery || !cards) return
+      if (delivery.cardMessageId) void cards.deliver(delivery.cardMessageId).catch(() => {})
+      cards.deliverNotice(delivery.notice)
+    },
     async callback(url: URL): Promise<CallbackPage> {
       const state = url.searchParams.get('state')
       if (!state || url.searchParams.getAll('state').length !== 1) return { kind: 'unavailable' }
@@ -410,17 +492,31 @@ export function createConnections({
       const callback = readCallback(url, request.oauthState)
       if (callback.kind === 'invalid') return { kind: 'unavailable' }
       if (callback.kind === 'denied' && callback.error === 'access_denied') {
-        return transaction(db, (tx): CallbackPage => {
-          const current = requestForState(state)
-          if (current?.state !== 'authorizing' || current.expiresAt <= new Date())
-            return pageFor(current)
-          tx.update(connectionRequest)
-            .set({ state: 'cancelled', pkceVerifier: null })
-            .where(eq(connectionRequest.id, current.id))
-            .run()
-          return { kind: 'cancelled' }
-        })
+        const result = transaction(
+          db,
+          (tx): { page: CallbackPage; delivery: ConnectionDelivery } => {
+            const current = requestForState(state)
+            if (current?.state !== 'authorizing' || current.expiresAt <= new Date())
+              return { page: pageFor(current), delivery: null }
+            tx.update(connectionRequest)
+              .set({ state: 'cancelled', pkceVerifier: null })
+              .where(eq(connectionRequest.id, current.id))
+              .run()
+            return {
+              page: { kind: 'cancelled' },
+              delivery: updateChat(
+                tx,
+                current,
+                '接続をキャンセルしました',
+                'The approver cancelled the account connection. Do not retry without their request.',
+              ),
+            }
+          },
+        )
+        connections.deliverCompletion(result.delivery)
+        return result.page
       }
+
       const exchangeKey = JSON.stringify([state, callback.kind === 'code' ? callback.code : null])
       attempts.set(state, (attempts.get(state) ?? 0) + 1)
       try {
@@ -451,10 +547,10 @@ export function createConnections({
         })
         const expiresAt = new Date(Date.now() + tokens.expiresIn * 1000)
         const started = performance.now()
-        const result = transaction(db, (tx): { page: CallbackPage; committed: boolean } => {
+        const result = transaction(db, (tx): CallbackResult => {
           const current = requestForState(state)
           if (current?.state !== 'authorizing' || current.expiresAt <= new Date())
-            return { page: pageFor(current), committed: false }
+            return { page: pageFor(current), committed: false, delivery: null }
           const previous = tx
             .select()
             .from(account)
@@ -494,6 +590,7 @@ export function createConnections({
             return {
               page: { kind: 'shared-services-missing', services: missing },
               committed: false,
+              delivery: null,
             }
           }
           const id = previous?.id ?? `acc-${Bun.randomUUIDv7()}`
@@ -522,35 +619,8 @@ export function createConnections({
           tx.delete(accountGrant)
             .where(and(eq(accountGrant.accountId, id), notInArray(accountGrant.service, services)))
             .run()
-          for (const service of current.services) {
-            if (!services.includes(service)) continue
-            const granted = grant(tx, {
-              agentGroupId: current.agentGroupId,
-              accountId: id,
-              service,
-              grantedBy: current.authorizedBy ?? current.requestedBy,
-            })
-            if (!granted.ok)
-              throw new Error(`unable to grant connected account: ${granted.refusal}`)
-            tx.update(accountGrant)
-              .set({
-                grantedBy: current.authorizedBy ?? current.requestedBy,
-                grantedAt: new Date(),
-              })
-              .where(
-                and(
-                  eq(accountGrant.accountId, id),
-                  eq(accountGrant.agentGroupId, current.agentGroupId),
-                  eq(accountGrant.service, service),
-                ),
-              )
-              .run()
-          }
-          tx.update(connectionRequest)
-            .set({ state: 'completed', accountId: id, pkceVerifier: null })
-            .where(eq(connectionRequest.id, current.id))
-            .run()
-          return { page: pageFor(requestForState(state)), committed: true }
+          const delivery = connections.complete(tx, current.id, id)
+          return { page: pageFor(requestForState(state)), committed: true, delivery }
         })
         if (result.page.kind === 'shared-services-missing')
           log({
@@ -564,6 +634,7 @@ export function createConnections({
             requestId: request.id,
             transactionMs: performance.now() - started,
           })
+        connections.deliverCompletion(result.delivery)
         return result.page
       } catch (error) {
         log({

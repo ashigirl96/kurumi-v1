@@ -6,7 +6,7 @@ import type { ChatLedger, InboundEvent, InboundReceipt } from '@kurumi/chat/serv
 import { transaction, type Db, type Tx, type KurumiContext } from '@kurumi/rpc/server'
 import { implement, ORPCError } from '@orpc/server'
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm'
-import type { z } from 'zod'
+import { z } from 'zod'
 
 import {
   contract,
@@ -100,6 +100,7 @@ export type RuntimeLog =
       delayMs: number
       monotonicMs: number
     }
+  | { kind: 'session.notify'; sessionId: string; inboundId: string; monotonicMs: number }
   | { kind: 'session.cleanup.failed'; sessionId: string; containerId: string; monotonicMs: number }
   | {
       kind: 'session.container.reaped'
@@ -110,6 +111,8 @@ export type RuntimeLog =
       monotonicMs: number
     }
   | SupervisionLog
+const storedCardSchema = CardSchema.extend({ replaces: z.string().min(1).optional() })
+
 type OutboundInput = { id: string; sessionId: string; text: string; inReplyTo?: string }
 export type SessionNotice = { key: string; sessionId: string; text: string }
 export type NoticeReceipt = 'queued' | 'duplicate' | 'no_session'
@@ -120,6 +123,9 @@ export type SessionLedger = {
   routeInbound(event: InboundEvent): Promise<InboundReceipt>
   postOutbound(input: OutboundInput): Promise<void>
   postCard(tx: Tx, sessionId: string, card: Card): string
+  replaceCard(tx: Tx, messageId: string, card: Card): string
+  queueNotice(tx: Tx, notice: SessionNotice): NoticeReceipt
+  deliverNotice(notice: SessionNotice): void
   deliverCard(id: string): Promise<void>
   /** Starts a turn with `text` as a system message, once per key, and shows the same text in the chat. */
   notify(notice: SessionNotice): NoticeReceipt
@@ -162,6 +168,62 @@ function nextInboundSeq(tx: Tx, id: string): number {
       .where(eq(inboundMessage.sessionId, id))
       .get()?.seq ?? 0) + 1
   )
+}
+
+function postCard(tx: Tx, destinationId: string, card: Card, replaces?: string): string {
+  if (!tx.select().from(session).where(eq(session.id, destinationId)).get())
+    throw new ORPCError('NOT_FOUND')
+  const id = `out-${crypto.randomUUID()}`
+  const seq =
+    (tx
+      .select({ seq: sql<number>`coalesce(max(${outboundMessage.seq}), 0)` })
+      .from(outboundMessage)
+      .where(eq(outboundMessage.sessionId, destinationId))
+      .get()?.seq ?? 0) + 1
+  tx.insert(outboundMessage)
+    .values({
+      id,
+      sessionId: destinationId,
+      seq,
+      kind: 'card',
+      content: JSON.stringify(storedCardSchema.parse({ ...card, replaces })),
+      status: 'queued',
+      attempts: 1,
+      createdAt: new Date(),
+    })
+    .run()
+  return id
+}
+
+function queueNotice(tx: Tx, { key, sessionId: id, text }: SessionNotice): NoticeReceipt {
+  const noticeId = `ntf-${key}`
+  const current = tx
+    .select({ id: session.id })
+    .from(session)
+    .where(and(eq(session.id, id), eq(session.status, 'active')))
+    .get()
+  if (!current) return 'no_session'
+  const existing = tx
+    .select({ id: inboundMessage.id })
+    .from(inboundMessage)
+    .where(eq(inboundMessage.id, noticeId))
+    .get()
+  if (existing) return 'duplicate'
+  const now = new Date()
+  tx.insert(inboundMessage)
+    .values({
+      id: noticeId,
+      sessionId: id,
+      seq: nextInboundSeq(tx, id),
+      kind: 'system',
+      trigger: true,
+      status: 'pending',
+      content: text,
+      createdAt: now,
+    })
+    .run()
+  tx.update(session).set({ lastActiveAt: now }).where(eq(session.id, id)).run()
+  return 'queued'
 }
 
 export function createSessionLedger({
@@ -462,6 +524,12 @@ export function createSessionLedger({
           if (!row || (row.processAfter && row.processAfter.getTime() > Date.now())) return []
           if (row.status === 'processing' && row.claimedBy !== principal.containerId) return []
           if (row.status === 'pending') {
+            if (row.kind === 'system')
+              log?.({
+                kind: 'session.inbound.received',
+                inboundId: row.id,
+                monotonicMs: performance.now(),
+              })
             tx.update(inboundMessage)
               .set({ status: 'processing', claimedBy: principal.containerId, tries: row.tries + 1 })
               .where(eq(inboundMessage.id, row.id))
@@ -572,12 +640,25 @@ export function createSessionLedger({
           ? chatLedger.targetOf(current.messagingGroupId, current.threadId)
           : null
         const adapter = target ? chatLedger.adapter(target) : null
-        if (target && adapter)
-          platformMessageId = (
-            await (row.kind === 'card'
-              ? adapter.postCard(target, { id, card: CardSchema.parse(JSON.parse(row.content)) })
-              : adapter.post(target, { id, text: row.content }))
-          ).platformMessageId
+        if (target && adapter) {
+          if (row.kind === 'card') {
+            const card = storedCardSchema.parse(JSON.parse(row.content))
+            const original = card.replaces
+              ? db.select().from(outboundMessage).where(eq(outboundMessage.id, card.replaces)).get()
+              : undefined
+            platformMessageId = (
+              await (card.replaces
+                ? adapter.replaceCard(target, {
+                    id: original?.platformMessageId ?? card.replaces,
+                    card,
+                  })
+                : adapter.postCard(target, { id, card }))
+            ).platformMessageId
+          } else {
+            platformMessageId = (await adapter.post(target, { id, text: row.content }))
+              .platformMessageId
+          }
+        }
       } catch {}
       transaction(db, (tx) => {
         tx.update(outboundMessage)
@@ -603,6 +684,20 @@ export function createSessionLedger({
     } finally {
       deliveries.delete(id)
     }
+  }
+
+  function deliverNotice({ key, sessionId: id, text }: SessionNotice): void {
+    if (stopped) return
+    const inboundId = `ntf-${key}`
+    runtimeLog?.({
+      kind: 'session.notify',
+      sessionId: id,
+      inboundId,
+      monotonicMs: performance.now(),
+    })
+    wake(id)
+    if (enabled) void reconcile(id).catch(() => {})
+    void deliver({ id: `ntf-${crypto.randomUUID()}`, sessionId: id, text }).catch(() => {})
   }
 
   return {
@@ -721,29 +816,15 @@ export function createSessionLedger({
         ? { ...row, sessionId: sessionId.parse(row.sessionId), __brand: 'AgentPrincipal' }
         : null
     },
-    postCard(tx, destinationId, card) {
-      if (!tx.select().from(session).where(eq(session.id, destinationId)).get())
-        throw new ORPCError('NOT_FOUND')
-      const id = `out-${crypto.randomUUID()}`
-      const seq =
-        (tx
-          .select({ seq: sql<number>`coalesce(max(${outboundMessage.seq}), 0)` })
-          .from(outboundMessage)
-          .where(eq(outboundMessage.sessionId, destinationId))
-          .get()?.seq ?? 0) + 1
-      tx.insert(outboundMessage)
-        .values({
-          id,
-          sessionId: destinationId,
-          seq,
-          kind: 'card',
-          content: JSON.stringify(CardSchema.parse(card)),
-          status: 'queued',
-          attempts: 1,
-          createdAt: new Date(),
-        })
-        .run()
-      return id
+    postCard,
+    replaceCard(tx, messageId, card) {
+      const original = tx
+        .select()
+        .from(outboundMessage)
+        .where(eq(outboundMessage.id, messageId))
+        .get()
+      if (!original || original.kind !== 'card') throw new ORPCError('NOT_FOUND')
+      return postCard(tx, original.sessionId, card, messageId)
     },
     async deliverCard(id) {
       if (stopped) return
@@ -761,42 +842,11 @@ export function createSessionLedger({
         if (!(error instanceof ORPCError) || error.code !== 'SERVICE_UNAVAILABLE') throw error
       }
     },
-    notify({ key, sessionId: id, text }) {
-      const noticeId = `ntf-${key}`
-      const receipt = transaction(db, (tx): NoticeReceipt => {
-        const current = tx
-          .select({ id: session.id })
-          .from(session)
-          .where(and(eq(session.id, id), eq(session.status, 'active')))
-          .get()
-        if (!current) return 'no_session'
-        const existing = tx
-          .select({ id: inboundMessage.id })
-          .from(inboundMessage)
-          .where(eq(inboundMessage.id, noticeId))
-          .get()
-        if (existing) return 'duplicate'
-        const now = new Date()
-        tx.insert(inboundMessage)
-          .values({
-            id: noticeId,
-            sessionId: id,
-            seq: nextInboundSeq(tx, id),
-            kind: 'system',
-            trigger: true,
-            status: 'pending',
-            content: text,
-            createdAt: now,
-          })
-          .run()
-        tx.update(session).set({ lastActiveAt: now }).where(eq(session.id, id)).run()
-        return 'queued'
-      })
-      if (receipt !== 'queued' || stopped) return receipt
-      wake(id)
-      if (enabled) void reconcile(id).catch(() => {})
-      // An agent names its own outbound ids, so a guessable id here could be taken first.
-      void deliver({ id: `ntf-${crypto.randomUUID()}`, sessionId: id, text }).catch(() => {})
+    queueNotice,
+    deliverNotice,
+    notify(notice) {
+      const receipt = transaction(db, (tx) => queueNotice(tx, notice))
+      if (receipt === 'queued') deliverNotice(notice)
       return receipt
     },
     channel: {

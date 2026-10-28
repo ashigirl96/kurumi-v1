@@ -1137,6 +1137,9 @@ test.each(['listening', 'no-listener', 'stopped'] as const)(
       vaultKey: randomBytes(32),
       cards: {
         post: (tx, sessionId, card) => sessions.postCard(tx, sessionId, card),
+        replace: (tx, id, card) => sessions.replaceCard(tx, id, card),
+        queueNotice: (tx, notice) => sessions.queueNotice(tx, notice),
+        deliverNotice: (notice) => sessions.deliverNotice(notice),
         deliver: (id) => sessions.deliverCard(id),
       },
     }).connections

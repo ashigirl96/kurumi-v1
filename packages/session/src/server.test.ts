@@ -517,7 +517,13 @@ test('a notice queued before start is served once the ledger starts', async () =
   })
 
   expect(
-    ledger.notify({ key: 'apr-boot', sessionId: receipt.sessionId, text: 'approved while down' }),
+    transaction(db, (tx) =>
+      ledger.queueNotice(tx, {
+        key: 'apr-boot',
+        sessionId: receipt.sessionId,
+        text: 'approved while down',
+      }),
+    ),
   ).toBe('queued')
   expect(driver.runs).toEqual([])
 
@@ -655,4 +661,65 @@ test('channel.post accepts text and rejects an agent-forged card body', () => {
     true,
   )
   expect(db.select().from(outboundMessage).all()).toEqual([])
+})
+
+test('replacement and notice join one transaction, render under the original ref, and wake a parked pull', async () => {
+  const driver = createFakeDriver()
+  ledger = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: runtime(driver),
+  })
+  const stream = chat.terminal({ agentGroupId: agentId, text: 'connect', follow: true })
+  const receipt = (await stream.next()).value
+  if (!receipt || receipt.kind !== 'queued') throw new Error('missing receipt')
+  const principal = ledger.authenticate(driver.runs[0]?.env.KURUMI_TOKEN ?? '')
+  if (!principal) throw new Error('missing container')
+  await ledger.channel.pull(principal, { waitMs: 0 })
+  await ledger.channel.complete(principal, { ids: [receipt.inboundId] })
+  const card = {
+    owner: 'account.connect',
+    ref: 'cr-atomic',
+    title: 'Google',
+    body: 'gmail',
+    buttons: [],
+  } as const
+  const id = transaction(db, (tx) =>
+    ledger.postCard(tx, receipt.sessionId, { ...card, buttons: [] }),
+  )
+  await ledger.deliverCard(id)
+  await stream.next()
+  const notice = { key: card.ref, sessionId: receipt.sessionId, text: 'Continue the task.' }
+  const replacement = { ...card, title: '✅ connected（gmail）', body: '', buttons: [] }
+  expect(() =>
+    transaction(db, (tx) => {
+      ledger.replaceCard(tx, id, replacement)
+      expect(ledger.queueNotice(tx, notice)).toBe('queued')
+      throw new Error('rollback')
+    }),
+  ).toThrow('rollback')
+  expect(db.select().from(outboundMessage).all()).toHaveLength(1)
+  expect(db.select().from(inboundMessage).all()).toHaveLength(1)
+  const parked = ledger.channel.pull(principal, { waitMs: 2000 })
+  const replacementId = transaction(db, (tx) => {
+    const savedId = ledger.replaceCard(tx, id, replacement)
+    expect(ledger.queueNotice(tx, notice)).toBe('queued')
+    expect(ledger.queueNotice(tx, notice)).toBe('duplicate')
+    return savedId
+  })
+  const row = db.select().from(outboundMessage).where(eq(outboundMessage.id, replacementId)).get()
+  expect(JSON.parse(row!.content)).toMatchObject({ replaces: id, ref: card.ref, buttons: [] })
+  await ledger.deliverCard(replacementId)
+  expect((await stream.next()).value).toEqual({
+    kind: 'reply',
+    outboundId: id,
+    text: 'cr-atomic\n✅ connected（gmail）',
+  })
+  ledger.deliverNotice(notice)
+  expect((await parked).messages).toMatchObject([
+    { kind: 'system', content: notice.text, trigger: true },
+  ])
+  expect((await stream.next()).value).toMatchObject({ kind: 'reply', text: notice.text })
+  await stream.return()
 })
