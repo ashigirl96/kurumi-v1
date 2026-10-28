@@ -738,3 +738,41 @@ test('replacement and notice join one transaction, render under the original ref
   expect((await stream.next()).value).toMatchObject({ kind: 'reply', text: notice.text })
   await stream.return()
 })
+
+test.each(['completed', 'failed'] as const)(
+  'complete keeps a %s outcome immutable, idempotent, and owned',
+  async (status) => {
+    const driver = createFakeDriver()
+    ledger = createSessionLedger({
+      db,
+      agentLedger: agents,
+      chatLedger: chat,
+      runtime: runtime(driver),
+    })
+    const first = await ledger.routeInbound(event('first'))
+    const principal = ledger.authenticate(driver.runs[0]?.env.KURUMI_TOKEN ?? '')
+    const other = agents.create({ name: 'other' }).id
+    await ledger.routeInbound(event('other', other))
+    const stranger = ledger.authenticate(driver.runs[1]?.env.KURUMI_TOKEN ?? '')
+    await ledger.channel.pull(principal, { waitMs: 0 })
+    await rejects(ledger.channel.complete(stranger, { ids: [first.inboundId], status }), {
+      code: 'FORBIDDEN',
+    })
+    await ledger.channel.complete(principal, { ids: [first.inboundId], status })
+    await ledger.channel.complete(principal, { ids: [first.inboundId], status })
+    await rejects(
+      ledger.channel.complete(principal, {
+        ids: [first.inboundId],
+        status: status === 'failed' ? 'completed' : 'failed',
+      }),
+      { code: 'FORBIDDEN' },
+    )
+    expect(
+      db.select().from(inboundMessage).where(eq(inboundMessage.id, first.inboundId)).get()?.status,
+    ).toBe(status)
+    const next = await ledger.routeInbound(event('next'))
+    expect((await ledger.channel.pull(principal, { waitMs: 0 })).messages[0]?.id).toBe(
+      next.inboundId,
+    )
+  },
+)
