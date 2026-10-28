@@ -20,6 +20,7 @@ import { eq } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 
+import { postInput } from './contract.ts'
 import { container, inboundMessage, outboundMessage, session } from './schema.ts'
 import {
   createSessionLedger,
@@ -577,4 +578,81 @@ test('an agent that posts the notice id first cannot keep the notice from the bo
   ])
   expect(shown).toEqual({ kind: 'reply', outboundId: expect.any(String), text })
   await stream.return()
+})
+
+test('postCard joins the caller transaction and leaves no row after rollback', async () => {
+  const receipt = await ledger.routeInbound(event('hello'))
+  const card = {
+    owner: 'account.connect',
+    ref: 'cr-rollback',
+    title: 'Google',
+    body: 'gmail',
+    buttons: [{ action: 'connect', label: '接続' }],
+  } as const
+  expect(() =>
+    transaction(db, (tx) => {
+      ledger.postCard(tx, receipt.sessionId, { ...card, buttons: [...card.buttons] })
+      throw new Error('rollback')
+    }),
+  ).toThrow('rollback')
+  expect(db.select().from(outboundMessage).all()).toEqual([])
+})
+
+test('committed cards use the terminal adapter, deduplicate delivery and fail without listeners', async () => {
+  const stream = chat.terminal({ agentGroupId: agentId, text: 'hello', follow: true })
+  const first = await stream.next()
+  if (first.done || first.value.kind !== 'queued') throw new Error('missing receipt')
+  const sessionId = first.value.sessionId
+  const id = transaction(db, (tx) =>
+    ledger.postCard(tx, sessionId, {
+      owner: 'account.connect',
+      ref: 'cr-delivery',
+      title: 'Google',
+      body: 'gmail',
+      buttons: [{ action: 'connect', label: '接続' }],
+    }),
+  )
+  await Promise.all([ledger.deliverCard(id), ledger.deliverCard(id)])
+  const reply = await stream.next()
+  expect(reply.value).toMatchObject({ kind: 'reply', outboundId: id })
+  expect(db.select().from(outboundMessage).get()).toMatchObject({
+    kind: 'card',
+    status: 'delivered',
+  })
+  await stream.return()
+  const failed = transaction(db, (tx) =>
+    ledger.postCard(tx, sessionId, {
+      owner: 'account.connect',
+      ref: 'cr-failed',
+      title: 'Google',
+      body: 'gmail',
+      buttons: [],
+    }),
+  )
+  await ledger.deliverCard(failed)
+  expect(
+    db.select().from(outboundMessage).where(eq(outboundMessage.id, failed)).get()?.status,
+  ).toBe('failed')
+})
+
+test('channel.post accepts text and rejects an agent-forged card body', () => {
+  const input = {
+    id: 'forged',
+    inReplyTo: 'in-test',
+    body: {
+      kind: 'card',
+      card: {
+        owner: 'account.connect',
+        ref: 'cr-forged',
+        title: 'Google',
+        body: 'gmail',
+        buttons: [],
+      },
+    },
+  }
+  expect(postInput.safeParse(input).success).toBe(false)
+  expect(postInput.safeParse({ ...input, body: { kind: 'text', text: 'hello' } }).success).toBe(
+    true,
+  )
+  expect(db.select().from(outboundMessage).all()).toEqual([])
 })

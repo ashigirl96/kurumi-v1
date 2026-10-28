@@ -1,10 +1,12 @@
 import type { AgentLedger } from '@kurumi/agent/server'
+import type { Caller } from '@kurumi/rpc/contract'
 import type { Db, KurumiContext, Tx } from '@kurumi/rpc/server'
 import { AsyncIteratorClass, implement, ORPCError } from '@orpc/server'
 import { and, eq } from 'drizzle-orm'
 
 import {
   contract,
+  type CardActionReply,
   type ChannelAdapter,
   type DeliveryTarget,
   type InboundEvent,
@@ -24,6 +26,7 @@ export type ChatLedger = {
   adapter(key: { channel: string; instance: string | null }): ChannelAdapter | null
   targetOf(messagingGroupId: string, threadId: string | null): DeliveryTarget | null
   terminal(input: TerminalInput, signal?: AbortSignal): AsyncGenerator<TerminalEvent, void>
+  press(input: { ref: string; action: string }, caller: Caller): CardActionReply
   stop(): void
 }
 
@@ -34,10 +37,21 @@ export function createChatLedger({
 }: {
   db: Db
   agentLedger: AgentLedger
-  sink: () => { onInbound(event: InboundEvent): Promise<InboundReceipt> }
+  sink: () => {
+    onInbound(event: InboundEvent): Promise<InboundReceipt>
+    onCardAction?(input: { ref: string; action: string }, caller: Caller): CardActionReply
+  }
 }): ChatLedger {
   const terminalAdapter = createTerminalAdapter()
   return {
+    press(input, caller) {
+      return (
+        sink().onCardAction?.(input, caller) ?? {
+          kind: 'notice',
+          text: 'このカードは利用できません。もう一度接続を頼んでください',
+        }
+      )
+    },
     ensureTerminal(tx, agentGroupId) {
       const agent = agentLedger.get(agentGroupId)
       if (!agent) throw new ORPCError('NOT_FOUND', { message: `agent not found: ${agentGroupId}` })
@@ -149,6 +163,7 @@ export function createChatLedger({
 
 const os = implement(contract).$context<KurumiContext & { chatLedger: ChatLedger }>()
 export const router = os.router({
+  press: os.press.handler(({ input, context }) => context.chatLedger.press(input, context.caller)),
   terminal: os.terminal.handler(({ input, context, signal }) => {
     if (context.caller.kind !== 'host') {
       throw new ORPCError('FORBIDDEN', { message: 'terminal chat requires the host caller' })

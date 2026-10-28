@@ -1,6 +1,6 @@
 import { ORPCError } from '@orpc/server'
 
-import type { ChannelAdapter, DeliveryTarget, TerminalEvent } from './contract.ts'
+import type { Card, ChannelAdapter, DeliveryTarget, TerminalEvent } from './contract.ts'
 
 type Reply = Extract<TerminalEvent, { kind: 'reply' }>
 type QueueState = { kind: 'open' } | { kind: 'closed' } | { kind: 'failed'; error: Error }
@@ -20,23 +20,36 @@ function checkTarget(target: DeliveryTarget): void {
 export function createTerminalAdapter(): TerminalAdapter {
   const subscribers = new Map<string, Set<Subscriber>>()
   let stopped = false
+  const post: ChannelAdapter['post'] = async (target, body) => {
+    checkTarget(target)
+    let delivered = false
+    for (const subscriber of subscribers.get(target.platformId) ?? []) {
+      if (subscriber.push({ kind: 'reply', outboundId: body.id, text: body.text })) delivered = true
+    }
+    if (!delivered)
+      throw new ORPCError('SERVICE_UNAVAILABLE', { message: 'no active terminal subscribers' })
+    return { platformMessageId: body.id }
+  }
+  const postCard = (target: DeliveryTarget, body: { id: string; card: Card }) =>
+    post(target, {
+      id: body.id,
+      text: [
+        body.card.ref,
+        body.card.title,
+        body.card.body,
+        ...body.card.buttons.map(
+          (button) => `${button.label}: kurumi chat press ${body.card.ref} ${button.action}`,
+        ),
+      ].join('\n'),
+    })
 
   return {
     kind: 'terminal',
     instance: null,
     ownerOnly: true,
-    async post(target, body) {
-      checkTarget(target)
-      let delivered = false
-      for (const subscriber of subscribers.get(target.platformId) ?? []) {
-        if (subscriber.push({ kind: 'reply', outboundId: body.id, text: body.text }))
-          delivered = true
-      }
-      if (!delivered) {
-        throw new ORPCError('SERVICE_UNAVAILABLE', { message: 'no active terminal subscribers' })
-      }
-      return { platformMessageId: body.id }
-    },
+    post,
+    postCard,
+    replaceCard: postCard,
     subscribe(target, signal) {
       checkTarget(target)
       if (stopped) throw new ORPCError('SERVICE_UNAVAILABLE', { message: 'terminal is stopped' })

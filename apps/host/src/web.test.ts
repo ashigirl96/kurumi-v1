@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from 'bun:test'
 import { randomBytes } from 'node:crypto'
 
-import { connectionRequest } from '@kurumi/account/schema'
+import { account, connectionRequest } from '@kurumi/account/schema'
 import { createAccountLedger } from '@kurumi/account/server'
 import { inMemoryDb, insertAgentGroup, tokenGmailOnly } from '@kurumi/account/testing'
+import { transaction } from '@kurumi/rpc/server'
 import { eq } from 'drizzle-orm'
 
 import { startWeb } from './web.ts'
@@ -163,3 +164,62 @@ test.each(['access_denied', 'server_error', 'empty-grant'])(
     }
   },
 )
+
+test('shared-service refusal names the missing services and explains the next consent', async () => {
+  const localDb = inMemoryDb()
+  insertAgentGroup(localDb, 'work')
+  insertAgentGroup(localDb, 'home')
+  let full = true
+  const localLedger = createAccountLedger({
+    db: localDb,
+    vaultKey: randomBytes(32),
+    fetch: Object.assign(
+      async () =>
+        Response.json({
+          ...tokenGmailOnly,
+          scope: full
+            ? `${tokenGmailOnly.scope} https://www.googleapis.com/auth/calendar`
+            : tokenGmailOnly.scope,
+        }),
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  const connections = localLedger.connections
+  connections.setClient({ clientId: 'fixture', clientSecret: 'fixture' })
+  const begin = () => {
+    const { url } = connections.connect(
+      { agentGroupId: 'work', services: ['gmail'] },
+      { kind: 'host' },
+    )
+    const result = connections.openLink(new URL(url).pathname.split('/').at(-1)!)
+    if (result.kind !== 'authorize') throw new Error('missing authorize URL')
+    return `/oauth/callback?state=${result.url.searchParams.get('state')}&code=fixture`
+  }
+  try {
+    await connections.callback(new URL(begin(), 'http://127.0.0.1'))
+    const held = localDb.select().from(account).get()!
+    transaction(localDb, (tx) =>
+      localLedger.grant(tx, {
+        accountId: held.id,
+        agentGroupId: 'home',
+        service: 'google-calendar',
+        grantedBy: 'host',
+      }),
+    )
+    full = false
+    const path = begin()
+    web = startWeb({ host: '127.0.0.1', port: 0 }, localLedger)
+    const response = await fetch(new URL(path, web.url))
+    expect(response.status).toBe(409)
+    expect(response.headers.get('cache-control')).toBe('no-store')
+    const body = await response.text()
+    expect(body).toContain('google-calendar')
+    expect(body).toContain('next consent will ask for these services')
+    expect(body).toContain('only to the groups that already hold them')
+    expect(body).toContain('Press the card again')
+  } finally {
+    await web?.stop(true)
+    web = undefined
+    localDb.$client.close()
+  }
+})

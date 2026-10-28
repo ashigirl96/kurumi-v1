@@ -121,9 +121,20 @@ export async function runCommand(
   }
 }
 
-async function chat(argv: string[], link: RPCLink<Record<string, never>>): Promise<number> {
+export async function chat(argv: string[], link: Link): Promise<number> {
+  if (argv[0] === 'press') {
+    const [, ref, action] = argv
+    if (argv.length !== 3 || !ref || !action) {
+      process.stderr.write('Usage: kurumi chat press <ref> <action>\n')
+      return 1
+    }
+    const client: ContractRouterClient<{ chat: typeof chatContract }> = createORPCClient(link)
+    const reply = await client.chat.press({ ref, action })
+    process.stdout.write(`${reply.kind === 'private-link' ? reply.url : reply.text}\n`)
+    return reply.kind === 'notice' ? 1 : 0
+  }
   if (argv.length !== 1 || argv[0] === '--help' || argv[0] === '-h') {
-    process.stderr.write('Usage: kurumi chat <agent>\n')
+    process.stderr.write('Usage: kurumi chat <agent> | kurumi chat press <ref> <action>\n')
     return argv[0] === '--help' || argv[0] === '-h' ? 0 : 1
   }
   const client: ContractRouterClient<{ agent: typeof agentContract; chat: typeof chatContract }> =
@@ -250,7 +261,10 @@ function forward(
 const json = (output: unknown) => JSON.stringify(output, null, 2)
 
 const renderers: Readonly<Record<string, (output: unknown) => string>> = {
-  'account.connect': (output) => ConnectOutputSchema.parse(output).url,
+  'account.connect': (output) => {
+    const result = ConnectOutputSchema.parse(output)
+    return 'url' in result ? result.url : result.requestId
+  },
   'account.addKey': (output) => AddKeyOutputSchema.parse(output).handle,
   'account.list': (output) =>
     alignColumns(

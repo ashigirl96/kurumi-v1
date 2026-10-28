@@ -17,7 +17,10 @@ const link: ClientLink<Record<string, never>> = {
 
 test('only procedures with tool metadata become tools, including nested procedures', () => {
   expect(toolsOf({ private: kc, channel: kc.meta({ agent: 'channel' }) }, link, signal)).toEqual([])
-  expect(toolsOf(runnerContract, link, signal).map(({ name }) => name)).toEqual(['list_accounts'])
+  expect(toolsOf(runnerContract, link, signal).map(({ name }) => name)).toEqual([
+    'connect_account',
+    'list_accounts',
+  ])
   expect(createKurumiServer(link, signal)).toMatchObject({ name: 'kurumi', type: 'sdk' })
 })
 
@@ -54,7 +57,9 @@ test('aborting a turn cancels its in-flight tool RPC without stopping the runner
       })
     },
   }
-  const [list] = toolsOf(runnerContract, pendingLink, signal)
+  const list = toolsOf(runnerContract, pendingLink, signal).find(
+    ({ name }) => name === 'list_accounts',
+  )
   if (!list) throw new Error('missing list_accounts')
   const pending = list.handler({}, { signal: turn.signal })
   turn.abort()
@@ -66,7 +71,7 @@ test('aborting a turn cancels its in-flight tool RPC without stopping the runner
 test('handlers forward the contract path and input on the existing link', async () => {
   calls.length = 0
   const tools = toolsOf(runnerContract, link, signal)
-  expect(await tools[0]?.handler({}, undefined)).toEqual({
+  expect(await tools.find(({ name }) => name === 'list_accounts')?.handler({}, undefined)).toEqual({
     content: [{ type: 'text', text: '{"accounts":[]}' }],
   })
   const [echo] = toolsOf(

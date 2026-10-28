@@ -764,7 +764,9 @@ export const router = os.router({
     context.accountLedger.connections.setClient(client)
   }),
   connect: os.connect.handler(({ context, input }) =>
-    context.accountLedger.connections.connect(input, context.caller),
+    context.caller.kind === 'agent'
+      ? context.accountLedger.connections.connectAgent(input, context.caller)
+      : context.accountLedger.connections.connect(input, context.caller),
   ),
   addKey: os.addKey.handler(({ context, input: [vendor, { label, autoGrant, value }] }) => {
     const result = transaction(context.db, (tx) =>

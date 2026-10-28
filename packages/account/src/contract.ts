@@ -1,7 +1,7 @@
 import { kc } from '@kurumi/rpc/contract'
 import { z } from 'zod'
 
-import { keyVendorIds, serviceIds, vendorOf } from './catalog.ts'
+import { keyVendorIds, serviceIds } from './catalog.ts'
 
 export const ServiceIdSchema = z.enum(serviceIds)
 export const HandleSchema = z.string().min(1).describe('handle')
@@ -36,17 +36,14 @@ const ClientStdinSchema = z
   .meta({ stdin: true })
 
 export const ConnectInputSchema = z.object({
-  services: z
-    .array(ServiceIdSchema)
-    .min(1)
-    .refine(
-      (services) => services.every((service) => vendorOf(service) === 'google'),
-      'only Google services are supported',
-    ),
-  agentGroupId: z.string().min(1),
+  services: z.array(ServiceIdSchema).min(1),
+  agentGroupId: z.string().min(1).optional(),
 })
 
-export const ConnectOutputSchema = z.object({ url: z.url() })
+export const ConnectOutputSchema = z.union([
+  z.object({ url: z.url() }),
+  z.object({ kind: z.literal('card_posted'), requestId: z.string(), reused: z.boolean() }),
+])
 
 /** A key ends up in an HTTP header value, which carries only visible ASCII safely. */
 const KeyValueSchema = z
@@ -87,7 +84,16 @@ export const contract = {
       z.tuple([z.literal('google').describe('vendor'), z.object({ client: ClientStdinSchema })]),
     ),
   connect: kc
-    .meta({ cli: true, description: 'Issue a one-time Google account connection link' })
+    .meta({
+      cli: true,
+      description: 'Connect a Google account',
+      agent: 'own-group',
+      tool: {
+        name: 'connect_account',
+        instructions:
+          'Ask an approver to connect Google services (gmail or google-calendar) to your group. Posts a Connect Card in this chat; the approver presses it to connect. Returns card_posted, requestId, and reused, never a link. When reused is true, the existing card was reused and no new card was posted. Omit agentGroupId.',
+      },
+    })
     .input(ConnectInputSchema)
     .output(ConnectOutputSchema),
   mine: kc

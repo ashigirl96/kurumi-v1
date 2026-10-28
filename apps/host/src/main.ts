@@ -254,6 +254,10 @@ export async function startHost(config: HostConfig) {
       db,
       vaultKey,
       webPort: config.web.port,
+      cards: {
+        post: (tx, sessionId, card) => sessionLedger.postCard(tx, sessionId, card),
+        deliver: (id) => sessionLedger.deliverCard(id),
+      },
       log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
       canApprove: (caller, group) =>
         accessLedger.isApprover(caller, accessLedger.approverChain(group)),
@@ -273,7 +277,15 @@ export async function startHost(config: HostConfig) {
     const chatLedger = createChatLedger({
       db,
       agentLedger,
-      sink: () => ({ onInbound: (event) => sessionLedger.routeInbound(event) }),
+      sink: () => ({
+        onInbound: (event) => sessionLedger.routeInbound(event),
+        onCardAction: (input, caller) => {
+          const cardOwners = {
+            'account.connect': () => accountLedger.connections.press(input, caller),
+          }
+          return cardOwners['account.connect']()
+        },
+      }),
     })
     chat = chatLedger
     const sessionLedger = createSessionLedger({

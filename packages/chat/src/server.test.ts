@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { migrations as accessMigrations } from '@kurumi/access/server'
 import { createAgentLedger, migrations as agentMigrations } from '@kurumi/agent/server'
 import type { Caller } from '@kurumi/rpc/contract'
-import { transaction, type Db } from '@kurumi/rpc/server'
+import { guardRouter, transaction, type Db, type KurumiContext } from '@kurumi/rpc/server'
 import { createRouterClient } from '@orpc/server'
 import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
@@ -362,4 +362,27 @@ test.each<Caller>([
   expect(db.select().from(messagingGroup).all()).toEqual([])
   expect(db.select().from(wiring).all()).toEqual([])
   await rejects(terminalAdapter().post(terminalTarget(), { id: 'out-denied', text: 'none' }))
+})
+
+test('guarded chat.press refuses agents even when the context guard allows the call', async () => {
+  const guarded = guardRouter<KurumiContext & { chatLedger: typeof ledger }>().router({
+    chat: router,
+  })
+  const rpc = createRouterClient(guarded, {
+    context: {
+      db,
+      chatLedger: ledger,
+      caller: { kind: 'agent', agentGroupId: agentId, sessionId: 'ses-shared' },
+      guard: () => ({ kind: 'allow' }),
+      grant: null,
+    },
+  })
+  await rejects(rpc.chat.press({ ref: 'cr-test', action: 'connect' }), { code: 'FORBIDDEN' })
+})
+
+test('a card without an action handler returns the unavailable-card notice', async () => {
+  expect(await client().press({ ref: 'unknown', action: 'connect' })).toEqual({
+    kind: 'notice',
+    text: 'このカードは利用できません。もう一度接続を頼んでください',
+  })
 })

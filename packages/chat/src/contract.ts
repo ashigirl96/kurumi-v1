@@ -41,6 +41,20 @@ export type DeliveryTarget = {
   platformId: string
   threadId: string | null
 }
+export const CardOwnerSchema = z.enum(['account.connect'])
+export const CardSchema = z.object({
+  owner: CardOwnerSchema,
+  ref: z.string().min(1),
+  title: z.string(),
+  body: z.string(),
+  buttons: z.array(z.object({ action: z.string().min(1), label: z.string() })),
+})
+export type Card = z.infer<typeof CardSchema>
+export const CardActionReplySchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('private-link'), url: z.url() }),
+  z.object({ kind: z.literal('notice'), text: z.string() }),
+])
+export type CardActionReply = z.infer<typeof CardActionReplySchema>
 export type ChannelAdapter = {
   readonly kind: string
   readonly instance: string | null
@@ -49,8 +63,20 @@ export type ChannelAdapter = {
     target: DeliveryTarget,
     body: { id: string; text: string },
   ): Promise<{ platformMessageId: string }>
+  postCard(
+    target: DeliveryTarget,
+    body: { id: string; card: Card },
+  ): Promise<{ platformMessageId: string }>
+  replaceCard(
+    target: DeliveryTarget,
+    body: { id: string; card: Card },
+  ): Promise<{ platformMessageId: string }>
 }
 
 export const contract = {
+  press: kc
+    .meta({})
+    .input(z.object({ ref: z.string().min(1), action: z.string().min(1) }))
+    .output(CardActionReplySchema),
   terminal: kc.meta({}).input(terminalInput).output(eventIterator(terminalEvent)),
 }
