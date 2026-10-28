@@ -10,6 +10,7 @@ usage: lane.sh <command> <lane> [args]
   add-key <lane>             add the keychain subscription token as anthropic/main (auto-grant)
   chat <lane> <agent> <line> send one line and wait for the reply; prints the transcript path
   probe <lane>               from the lane's one agent container, POST /v1/messages (max_tokens 1) through the gateway
+  egress-probe <lane> <host-ip> <open|blocked>  check direct TCP and the gateway from the agent
   consent <lane> <url>       complete Google consent (flags: --account <n>, --uncheck <service>, --cancel)
   google-client <lane>       pipe the keychain Google OAuth client into account set-client
   down <lane>                stop the host, remove its containers and home; keep evidence
@@ -150,6 +151,14 @@ probe() {
     probe "${KURUMI_VERIFY_PROBE_MODEL:-claude-haiku-4-5}" | grep -iE '^(x-kurumi-account|status=)'
 }
 
+egress_probe() {
+  [ $# -eq 2 ] || usage
+  containers=$(docker ps -q --filter "label=kurumi.install=$(install_label)" --filter label=kurumi.role=agent)
+  [ "$(echo "$containers" | grep -c .)" -eq 1 ] ||
+    die "egress-probe needs exactly one running agent container; chat once first"
+  sh "$repo/.agents/skills/verify/egress-probe.sh" "$containers" "$1" "$KURUMI_WEB_PORT" "$2"
+}
+
 down() {
   agent-browser --session "kurumi-verify-$lane" close >/dev/null
   pid=$(host_pid)
@@ -166,6 +175,8 @@ down() {
     # SIGTERM leaves agent containers running, so remove them by this lane's install label.
     ids=$(docker ps -aq --filter "label=kurumi.install=$(install_label)")
     [ -z "$ids" ] || echo "$ids" | xargs docker rm -f >/dev/null
+    networks=$(docker network ls -q --filter "label=kurumi.install=$(install_label)" --filter label=kurumi.role=isolation)
+    [ -z "$networks" ] || echo "$networks" | xargs docker network rm >/dev/null
     rm -rf "$home"
   fi
   echo "lane $lane down; evidence kept in $evidence"
@@ -191,6 +202,7 @@ case $command in
   add-key) add_key ;;
   chat) chat "$@" ;;
   probe) probe ;;
+  egress-probe) egress_probe "$@" ;;
   consent) exec bun "$repo/.agents/skills/verify/consent.ts" "$lane" "$@" ;;
   google-client) google_client ;;
   down) down ;;

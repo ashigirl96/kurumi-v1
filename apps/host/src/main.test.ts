@@ -136,7 +136,13 @@ test('a repeated SIGINT during shutdown still lets the host stop cleanly', async
   const created = join(home, 'create-started')
   writeFileSync(
     join(home, 'docker'),
-    `#!/bin/sh\nif [ "$1" = create ]; then : > '${created}'; sleep 1; fi\n`,
+    inventoryDocker.replace(
+      'const home = process.env.KURUMI_HOME;',
+      `if (process.argv[2] === 'create' && process.argv.includes('kurumi.role=probe')) {
+        writeFileSync(${JSON.stringify(created)}, ''); await Bun.sleep(1000);
+      }
+const home = process.env.KURUMI_HOME;`,
+    ),
     { mode: 0o755 },
   )
   const host = await spawnHost(home, undefined, { PATH: `${home}:${process.env.PATH}` })
@@ -606,43 +612,52 @@ test('a stored gateway CA certificate that cannot be parsed stops the host, and 
   expect(readFileSync(join(home, 'vault.key')).equals(key)).toBe(true)
 }, 5000)
 
-const inventoryDocker = `#!/bin/sh
-containers="$KURUMI_HOME/containers"
-case "$1" in
-create)
-  for arg; do
-    case "$arg" in
-    kurumi.session=*) session=\${arg#kurumi.session=} ;;
-    kurumi.container=*) container=\${arg#kurumi.container=} ;;
-    kurumi.revision=*) revision=\${arg#kurumi.revision=} ;;
-    esac
-    if [ "$previous" = --name ]; then name=$arg; fi
-    previous=$arg
-  done
-  case "$name" in
-  kurumi-probe-*) printf %s "$arg" > "$KURUMI_HOME/probe-url" ;;
-  *)
-    id=\${name#kurumi-agent-}
-    printf '["%s%s","%s","running","agent","%s","%s","%s"]\\n' "$id" "$id" "$name" "$session" "$container" "$revision" >> "$containers" ;;
-  esac ;;
-ps)
-  case "$*" in *kurumi.revision*)
-    container=$(printf '%s\\n' "$@" | sed -n 's/^label=kurumi.container=//p')
-    if [ -f "$containers" ]; then grep -F '"'"$container" "$containers"; fi ;;
-  esac ;;
-rm)
-  if [ -f "$containers" ]; then
-    grep -vF '"'"$3"'"' "$containers" > "$containers.next"
-    mv "$containers.next" "$containers"
-  fi
-  echo "$3" ;;
-start)
-  if [ "$2" = --attach ]; then
-    exec curl -fsS "$(sed s/host.docker.internal/127.0.0.1/ "$KURUMI_HOME/probe-url")"
-  fi ;;
-wait) while kill -0 "$PPID" 2>/dev/null; do sleep 0.05; done ;;
-esac
-exit 0
+const inventoryDocker = `#!/usr/bin/env bun
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { FakeIsolation } from '${new URL('../../../packages/session/src/driver/fake-isolation.ts', import.meta.url).pathname}';
+const home = process.env.KURUMI_HOME;
+const lock = home + '/docker.lock';
+while (true) { try { mkdirSync(lock); break; } catch { Bun.sleepSync(5); } }
+const path = home + '/docker-state.json';
+const fake = new FakeIsolation();
+if (existsSync(path)) {
+  const state = JSON.parse(readFileSync(path, 'utf8'));
+  for (const [key, value] of state.containers) fake.containers.set(key, value);
+  for (const [key, value] of state.networks) fake.networks.set(key, value);
+}
+const args = process.argv.slice(2);
+const [command] = args;
+const reference = args.at(-1);
+const name = [...fake.containers].find(([name, c]) => name === reference || c.Id === reference)?.[0];
+let result = fake.respond(args);
+const listing = () => [...fake.containers].filter(([, c]) => c.Config.Labels['kurumi.role'] === 'agent').map(([name, c]) => JSON.stringify([c.Id, name, 'running', 'agent', c.Config.Labels['kurumi.session'], c.Config.Labels['kurumi.container'], c.Config.Labels['kurumi.revision']]));
+if (!result && command === 'rm' && name) {
+  const target = fake.containers.get(name);
+  for (const network of fake.networks.values()) delete network.Containers[target.Id];
+  fake.containers.delete(name);
+  result = { code: 0, stdout: reference, stderr: '' };
+}
+if (!result && command === 'ps') {
+  const namesOnly = args.at(-1) === '{{.Names}}';
+  result = { code: 0, stdout: namesOnly ? '' : listing().join('\\n'), stderr: '' };
+}
+writeFileSync(path, JSON.stringify({ containers: [...fake.containers], networks: [...fake.networks] }));
+writeFileSync(home + '/containers', listing().join('\\n'));
+rmSync(lock, { recursive: true });
+if (result) {
+  process.stdout.write(result.stdout);
+  process.stderr.write(result.stderr);
+  process.exit(result.code ?? 1);
+}
+if (command === 'start' && args[1] === '--attach') {
+  const target = fake.containers.get(reference);
+  const url = target.Config.Cmd.at(-1).replace('host.docker.internal', '127.0.0.1');
+  process.stdout.write(await (await fetch(url)).text());
+}
+if (command === 'wait') while (true) {
+  try { process.kill(process.ppid, 0); } catch { break; }
+  await Bun.sleep(50);
+}
 `
 
 test('after a second agent group is created, a restarted host adopts the first group container', async () => {
@@ -659,6 +674,7 @@ test('after a second agent group is created, a restarted host adopts the first g
     return readFileSync(path, 'utf8')
       .trim()
       .split('\n')
+      .filter(Boolean)
       .map((line) => {
         const [, name = '', , , , id = '', revision = ''] = z
           .array(z.string())
@@ -1316,5 +1332,17 @@ test.each(['startup', 'timer'] as const)(
       expect((await output).match(/account.connect.expired/g)!.length).toBeGreaterThan(1)
     }
     expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
+  },
+)
+
+test.each(['bridge', 'none', ''])(
+  'host rejects the removed Docker network override %j',
+  async (value) => {
+    const home = homeForTest()
+    const host = await spawnHost(home, undefined, { KURUMI_DOCKER_NETWORK: value })
+    expect(await host.exited).not.toBe(0)
+    const error = await new Response(host.stderr).text()
+    expect(error).toContain('KURUMI_DOCKER_NETWORK')
+    expect(error).toContain('Unset it')
   },
 )

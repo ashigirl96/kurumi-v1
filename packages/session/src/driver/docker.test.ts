@@ -12,7 +12,7 @@ const url = 'http://host.docker.internal:1234/probe/fresh-nonce'
 
 function setup() {
   const cli = new FakeCli()
-  const driver = createDockerDriver({ install: 'test-install', image, cli })
+  const driver = createDockerDriver({ agentPort: 1234, install: 'test-install', image, cli })
   return { cli, driver }
 }
 
@@ -61,7 +61,7 @@ test('probe returns the raw response only after its container has been removed',
   ).toEqual(['--pull', 'never'])
   expect(
     create.args.slice(create.args.indexOf('--network'), create.args.indexOf('--network') + 2),
-  ).toEqual(['--network', 'bridge'])
+  ).toEqual(['--network', `${containerName(create.args)}-net`])
   expect(create.args).toContain(image)
   expect(create.args.at(-1)).toBe(url)
   const name = create.args[create.args.indexOf('--name') + 1]
@@ -70,15 +70,15 @@ test('probe returns the raw response only after its container has been removed',
   expect(cli.started[2]?.args).toEqual(['rm', '--force', name])
 })
 
-test('network is configurable and every probe gets a unique name', async () => {
+test('every probe gets its own private network', async () => {
   const cli = new FakeCli()
   cli.responses.push({ match: /.*/, result: {} })
-  const driver = createDockerDriver({ install: 'test', image, network: 'none', cli })
+  const driver = createDockerDriver({ agentPort: 1234, install: 'test', image, cli })
   await driver.probe(url)
   await driver.probe(url)
   const creates = cli.started.filter(({ args }) => args[0] === 'create')
   expect(creates).toHaveLength(2)
-  expect(creates[0]?.args).toContain('none')
+  expect(creates[0]?.args).toContain(`${containerName(creates[0]?.args ?? [])}-net`)
   expect(creates[0]?.args).not.toEqual(creates[1]?.args)
 })
 
@@ -388,7 +388,13 @@ test.each(['permission denied', 'removal already in progress'])(
   'cleanup retains ownership when the container remains after %s',
   async (stderr) => {
     const cli = new FakeCli()
-    const driver = createDockerDriver({ install: 'test', image, timeoutMs: 30, cli })
+    const driver = createDockerDriver({
+      agentPort: 1234,
+      install: 'test',
+      image,
+      timeoutMs: 30,
+      cli,
+    })
     const outcome = observe(driver.probe(url))
     const create = await call(cli, 0)
     const name = create.args[create.args.indexOf('--name') + 1]
@@ -427,14 +433,15 @@ test('ordinary failures do not claim cleanup failed', async () => {
   }
 })
 
-test('synchronously failing process start is normalized and cleaned up', async () => {
+test('synchronously failing process start releases isolation without deleting an uncreated container', async () => {
   const cli = new FakeCli()
   const driver = createDockerDriver({
+    agentPort: 1234,
     install: 'test',
     image,
     cli: {
       start(args) {
-        if (args[0] === 'create')
+        if (args[0] === 'create' && !args.includes('kurumi.role=relay'))
           throw Object.assign(new Error('cannot spawn docker'), {
             code: 'ENOENT',
             syscall: 'spawn docker',
@@ -449,7 +456,8 @@ test('synchronously failing process start is normalized and cleaned up', async (
   if (outcome.kind !== 'failure') throw new Error('probe unexpectedly succeeded')
   expect(String(outcome.error)).toContain(`Docker (${image}): create: cannot spawn docker`)
   expect(outcome.error).not.toHaveProperty('cleanupFailed')
-  expect(cli.started[0]?.args[0]).toBe('rm')
+  expect(cli.started).toHaveLength(0)
+  expect(cli.isolation.networks.size).toBe(0)
 })
 
 test('oversized stdout fails rather than accepting a truncated proof', async () => {
@@ -466,7 +474,7 @@ test('oversized stdout fails rather than accepting a truncated proof', async () 
 async function program(timeoutMs = 1000) {
   const cli = new FakeCli()
   cli.responses.push({ match: /.*/, result: {} })
-  await createDockerDriver({ install: 'test', image, timeoutMs, cli }).probe(url)
+  await createDockerDriver({ agentPort: 1234, install: 'test', image, timeoutMs, cli }).probe(url)
   const create = await call(cli, 0)
   const script = create.args[create.args.indexOf('-e') + 1]
   if (!script) throw new Error('probe has no fetch program')
@@ -555,7 +563,6 @@ function agentSpec() {
       { hostPath: import.meta.dir, containerPath: '/workspace/group', readonly: false },
       { hostPath: import.meta.path, containerPath: '/app/runner.js', readonly: true },
     ],
-    network: { kind: 'default' as const },
     limits: { cpus: 1.5, memoryMb: 768, pids: 64 },
   }
 }
@@ -649,19 +656,18 @@ test('concurrent and repeated runs for one session create one container', async 
   await driver.stop()
 })
 
-test('agent lockdown uses the contributed network and never attaches to stdout', async () => {
+test('agent uses its private network and never attaches to stdout', async () => {
   const { cli, driver } = setup()
   cli.responses.push({ match: /^(create|start) /, result: {} })
   expect(
     await driver.run({
       ...agentSpec(),
-      network: { kind: 'lockdown', dockerNetwork: 'private-net' },
     }),
   ).toEqual({ ok: true })
   const args = (await call(cli, 0)).args
   expect(args.slice(args.indexOf('--network'), args.indexOf('--network') + 2)).toEqual([
     '--network',
-    'private-net',
+    `${containerName(args)}-net`,
   ])
   expect(cli.joined().join(' ')).not.toContain('--attach')
   await finishAgent(cli, 2)
@@ -859,7 +865,7 @@ test('kill lets a replacement create settle after its predecessor cleanup finish
 
 test('kill rejects when a replacement create reaches its cleanup deadline', async () => {
   const cli = new FakeCli()
-  const driver = createDockerDriver({ install: 'test', image, cli, timeoutMs: 30 })
+  const driver = createDockerDriver({ agentPort: 1234, install: 'test', image, cli, timeoutMs: 30 })
   const failed = driver.run(agentSpec())
   ;(await call(cli, 0)).proc.complete({ code: 1 })
   ;(await call(cli, 1)).proc.complete({ code: 1 })
@@ -888,6 +894,7 @@ test.each(['agent', 'probe'] as const)(
     const daemon: Cli = {
       start(args) {
         const proc = cli.start(args)
+        if (proc.isolation) return proc
         if (args[0] === 'create') {
           const name = containerName([...args])
           setTimeout(() => {
@@ -914,7 +921,12 @@ test.each(['agent', 'probe'] as const)(
         return proc
       },
     }
-    const driver = createDockerDriver({ install: 'test-install', image, cli: daemon })
+    const driver = createDockerDriver({
+      agentPort: 1234,
+      install: 'test-install',
+      image,
+      cli: daemon,
+    })
     const pending = role === 'agent' ? driver.run(agentSpec()) : observe(driver.probe(url))
     await call(cli, 0)
     await driver.stop()
@@ -929,7 +941,13 @@ test.each(['agent', 'probe'] as const)(
   'stop reports unconfirmed cleanup within its bound when %s create never settles',
   async (role) => {
     const cli = new FakeCli()
-    const driver = createDockerDriver({ install: 'test', image, cli, timeoutMs: 30 })
+    const driver = createDockerDriver({
+      agentPort: 1234,
+      install: 'test',
+      image,
+      cli,
+      timeoutMs: 30,
+    })
     const pending = role === 'agent' ? driver.run(agentSpec()) : observe(driver.probe(url))
     const create = await call(cli, 0)
     const stopped = driver.stop().then(
@@ -952,6 +970,7 @@ function signalledDaemon(code: number | null) {
   const daemon: Cli = {
     start(args) {
       const proc = cli.start(args)
+      if (proc.isolation) return proc
       if (args[0] === 'create') {
         const name = containerName([...args])
         proc.complete({ code })
@@ -989,7 +1008,12 @@ test.each(
   'stop leaves no $role container or rejects when its create CLI ends by $exit from an outside signal',
   async ({ role, code }) => {
     const { cli, containers, created, daemon } = signalledDaemon(code)
-    const driver = createDockerDriver({ install: 'test-install', image, cli: daemon })
+    const driver = createDockerDriver({
+      agentPort: 1234,
+      install: 'test-install',
+      image,
+      cli: daemon,
+    })
     const pending = role === 'agent' ? driver.run(agentSpec()) : observe(driver.probe(url))
     await call(cli, 0)
     await pending
@@ -1006,7 +1030,12 @@ test.each(
 
 test('kill rejects after an agent create CLI ends by an outside signal', async () => {
   const { created, daemon } = signalledDaemon(143)
-  const driver = createDockerDriver({ install: 'test-install', image, cli: daemon })
+  const driver = createDockerDriver({
+    agentPort: 1234,
+    install: 'test-install',
+    image,
+    cli: daemon,
+  })
   expect((await driver.run(agentSpec())).ok).toBe(false)
   const killed = await driver.kill('ctr-one', 0).then(
     () => 'ok',
@@ -1026,7 +1055,7 @@ test('docker CLI children run in their own process group', async () => {
   const path = process.env.PATH
   process.env.PATH = `${dir}:${path}`
   try {
-    const driver = createDockerDriver({ install: 'test-install', image })
+    const driver = createDockerDriver({ agentPort: 1234, install: 'test-install', image })
     expect(await driver.sweep()).toEqual([])
     await driver.stop()
     const own = (await Bun.$`ps -o pgid= -p ${process.pid}`.text()).trim()

@@ -4,7 +4,7 @@ import { promisify } from 'node:util'
 export type ListedContainer = {
   dockerId: string
   name: string
-  role: 'agent' | 'probe' | null
+  role: 'agent' | 'probe' | 'relay' | null
   sessionId: string | null
   containerId: string | null
   revision: string | null
@@ -49,7 +49,7 @@ export function parseListing(line: string): ListedContainer | null {
   return {
     dockerId,
     name,
-    role: role === 'agent' || role === 'probe' ? role : null,
+    role: role === 'agent' || role === 'probe' || role === 'relay' ? role : null,
     sessionId: sessionId || null,
     containerId: containerId || null,
     revision: revision || null,

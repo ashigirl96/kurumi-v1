@@ -26,7 +26,7 @@ import {
   type StateKeyInput,
   type StatePutInput,
 } from './contract.ts'
-import type { ContainerDriver, ContainerInventory, ContainerSpec } from './driver/docker.ts'
+import type { ContainerDriver, ContainerInventory } from './driver/docker.ts'
 import {
   createLiveness,
   createSupervisor,
@@ -43,7 +43,6 @@ export type { AgentPrincipal, SessionId } from './contract.ts'
 export type ContainerEgress = {
   env: Record<string, string>
   mounts: { hostPath: string; containerPath: string; readonly: true }[]
-  network: ContainerSpec['network']
 }
 export type Admission =
   | { open: true }
@@ -389,12 +388,14 @@ export function createSessionLedger({
         reason,
         monotonicMs: performance.now(),
       })
-    void cleanup(id).catch(() => {})
+    return cleanup(id)
   }
 
   const unsubscribe = runtime?.driver.onExit((id, code) => {
     if (stopped) return
-    reap(id, `exited with code ${code}`, supervision?.inventory.nameOf(id) ?? null)
+    void reap(id, `exited with code ${code}`, supervision?.inventory.nameOf(id) ?? null).catch(
+      () => {},
+    )
   })
 
   async function reconcileSession(id: string) {
@@ -465,7 +466,6 @@ export function createSessionLedger({
           { hostPath: agent.folder, containerPath: '/workspace/group', readonly: false },
           ...egress.mounts,
         ],
-        network: egress.network,
         limits: { cpus: 1, memoryMb: 1024, pids: 256 },
       })
       if (result.ok) {

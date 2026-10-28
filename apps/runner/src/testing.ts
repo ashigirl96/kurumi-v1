@@ -123,7 +123,7 @@ export async function startHost() {
       image: 'test',
       egress: {
         admission: () => ({ open: true }),
-        contribution: () => ({ env: {}, mounts: [], network: { kind: 'default' } }),
+        contribution: () => ({ env: {}, mounts: [] }),
       },
     },
   })

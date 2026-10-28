@@ -113,9 +113,14 @@ test('a supervised running container is stale once it has been silent longer tha
   expect(plan([row({ status: 'starting', liveness: silent(10 * staleAfterMs) })], null)).toEqual([])
 })
 
-test('stopping rows keep their container for the cleanup that is already under way', () => {
-  expect(plan([row({ status: 'stopping' })], [listed()])).toEqual([])
-  expect(plan([row({ status: 'stopping', liveness: silent(10 * staleAfterMs) })], [])).toEqual([])
+test('stopping rows retry cleanup even when the session is still active', () => {
+  const cleanup = [
+    { kind: 'reap', row: 'ctr-a', reason: 'cleanup unfinished' },
+  ] satisfies ReturnType<typeof plan>
+  expect(plan([row({ status: 'stopping' })], [listed()])).toEqual(cleanup)
+  expect(plan([row({ status: 'stopping', liveness: silent(10 * staleAfterMs) })], [])).toEqual(
+    cleanup,
+  )
 })
 
 test('the pass retries an unfinished cleanup for a session that no longer spawns', () => {
@@ -214,7 +219,7 @@ function fakeInventory(listing: ListedContainer[] = []) {
       if (failing) throw new Error('Cannot connect to the Docker daemon')
       return listing
     },
-    adopt(container) {
+    async adopt(container) {
       adoptions.push(container.name)
       return { ok: true }
     },
@@ -256,7 +261,7 @@ function supervise(
     intervalMs,
     rows: () => [],
     accept: () => {},
-    reap: () => {},
+    reap: async () => {},
     log: (entry) => logs.push(entry),
     ...overrides,
   })
@@ -293,7 +298,7 @@ test('while Docker cannot be listed the supervisor retries with backoff and adop
   await supervisor.stop()
 })
 
-test('a decision that fails keeps adoption closed, and the retry adopts without a second driver adoption', async () => {
+test('a failed acceptance keeps admission closed and retries validated adoption', async () => {
   const fake = fakeInventory([listed()])
   fake.answer()
   let busy = true
@@ -319,10 +324,10 @@ test('a decision that fails keeps adoption closed, and the retry adopts without 
   )
   await supervisor.start()
   expect(adopted).toBe(false)
-  expect(fake.adoptions).toEqual([])
+  expect(fake.adoptions).toEqual(['kurumi-agent-a'])
   await eventually(() => adopted)
   expect(accepted).toEqual(['ctr-a'])
-  expect(fake.adoptions).toEqual(['kurumi-agent-a'])
+  expect(fake.adoptions).toEqual(['kurumi-agent-a', 'kurumi-agent-a'])
   expect(
     logs.flatMap((entry) =>
       entry.kind === 'session.adoption.done' || entry.kind === 'session.reconcile.failed'
@@ -387,7 +392,6 @@ function revisionFor(sha: string, sessionEnv: SessionEnv = proxyEnv): string {
     contribution: ({ sessionToken }) => ({
       ...gateway,
       env: { ...gateway.env, ...sessionEnv({ port: 4100, sessionToken }) },
-      network: { kind: 'lockdown', dockerNetwork: 'bridge' },
     }),
   })
 }
@@ -410,3 +414,37 @@ test('a change to the per-session proxy env keys, username, or scheme changes th
     expect(revisionFor('aaa', changed)).not.toBe(revisionFor('aaa'))
   }
 })
+
+test.each([true, false])(
+  'shutdown during async adoption does not accept or reap the surviving row (validation %s)',
+  async (ok) => {
+    const fake = fakeInventory([listed()])
+    fake.answer()
+    const validating = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    fake.inventory.adopt = async () => {
+      validating.resolve()
+      await release.promise
+      return ok ? { ok: true } : { ok: false, reason: 'driver stopped' }
+    }
+    const changes: string[] = []
+    const supervisor = createSupervisor({
+      inventory: fake.inventory,
+      staleAfterMs,
+      intervalMs: 400,
+      rows: () => [row()],
+      accept: () => changes.push('accept'),
+      reap: async () => {
+        changes.push('reap')
+      },
+      log: () => {},
+    })
+    const adopted = supervisor.adopted.catch(() => {})
+    const starting = supervisor.start()
+    await validating.promise
+    const stopping = supervisor.stop()
+    release.resolve()
+    await Promise.all([starting, stopping, adopted])
+    expect(changes).toEqual([])
+  },
+)

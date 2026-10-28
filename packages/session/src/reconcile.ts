@@ -109,6 +109,8 @@ function leftover(role: ListedContainer['role']): string {
       return 'no live row'
     case 'probe':
       return 'leftover probe'
+    case 'relay':
+      return 'leftover relay'
     case null:
       return 'unknown role'
     default: {
@@ -134,7 +136,7 @@ export function planReconciliation({
     const container = byName.get(row.name)
     if (container) claimed.add(container.name)
     if (row.status === 'stopping') {
-      if (!row.sessionActive) decisions.push({ kind: 'reap', row, reason: 'cleanup unfinished' })
+      decisions.push({ kind: 'reap', row, reason: 'cleanup unfinished' })
       continue
     }
     if (row.liveness) {
@@ -161,7 +163,7 @@ export function createSupervisor(deps: {
   intervalMs: number
   rows(): ContainerRow[]
   accept(row: ContainerRow): void
-  reap(rowId: string, reason: string, name: string): void
+  reap(rowId: string, reason: string, name: string): Promise<void>
   log(entry: SupervisionLog): void
 }) {
   const { inventory, intervalMs } = deps
@@ -198,16 +200,17 @@ export function createSupervisor(deps: {
     })
   }
 
-  function apply(decision: Reconciliation): Reconciliation['kind'] {
+  async function apply(decision: Reconciliation): Promise<Reconciliation['kind'] | null> {
     switch (decision.kind) {
       case 'adopt': {
         const { row, container } = decision
-        deps.accept(row)
-        const result = inventory.adopt(container)
+        const result = await inventory.adopt(container)
+        if (stopped) return null
         if (!result.ok) {
-          deps.reap(row.id, `adoption failed: ${result.reason}`, row.name)
+          await deps.reap(row.id, `adoption failed: ${result.reason}`, row.name)
           return 'reap'
         }
+        deps.accept(row)
         deps.log({
           kind: 'session.container.adopted',
           sessionId: row.sessionId,
@@ -219,22 +222,19 @@ export function createSupervisor(deps: {
         return 'adopt'
       }
       case 'reap':
-        deps.reap(decision.row.id, decision.reason, decision.row.name)
+        await deps.reap(decision.row.id, decision.reason, decision.row.name)
         return 'reap'
       case 'stop': {
         const { container, reason } = decision
-        inventory.remove(container).then(
-          () =>
-            deps.log({
-              kind: 'session.container.stopped',
-              sessionId: container.sessionId,
-              containerId: container.containerId,
-              name: container.name,
-              reason,
-              monotonicMs: performance.now(),
-            }),
-          (cause: unknown) => failed(`remove ${container.name}: ${String(cause)}`),
-        )
+        await inventory.remove(container)
+        deps.log({
+          kind: 'session.container.stopped',
+          sessionId: container.sessionId,
+          containerId: container.containerId,
+          name: container.name,
+          reason,
+          monotonicMs: performance.now(),
+        })
         return 'stop'
       }
       default: {
@@ -271,11 +271,14 @@ export function createSupervisor(deps: {
       }
       for (const decision of decisions)
         try {
-          counts[apply(decision)]++
+          if (stopped) break
+          const kind = await apply(decision)
+          if (kind !== null) counts[kind]++
         } catch (cause) {
           applied = false
           failed(String(cause))
         }
+      if (stopped) break
       if (containers && applied && !listed) {
         listed = true
         deps.log({

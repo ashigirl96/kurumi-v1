@@ -20,6 +20,7 @@ kurumi は host process（`apps/host`）で、`$KURUMI_HOME/kurumi.sock` 越し�
 | `add-key <n>` | owner の subscription token を macOS の keychain（service `kurumi-live-claude`）から読み、`account add-key anthropic --label main --auto-grant` に stdin で渡す。`anthropic/main` を出力する。 |
 | `chat <n> <agent> <line>` | `kurumi chat` で 1 行送り、返事か error の行が届くまで stdin を開けておく（`KURUMI_VERIFY_REPLY_TIMEOUT`、既定 180 秒）。transcript を保存する。exit 0 は行が返ってきたことしか意味しない。`Provider error …` の notice も 1 行に数えるので、Claude が答えたかは transcript を読んで確かめる。 |
 | `probe <n>` | lane にただ 1 つある agent container から、gateway 経由で `POST https://api.anthropic.com/v1/messages`（`max_tokens` 1）を送り、`x-kurumi-account` と `status=` を出力する。model は `KURUMI_VERIFY_PROBE_MODEL`、既定は `claude-haiku-4-5`。 |
+| `egress-probe <n> <host-ip> <open\|blocked>` | 同じ agent から numeric IP と host の Web Port への直接 TCP 接続、および gateway 経由の request を検査する。host IP は信頼できる外側の network から調べた numeric IPv4 を指定する。 |
 | `consent <n> <url> [flags]` | Google の同意画面を進める。`--account <n>`、`--uncheck <service>`、`--cancel` は [connect.md](features/connect.md) を参照。host は不要。 |
 | `google-client <n>` | keychain の Google client を `account set-client google` に渡す。CLI が未実装ならコマンド名を示して失敗する。 |
 | `down <n>` | lane の browser session を閉じ、host に SIGTERM を送り、install label で container を `docker rm -f` し、home を消す。evidence は残す。 |
@@ -28,11 +29,21 @@ kurumi は host process（`apps/host`）で、`$KURUMI_HOME/kurumi.sock` 越し�
 
 ## Launch
 
-lane `n` は `/tmp/kurumi-verify/lane-<n>/` に置く。`home/` が `KURUMI_HOME` で、`evidence/` は残す。Agent Port は `41000+10n`、loopback の Web Port は `41001+10n`。image は `kurumi-agent:verify-<HEAD の short SHA>` で、`KURUMI_AGENT_IMAGE` を設定すればそちらを使う。lane は並べて動かせるので、同時に走る検証にはそれぞれ別の番号を割り当てる。`up` の前に設定した host の環境変数（`KURUMI_STALE_AFTER_MS`、`KURUMI_DOCKER_NETWORK` など）は、そのまま host に渡る。
+lane `n` は `/tmp/kurumi-verify/lane-<n>/` に置く。`home/` が `KURUMI_HOME` で、`evidence/` は残す。Agent Port は `41000+10n`、loopback の Web Port は `41001+10n`。image は `kurumi-agent:verify-<HEAD の short SHA>` で、`KURUMI_AGENT_IMAGE` を設定すればそちらを使う。lane は並べて動かせるので、同時に走る検証にはそれぞれ別の番号を割り当てる。`up` の前に設定した host の環境変数（`KURUMI_STALE_AFTER_MS` など）は、そのまま host に渡る。`KURUMI_DOCKER_NETWORK` は廃止されており、設定されていると host は起動を拒否する。network は host が container ごとに作る。
 
 lane の path を短くしているのは、macOS が unix socket の path を 104 byte までに制限するからだ。長い scratch directory の下に home を置くと、`kurumi.sock` の bind に失敗する。
 
 owner の普段の host は `~/.kurumi` を使う。`lane.sh` は必ず `KURUMI_HOME` を設定するので、その host には触れない。同じ理由で、CLI は必ず `lane.sh kurumi` 経由で呼ぶ。
+
+## Egress probe
+
+`chat` で agent container を起動し、`add-key` で `anthropic/main` を登録してから実行する。外側の network にいる信頼できる container で `host.docker.internal` を解決し、その numeric IPv4 を指定する。private network の同名 alias からは調べない。
+
+```sh
+.agents/skills/verify/lane.sh egress-probe 3 <host-ip> blocked
+```
+
+通常の bridge にいる control container には、同じ probe を `sh .agents/skills/verify/egress-probe.sh <container> <host-ip> <web-port> open` で実行する。`blocked` では直接 TCP が拒否または timeout され、gateway の request が HTTP 200 と `anthropic/main` を返すときだけ成功する。DNS や IPv6 の遮断をこの probe の成功から推定しない。使い捨て control container は実行者が削除し、lane は `down` で片付ける。
 
 ## Doctor
 
@@ -56,7 +67,7 @@ owner の普段の host は `~/.kurumi` を使う。`lane.sh` は必ず `KURUMI_
 
 ## Cleanup
 
-失敗した回も含め、毎回 `down <n>` を流す（`smoke` は終了時に自分で流す）。`down` が kill するのはこの lane の `kurumi.lock` にある pid だけで、kurumi の host だと確かめてから送る。container はこの lane の `kurumi.install` label で消す。label は home の path から計算し直すので、`kill -9` で落ちた host の container も片付く。SIGTERM だけでは agent container は動き続ける。`kurumi-agent:verify-*` の image は次の lane のために残すので、使い終えたら `docker rmi` で消す。evidence directory は報告を読む側のものだ。subagent は消さずに path を報告し、最上位の session がユーザーに結果を渡したあとで `/tmp/kurumi-verify/lane-<n>/` を消す。
+失敗した回も含め、毎回 `down <n>` を流す（`smoke` は終了時に自分で流す）。`down` が kill するのはこの lane の `kurumi.lock` にある pid だけで、kurumi の host だと確かめてから送る。container と relay はこの lane の `kurumi.install` label で消し、続けて同じ install の isolation network を消す。label は home の path から計算し直すので、`kill -9` で落ちた host の container も片付く。SIGTERM だけでは agent container は動き続ける。`kurumi-agent:verify-*` の image は次の lane のために残すので、使い終えたら `docker rmi` で消す。evidence directory は報告を読む側のものだ。subagent は消さずに path を報告し、最上位の session がユーザーに結果を渡したあとで `/tmp/kurumi-verify/lane-<n>/` を消す。
 
 ## Features
 

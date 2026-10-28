@@ -97,7 +97,6 @@ function runtime(driver = createFakeDriver()): SessionRuntime {
       contribution: () => ({
         env: { KURUMI_URL: 'http://host.test' },
         mounts: [],
-        network: { kind: 'default' },
       }),
     },
   }

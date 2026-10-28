@@ -24,5 +24,5 @@ agent の container は host より長く生きる。host が SIGTERM で止ま�
 ## Gotchas
 
 - host の pid は `kurumi.lock` から読む。shell の `$!` は使わない。
-- `up` は image と runner を作り直す。`container/`、runner bundle、`KURUMI_AGENT_IMAGE`、Agent Port、`KURUMI_DOCKER_NETWORK` のどれかが変わると runtime revision が変わる。そのとき `host.log` は `container was created for another runtime` と出し、container を引き継がずに作り直す。引き継ぎを試すときは、同じ checkout のまま再起動する。
+- `up` は image と runner を作り直す。runner bundle、`KURUMI_AGENT_IMAGE`、Agent Port、relay のコードや isolation version のどれかが変わると runtime revision が変わる。image を同じ tag のまま作り直しても revision は変わらない。そのとき `host.log` は `container was created for another runtime` と出し、container を引き継がずに作り直す。引き継ぎを試すときは、同じ checkout のまま再起動する。
 - `host.log` は起動のたびに追記される。最新の `host.start` より後の行を読む。
