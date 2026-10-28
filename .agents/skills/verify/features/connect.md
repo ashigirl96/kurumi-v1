@@ -64,7 +64,7 @@ docker exec <container-id> curl -sS -D - -o /dev/null https://gmail.googleapis.c
 
 accountの指定は`L consent <n> '<connect-link>' --account 2`、部分同意は`--uncheck google-calendar`、拒否は`--cancel`を付ける。driverは表示されたscope checkboxごとにserviceと設定後の状態を出力する。`--uncheck`ではcheckboxのない追加アクセス画面も進め、hostのcallback本文に`Connected. Granted:`と対象serviceの`Not granted:`があることを確認する。callbackのscope queryだけでは成功と判定しない。hostを止めた場合や、狭いtokenの保存をhostが拒否した場合は非ゼロで終わる。
 
-access tokenの期限が60秒以内なら、gatewayはaccountごとに1回だけrefreshし、同時に来たGmailとCalendarのrequestもその完了を待つ。`host.log`の`account.refresh`（`durationMs`はGoogleとのrefresh往復時間）と、読取queryで`access_expires_at`が進んだことを確認する。
+access tokenの期限が60秒以内なら、gatewayはaccountごとに1回だけrefreshし、同時に来たGmailとCalendarのrequestもその完了を待つ。`host.log`の`account.refresh`（`durationMs`はGoogleとのrefresh往復時間）と、読取queryで`access_expires_at`が進んだことを確認する。`access_expires_at`を過去に書き換えて確かめられるのはkurumiのrefresh経路だけで、Google側の本当の期限切れはaccess tokenの寿命（約1時間）を待たないと起きない。本当の期限切れを見るlaneが複数あるときは、約61分の待ちを1回にまとめて共有する。
 
 ```sh
 L kurumi <n> db query 'select id, status, access_expires_at from account where vendor = "google"'
@@ -75,7 +75,7 @@ L kurumi <n> gateway log
 
 grantをrevokeすると、有効期限内のaccess tokenでもGoogleは401を返す。gatewayはその応答を返し、注入したOAuth情報が保存中のものと同じ場合だけ期限を切る。次のprobeでrefreshが`invalid_grant`となり、403の`account_needs_reauth`を返す。先に完了した再接続やrefreshのtokenを、遅れて来た401で失効させない。再接続がrefresh中に完了した場合も、現在のgrantと有効なtokenを読み直して使う。
 
-revokeの自己検証は、そのaccountを専有する`alone` laneでのみ行う。repo外のscratch scriptでlaneの`vault.key`とDBから保存tokenを開き、Googleの`https://oauth2.googleapis.com/revoke`へPOSTする。tokenは出力・保存・argvに渡さず、HTTP statusだけを記録する。containerからGmailを2回probeし、最初の401と次の403、本文の拒否されたserviceだけを含む接続案内、`account list`の`needs_reauth`をアドレスを伏せて残す。成功・失敗とも`L down <n>`で終了する。
+revokeの自己検証は、そのaccountを専有する`alone` laneでのみ行う。repo外のscratch scriptでlaneの`vault.key`とDBから保存tokenを開き、Googleの`https://oauth2.googleapis.com/revoke`へPOSTする。hostはDBを`locking_mode=EXCLUSIVE`で開くため、host稼働中にscriptがDBを開くと`SQLITE_BUSY`になる。保存tokenは`L kurumi <n> db query`の読取結果をstdinで渡すか、hostを止めてから読み、`L up <n>`で戻す。tokenは出力・保存・argvに渡さず、HTTP statusだけを記録する。containerからGmailを2回probeし、最初の401と次の403、本文の拒否されたserviceだけを含む接続案内、`account list`の`needs_reauth`をアドレスを伏せて残す。成功・失敗とも`L down <n>`で終了する。
 
 - スクリーンショットは `/tmp/kurumi-verify/lane-<n>/evidence/consent-*.png`。同じ helper がページ内のアドレス、入力値、placeholder、SVG、open shadow root、URL と iframe を撮影前と各 frame でぼかす。viewport だけを保存するため、ブラウザの URL バーは画像に含まれない。失敗時もその画面を保存する。
 - driver は正常終了、失敗、SIGINT、SIGTERM で `kurumi-verify-<n>` session を閉じる。検証後は成功・失敗とも `L down <n>` を流す。`down` もこの session を閉じる。

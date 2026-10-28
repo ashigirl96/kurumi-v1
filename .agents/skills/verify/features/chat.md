@@ -27,6 +27,7 @@ owner は agent group を作り、terminal から話しかける。stdin の 1 �
 
 ## Gotchas
 
+- 同じ agent group への `L chat` と `kurumi chat` は、1 つの共有 session（`mode: shared`）に入る。session を 2 つ要する確認では agent group を 2 つ作る。
 - key は最初の chat の前に追加する。account が grant されていないと、返事は Claude の答えではなく `Provider error 403 account_not_connected: …` のような notice になる。
 - Claude Code の 1 turn は `GET /api/claude_code/policy_limits` と `GET /api/claude_code/settings` も送る。`/v1/messages` の行を数えるときは path で絞る。
 - 最初の turn には container の起動が含まれる。返事が `KURUMI_VERIFY_REPLY_TIMEOUT` より遅いと、返事があとで `host.log` に届いても `L chat` は失敗する。
