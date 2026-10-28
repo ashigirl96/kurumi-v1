@@ -1186,3 +1186,55 @@ test.each(['1000', '59999', '60000.5', 'no', 'Infinity', ''])(
     expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
   },
 )
+
+test.each(['startup', 'timer'] as const)(
+  'a sweep failure at %s is handled at the correct boundary',
+  async (phase) => {
+    const home = homeForTest()
+    const preload = join(home, 'sweep-failure.ts')
+    writeFileSync(
+      preload,
+      `
+    import { mock } from 'bun:test'
+    import * as accounts from ${JSON.stringify(join(import.meta.dir, '../../../packages/account/src/server.ts'))}
+    const create = accounts.createAccountLedger
+    mock.module(${JSON.stringify(join(import.meta.dir, '../../../packages/account/src/server.ts'))}, () => ({
+      ...accounts,
+      createAccountLedger(deps) {
+        const ledger = create(deps)
+        const expire = ledger.connections.expireRequests
+        let calls = 0
+        ledger.connections.expireRequests = () => {
+          calls++
+          if (calls === ${phase === 'startup' ? 1 : 2}) throw new Error('sweep test failure')
+          return expire()
+        }
+        return ledger
+      },
+    }))
+    const interval = globalThis.setInterval
+    globalThis.setInterval = (callback, delay, ...args) => interval(callback, delay === 60000 ? 20 : delay, ...args)
+  `,
+    )
+    const host = await spawnHost(home, preload)
+    const errors = new Response(host.stderr).text()
+    const output = new Response(host.stdout).text()
+    if (phase === 'startup') {
+      expect(await host.exited).toBe(1)
+      expect(await errors).toContain('sweep test failure')
+      expect(await output).not.toContain('host.runtime')
+    } else {
+      await waitForHost(home, host)
+      await Bun.sleep(100)
+      expect(host.exitCode).toBeNull()
+      await waitForHost(home, host)
+      host.kill('SIGTERM')
+      expect(await host.exited).toBe(0)
+      expect(await errors).toContain(
+        '"kind":"account.connect.expiry_failed","message":"sweep test failure"',
+      )
+      expect((await output).match(/account.connect.expired/g)!.length).toBeGreaterThan(1)
+    }
+    expect(existsSync(join(home, 'kurumi.sock'))).toBe(false)
+  },
+)

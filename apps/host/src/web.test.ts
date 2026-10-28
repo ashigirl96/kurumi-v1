@@ -100,6 +100,10 @@ test('the callback grants OAuth services and reloads the same uncached success p
   expect(text).toContain('Connected. Granted: gmail.')
   expect(text).toContain('Not granted: google-calendar.')
   expect(await (await fetch(callback)).text()).toBe(text)
+  setSystemTime(Date.now() + 31 * 60_000)
+  const reloaded = await fetch(callback)
+  expect(reloaded.status).toBe(200)
+  expect(await reloaded.text()).toBe(text)
   expect(exchanges).toBe(1)
   expect((await fetch(callback, { method: 'POST' })).status).toBe(404)
 })
@@ -215,8 +219,8 @@ test('shared-service refusal names the missing services and explains the next co
     expect(response.headers.get('cache-control')).toBe('no-store')
     const body = await response.text()
     expect(body).toContain('google-calendar')
-    expect(body).toContain('next consent will ask for these services')
-    expect(body).toContain('only to the groups that already hold them')
+    expect(body).toContain('This also grants google-calendar to work.')
+    expect(body).not.toContain('only to the groups that already hold them')
     expect(body).toContain(
       'kurumi account connect --services gmail google-calendar --agent-group-id work',
     )
@@ -229,23 +233,38 @@ test('shared-service refusal names the missing services and explains the next co
 })
 
 test('a past-due callback shows expiry without changing the request or exchanging code', async () => {
+  let exchanges = 0
+  const expiredLedger = createAccountLedger({
+    db,
+    vaultKey: randomBytes(32),
+    fetch: Object.assign(
+      async () => {
+        exchanges++
+        return Response.json(tokenGmailOnly)
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
   insertAgentGroup(db, 'expired-work')
-  ledger.connections.setClient({ clientId: 'fixture', clientSecret: 'fixture' })
-  const id = ledger.connections.createRequest(
+  expiredLedger.connections.setClient({ clientId: 'fixture', clientSecret: 'fixture' })
+  const id = expiredLedger.connections.createRequest(
     { agentGroupId: 'expired-work', services: ['gmail'] },
     { kind: 'host' },
   )
-  const opened = ledger.connections.openLink(ledger.connections.issueLink(id, { kind: 'host' }))
+  const opened = expiredLedger.connections.openLink(
+    expiredLedger.connections.issueLink(id, { kind: 'host' }),
+  )
   if (opened.kind !== 'authorize') throw new Error('missing authorize URL')
   setSystemTime(Date.now() + 30 * 60_000)
   const before = db.select().from(connectionRequest).where(eq(connectionRequest.id, id)).get()
-  web = startWeb({ host: '127.0.0.1', port: 0 }, ledger)
+  web = startWeb({ host: '127.0.0.1', port: 0 }, expiredLedger)
   const callback = new URL('/oauth/callback', web.url)
   callback.searchParams.set('state', opened.url.searchParams.get('state')!)
   callback.searchParams.set('code', 'fixture')
   const response = await fetch(callback)
   expect(response.status).toBe(410)
-  expect(await response.text()).toBe('This request expired. Ask again to connect.')
+  expect(await response.text()).toBe('This request expired. Run kurumi account connect again.')
+  expect(exchanges).toBe(0)
   expect(db.select().from(connectionRequest).where(eq(connectionRequest.id, id)).get()).toEqual(
     before,
   )

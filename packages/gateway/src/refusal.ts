@@ -1,6 +1,6 @@
 import { STATUS_CODES } from 'node:http'
 
-import { type CredentialRefusal, type ServiceId } from '@kurumi/account/server'
+import { vendorOf, type CredentialRefusal, type ServiceId } from '@kurumi/account/server'
 
 export type HoldRefusal =
   | { code: 'approval_pending'; service: ServiceId; approvalId: string }
@@ -47,7 +47,7 @@ const askToAdd = 'ask the owner to add one with kurumi account add-key and grant
 export function nextStep(refusal: GatewayRefusal): string {
   switch (refusal.code) {
     case 'account_not_connected':
-      return `no account is granted ${refusal.service} for this agent group; call mcp__kurumi__connect_account with services=${JSON.stringify([refusal.service])}`
+      return `no account is granted ${refusal.service} for this agent group; ${vendorOf(refusal.service) === 'google' ? `call mcp__kurumi__connect_account with services=${JSON.stringify([refusal.service])}` : askToAdd}`
     case 'account_ambiguous':
       return `name one of ${refusal.granted.join(', ')}: put kurumi:<handle> where the token goes, or ask the owner to set a default`
     case 'account_not_granted':
@@ -55,7 +55,9 @@ export function nextStep(refusal: GatewayRefusal): string {
         ? `${refusal.named} is not granted ${refusal.service} for this agent group; put kurumi:<handle> for one of ${refusal.granted.join(', ')} where the token goes`
         : `${refusal.named} is not granted ${refusal.service} for this agent group, and no account is; ${askToAdd}`
     case 'account_needs_reauth':
-      return `reconnect ${refusal.handle}: call mcp__kurumi__connect_account with services=${JSON.stringify(refusal.services)}`
+      return vendorOf(refusal.service) === 'google'
+        ? `reconnect ${refusal.handle}: call mcp__kurumi__connect_account with services=${JSON.stringify([refusal.service])}`
+        : `ask the owner to add ${refusal.handle} again`
     case 'account_refresh_failed':
       return `could not refresh ${refusal.handle}; try again shortly`
     case 'selector_unreadable':

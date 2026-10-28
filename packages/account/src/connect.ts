@@ -94,6 +94,7 @@ export type ConnectionOptions = {
   webPort?: number
   requestTtlMs?: number
   canApprove?: (caller: Caller, agentGroupId: string) => boolean
+  canGrant?: (caller: Caller) => boolean
   cards?: {
     post(tx: Tx, sessionId: string, card: ConnectionCard): string
     replace(tx: Tx, messageId: string, card: ConnectionCard): string
@@ -122,7 +123,8 @@ type OpenLink = { kind: 'authorize'; url: URL } | { kind: 'unavailable' }
 type CallbackPage =
   | { kind: 'completed'; granted: ServiceId[]; missing: ServiceId[] }
   | { kind: 'shared-services-missing'; services: ServiceId[]; retry: string }
-  | { kind: 'cancelled' | 'expired' | 'unavailable' | 'failed' | 'nothing-granted' }
+  | { kind: 'expired'; retry: string }
+  | { kind: 'cancelled' | 'unavailable' | 'failed' | 'nothing-granted' }
 
 type CallbackResult = { page: CallbackPage; committed: boolean; delivery: ConnectionDelivery }
 
@@ -137,6 +139,7 @@ export function createConnections({
   webPort = 4001,
   requestTtlMs = requestTtl,
   canApprove = (caller) => caller.kind === 'host',
+  canGrant = (caller) => caller.kind === 'host',
   cards,
   fetch: fetchImpl = fetch,
   log = () => {},
@@ -170,9 +173,16 @@ export function createConnections({
   }
   const pageFor = (request: ConnectionRequest | undefined): CallbackPage => {
     if (!request) return { kind: 'unavailable' }
-    if (request.state === 'expired' || request.expiresAt <= new Date()) return { kind: 'expired' }
     if (request.state === 'cancelled') return { kind: 'cancelled' }
-    if (request.state !== 'completed') return { kind: 'unavailable' }
+    if (request.state !== 'completed')
+      return request.state === 'expired' || request.expiresAt <= new Date()
+        ? {
+            kind: 'expired',
+            retry: request.cardMessageId
+              ? 'Ask again to connect.'
+              : 'Run kurumi account connect again.',
+          }
+        : { kind: 'unavailable' }
     const held =
       request.accountId === null
         ? undefined
@@ -429,6 +439,8 @@ export function createConnections({
           if (caller.kind === 'agent' || !canApprove(caller, row.agentGroupId))
             return { kind: 'notice', text: 'この group の承認者だけが接続できます' }
           if (action.startsWith('use:')) {
+            if (!canGrant(caller))
+              return { kind: 'notice', text: 'owner だけが既存のアカウントを付与できます' }
             const held = tx
               .select()
               .from(account)
@@ -622,8 +634,8 @@ export function createConnections({
       if (!state || url.searchParams.getAll('state').length !== 1) return { kind: 'unavailable' }
       const request = requestForState(state)
       if (!request) return { kind: 'unavailable' }
-      if (request.state === 'expired' || request.expiresAt <= new Date()) return { kind: 'expired' }
-      if (request.state !== 'authorizing') return pageFor(request)
+      if (request.state !== 'authorizing' || request.expiresAt <= new Date())
+        return pageFor(request)
       const callback = readCallback(url, request.oauthState)
       if (callback.kind === 'invalid') return { kind: 'unavailable' }
       if (callback.kind === 'denied' && callback.error === 'access_denied') {
@@ -727,8 +739,8 @@ export function createConnections({
                 kind: 'shared-services-missing',
                 services: missing,
                 retry: current.cardMessageId
-                  ? 'Press the card again to retry.'
-                  : `Run kurumi account connect --services ${[...new Set([...current.services, ...missing])].join(' ')} --agent-group-id ${current.agentGroupId} to retry.`,
+                  ? 'The next consent will ask for these services; they stay granted only to the groups that already hold them. Press the card again to retry.'
+                  : `Run kurumi account connect --services ${[...new Set([...current.services, ...missing])].join(' ')} --agent-group-id ${current.agentGroupId} to retry. This also grants ${missing.join(', ')} to ${current.agentGroupId}.`,
               },
               committed: false,
               delivery: null,

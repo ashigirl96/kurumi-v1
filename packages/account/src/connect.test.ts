@@ -424,9 +424,11 @@ test.each(['unknown', 'expired', 'cancelled', 'open', 'missing-code', 'duplicate
     if (mode === 'duplicate-state') url.searchParams.append('state', url.searchParams.get('state')!)
     const page = await connections.callback(url)
     expect(endpoint.exchanges()).toBe(0)
-    expect(page).toEqual({
-      kind: mode === 'cancelled' ? 'cancelled' : mode === 'expired' ? 'expired' : 'unavailable',
-    })
+    expect(page).toEqual(
+      mode === 'expired'
+        ? { kind: 'expired', retry: 'Run kurumi account connect again.' }
+        : { kind: mode === 'cancelled' ? 'cancelled' : 'unavailable' },
+    )
     expect(db.select().from(account).all()).toEqual([])
   },
 )
@@ -468,9 +470,11 @@ test.each(['client-change', 'expires'] as const)(
         .set({ expiresAt: new Date(0) })
         .run()
     delayed.resolve(Response.json(tokenFull))
-    expect(await pending).toEqual({
-      kind: mode === 'client-change' ? 'cancelled' : 'expired',
-    })
+    expect(await pending).toEqual(
+      mode === 'client-change'
+        ? { kind: 'cancelled' }
+        : { kind: 'expired', retry: 'Run kurumi account connect again.' },
+    )
     expect(db.select().from(account).all()).toEqual([])
     expect(db.select().from(accountGrant).all()).toEqual([])
   },
@@ -616,7 +620,7 @@ test.each(['success', 'failure'] as const)(
     db.update(connectionRequest)
       .set({ expiresAt: new Date(0) })
       .run()
-    expect(await connections.callback(cancel)).toEqual({ kind: 'expired' })
+    expect(await connections.callback(cancel)).toEqual(page)
   },
 )
 
@@ -999,7 +1003,7 @@ test('narrow consent explains the shared services and widens only OAuth for a su
     kind: 'shared-services-missing',
     services: ['google-calendar'],
     retry:
-      'Run kurumi account connect --services gmail google-calendar --agent-group-id work to retry.',
+      'Run kurumi account connect --services gmail google-calendar --agent-group-id work to retry. This also grants google-calendar to work.',
   })
   expect(db.select().from(accountGrant).all()).toEqual(before)
   expect(db.select().from(account).get()).toEqual(held)
@@ -1287,12 +1291,17 @@ test('the sweep expires open and authorizing requests atomically, clears verifie
   const pending = create()
   const late = callbackUrl(pending)
   const live = create()
+  const completed = create()
+  db.update(connectionRequest)
+    .set({ state: 'completed' })
+    .where(eq(connectionRequest.id, completed))
+    .run()
   const terminal = create()
   db.update(connectionRequest)
     .set({ state: 'cancelled' })
     .where(eq(connectionRequest.id, terminal))
     .run()
-  for (const id of [requestId, pending, terminal])
+  for (const id of [requestId, pending, terminal, completed])
     db.update(connectionRequest)
       .set({ expiresAt: new Date(0) })
       .where(eq(connectionRequest.id, id))
@@ -1311,6 +1320,9 @@ test('the sweep expires open and authorizing requests atomically, clears verifie
   expect(
     db.select().from(connectionRequest).where(eq(connectionRequest.id, terminal)).get()?.state,
   ).toBe('cancelled')
+  expect(
+    db.select().from(connectionRequest).where(eq(connectionRequest.id, completed)).get()?.state,
+  ).toBe('completed')
   expect(JSON.parse(proof.cards()[1]!.content)).toMatchObject({
     ref: requestId,
     title: '期限切れです。もう一度頼んでください',
@@ -1320,7 +1332,10 @@ test('the sweep expires open and authorizing requests atomically, clears verifie
   expect(proof.notices()).toEqual([])
   expect(proof.resumed).toEqual([])
   const before = db.select().from(connectionRequest).all()
-  expect(await connections.callback(late)).toEqual({ kind: 'expired' })
+  expect(await connections.callback(late)).toEqual({
+    kind: 'expired',
+    retry: 'Run kurumi account connect again.',
+  })
   expect(db.select().from(connectionRequest).all()).toEqual(before)
   expect(db.select().from(accountGrant).all()).toEqual([])
   expect(connections.expireRequests().count).toBe(0)
@@ -1348,6 +1363,7 @@ test('a failed expiry replacement rolls the whole sweep back', async () => {
 
 test('reuse offers only active accounts covering every service and missing a requested group grant, then completes without OAuth', async () => {
   const proof = withCards({
+    canGrant: (who) => who.kind === 'human' && who.userId === 'owner',
     canApprove: (who) => who.kind === 'human' && who.userId === 'owner',
     fetch: Object.assign(
       async () => {
@@ -1491,4 +1507,58 @@ test('reuse completion rolls back grants and state when card replacement fails',
   )
   expect(db.select().from(accountGrant).all()).toEqual([])
   expect(db.select().from(connectionRequest).get()?.state).toBe('open')
+})
+
+test('a scoped admin cannot reuse an account another group connected', async () => {
+  const proof = withCards({
+    canApprove: (who, group) => who.kind === 'human' && who.userId === 'alice' && group === 'home',
+  })
+  insertAgentGroup(db, 'home')
+  insertAccount(db, {
+    id: 'bob-mail',
+    vendor: 'google',
+    label: '<test-account>',
+    services: ['gmail'],
+  })
+  transaction(db, (tx) =>
+    createAccountLedger({ db, vaultKey }).grant(tx, {
+      accountId: 'bob-mail',
+      agentGroupId: 'work',
+      service: 'gmail',
+      grantedBy: 'human:bob',
+    }),
+  )
+  const { requestId } = await connections.connectAgent(
+    { services: ['gmail'] },
+    { kind: 'agent', agentGroupId: 'home', sessionId: 'ses-home' },
+  )
+  expect(JSON.parse(proof.cards()[0]!.content).buttons).toContainEqual({
+    action: 'use:bob-mail',
+    label: 'google/<test-account> を使う',
+  })
+  const requests = db.select().from(connectionRequest).all()
+  const grants = db.select().from(accountGrant).all()
+  expect(
+    connections.press(
+      { ref: requestId, action: 'use:bob-mail' },
+      { kind: 'human', userId: 'alice' },
+    ),
+  ).toEqual({ kind: 'notice', text: 'owner だけが既存のアカウントを付与できます' })
+  expect(db.select().from(connectionRequest).all()).toEqual(requests)
+  expect(db.select().from(accountGrant).all()).toEqual(grants)
+  expect(db.select().from(connectLink).all()).toEqual([])
+  expect(proof.cards()).toHaveLength(1)
+  expect(proof.notices()).toEqual([])
+  expect(proof.resumed).toEqual([])
+})
+
+test('a completed callback still shows success after its TTL without exchanging again', async () => {
+  const endpoint = tokenEndpoint(() => Response.json(tokenFull))
+  const url = callbackUrl()
+  const page = await connections.callback(url)
+  expect(page.kind).toBe('completed')
+  setSystemTime(Date.now() + 31 * 60_000)
+  expect(await connections.callback(url)).toEqual(page)
+  expect(endpoint.exchanges()).toBe(1)
+  expect(db.select().from(connectionRequest).get()?.state).toBe('completed')
 })

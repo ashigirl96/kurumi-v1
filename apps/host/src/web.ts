@@ -18,9 +18,9 @@ export function startWeb(
           result.kind === 'completed'
             ? `Connected. Granted: ${result.granted.join(', ') || 'none'}.${result.missing.length ? ` Not granted: ${result.missing.join(', ')}.` : ''} You can close this tab.`
             : result.kind === 'shared-services-missing'
-              ? `Consent must also include: ${result.services.join(', ')}. The next consent will ask for these services; they stay granted only to the groups that already hold them. ${result.retry} Select all requested services.`
+              ? `Consent must also include: ${result.services.join(', ')}. ${result.retry} Select all requested services.`
               : result.kind === 'expired'
-                ? 'This request expired. Ask again to connect.'
+                ? `This request expired. ${result.retry}`
                 : result.kind === 'cancelled'
                   ? 'Google consent was cancelled. Run account connect again.'
                   : result.kind === 'nothing-granted'

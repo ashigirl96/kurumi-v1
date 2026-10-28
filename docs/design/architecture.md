@@ -76,7 +76,7 @@ curl https://gmail.googleapis.com/gmail/v1/users/me/profile
 # → 403 {"error":"account_not_granted","service":"gmail","named":"google/alice@work.example","granted":[…]}
 
 # service 自体の付与が無い。404 でないのは、Claude Code が 404 の本文を捨てて agent に next が届かないため
-# → 403 {"error":"account_not_connected","service":"notion","next":"call connect_account with services=[\"notion\"]"}
+# → 403 {"error":"account_not_connected","service":"gmail","next":"no account is granted gmail for this agent group; call mcp__kurumi__connect_account with services=[\"gmail\"]"}
 
 # credential の場所に kurumi の語はあるが selector として読めない
 # → 400 {"error":"selector_unreadable","service":"gmail","written":"…","accepted":["kurumi:google/alice@work.example",…]}
@@ -404,8 +404,8 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 - Implementation reconciliation P3-4: 狭い再同意は account の services を置き換え、覆わない grant を削除する。P3-6 以降は別 group の grant が消える同意を拒む。sketch の union はしない。
 - Implementation reconciliation P3-4: 完了後の再読込用に `oauthState` を残し、verifier だけを消す。sketch は両方を消す。
 - Implementation reconciliation P3-4: OAuth material は access token、nullable refresh token、granted scopes を持ち、期限は `accessExpiresAt`。
-- Implementation reconciliation P3-4: 旧 `google-consent.ts` とその tsc 検査の記述を修正した。script は P3-5 で削除済み。
-- Implementation reconciliation P3-4: P3-5 の perf 条件 2 は「refresh による増分が Google の refresh 時間 +100 ms 以内」とした。同時実行数を揃えて fresh と refreshed を比べる。Gmail 自体の約 300 ms を含める元の条件は成立しないため、root が了承した。
+- Implementation reconciliation P3-5: 旧 `google-consent.ts` とその tsc 検査の記述を修正した。script は P3-5 で削除済み。
+- Implementation reconciliation P3-5: P3-5 の perf 条件 2 は「refresh による増分が Google の refresh 時間 +100 ms 以内」とした。同時実行数を揃えて fresh と refreshed を比べる。Gmail 自体の約 300 ms を含める元の条件は成立しないため、root が了承した。
 - Implementation reconciliation P3-5: `credentialFor` は async で、`credentialInject` が await する。
 - Implementation reconciliation P3-5: `account_needs_reauth` は `agentGroupId` と account 全 services を持つ。P3-5 の CLI command の案内は P3-8 で `mcp__kurumi__connect_account` の案内に変えた。
 - Implementation reconciliation P3-5: network、timeout、5xx の refresh 失敗は retryable な 503 `account_refresh_failed`。`unexpected_response` 以外の OAuth 4xx と Google client 不在は `needs_reauth`。
@@ -428,10 +428,10 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 - Implementation reconciliation P3-7: `sessions.notify` は `queueNotice(tx)` と `deliverNotice` に分かれ、wrapper も残す。system inbound `ntf-<key>` と visible outbound `ntf-visible-<key>` を caller の transaction で保存する。`session.notify` を log に残し、system 行の `session.inbound.received` は container が claim した時点。
 - Implementation reconciliation P3-7: host の outbound は起動、routed inbound、post ごとに seq 順で再配達する。置換済み card は飛ばす。
 - Implementation reconciliation P3-7: `access_denied` は card を「接続をキャンセルしました」に変え、agent に承認者がキャンセルしたので依頼なしに再試行しないよう通知する。他の失敗は card を残す。
-- Implementation reconciliation P3-8: 期限切れは connections の 1 transaction で open/authorizing を expired にし、verifier を消して card を置換する。commit 後に配達し、agent への通知はしない。host 起動時と 60 秒ごとの local timer で実行し、件数と所要時間を log に残す。
-- Implementation reconciliation P3-8: 既存 account の button は `use:<accountId>`。active な Google account が要求 service 全部を覆い、group にその全てが付与済みでない場合に表示する。press は ref と承認者と coverage を再確認し、共通の complete を transaction 内、配達を commit 後に行う。返答は link を含まない notice。
-- Implementation reconciliation P3-8: 期限切れの callback は期限切れと再依頼を案内し、何も書き込まない。不明な state は従来の generic page。card の無い CLI request の shared-services-missing は、要求分と不足分を含む `kurumi account connect --services <services> --agent-group-id <group>` を案内する。
-- Implementation reconciliation P3-8: account_not_connected と account_needs_reauth は model に見える tool 名 `mcp__kurumi__connect_account` と service 配列を案内する。接続 tool 自体は Google 専用のまま。
+- Implementation reconciliation P3-8: 期限切れは connections の 1 transaction で open/authorizing を expired にし、verifier を消して card を置換する。commit 後に配達し、agent への通知はしない。host 起動時と 60 秒ごとの local timer で実行し、件数と所要時間を log に残す。timer の失敗は log に残して次回を待ち、起動時の失敗は起動を拒む。
+- Implementation reconciliation P3-8: 既存 account の button は `use:<accountId>`。active な Google account が要求 service 全部を覆い、group にその全てが付与済みでない場合に表示する。press は ref、承認者、owner の付与権限、coverage を再確認し、共通の complete を transaction 内、配達を commit 後に行う。返答は link を含まない notice。
+- Implementation reconciliation P3-8: 期限切れの callback は期限切れと再依頼を案内し、何も書き込まない。不明な state は従来の generic page。card の無い CLI request の shared-services-missing は、要求分と不足分を含む `kurumi account connect --services <services> --agent-group-id <group>` と、不足分もこの group に付与されることを案内する。完了・キャンセル済みの callback は期限後も元の結果を表示する。
+- Implementation reconciliation P3-8: account_not_connected と account_needs_reauth は model に見える tool 名 `mcp__kurumi__connect_account` と service 配列を案内する。この案内は catalog 上の Google service に限り、key vendor は add-key または同じ handle の再追加を案内する。再認可は拒否された service だけを要求し、既存 account の同意範囲は oauthServices で広げる。
 
 ## ユーザーが決めたこと（2026-10-22）
 

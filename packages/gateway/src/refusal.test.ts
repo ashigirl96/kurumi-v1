@@ -1,8 +1,19 @@
 import { expect, test } from 'bun:test'
+import { randomBytes } from 'node:crypto'
 
-import { accountHandle } from '@kurumi/account/server'
+import { ConnectInputSchema } from '@kurumi/account/contract'
+import { account, accountGrant, connectionRequest } from '@kurumi/account/schema'
+import { accountHandle, createAccountLedger } from '@kurumi/account/server'
+import { inMemoryDb, insertAgentGroup, tokenGmailOnly } from '@kurumi/account/testing'
+import { eq } from 'drizzle-orm'
 
-import { REFUSAL_STATUS, refusalHttp, refusalResponse, type GatewayRefusal } from './refusal.ts'
+import {
+  REFUSAL_STATUS,
+  refusalHttp,
+  refusalResponse,
+  nextStep,
+  type GatewayRefusal,
+} from './refusal.ts'
 
 const main = accountHandle('anthropic', 'main')
 const nonAscii = accountHandle('anthropic', '日本')
@@ -90,7 +101,7 @@ test('the body names the refusal as error, keeps its fields and says what to do 
 test.each([
   [
     { code: 'account_not_connected', service: 'anthropic-api' },
-    'no account is granted anthropic-api for this agent group; call mcp__kurumi__connect_account with services=["anthropic-api"]',
+    'no account is granted anthropic-api for this agent group; ask the owner to add one with kurumi account add-key and grant it',
   ],
   [
     { code: 'account_not_granted', service: 'gmail', named: 'google/x', granted: [] },
@@ -134,7 +145,7 @@ test.each([
       agentGroupId: 'g1',
       services: ['anthropic-api'],
     },
-    'reconnect anthropic/main: call mcp__kurumi__connect_account with services=["anthropic-api"]',
+    'ask the owner to add anthropic/main again',
   ],
   [
     { code: 'duplicate_slot', service: 'anthropic-api', header: 'authorization' },
@@ -184,7 +195,7 @@ test('the raw form is the same response as HTTP/1.1 bytes', () => {
   expect(raw.slice(raw.indexOf('\r\n\r\n') + 4)).toBe(body)
 })
 
-test('Google reauthorization names the connect tool and every account service', () => {
+test('Google reauthorization names the connect tool and only the refused service', () => {
   const response = refusalResponse({
     code: 'account_needs_reauth',
     service: 'gmail',
@@ -194,7 +205,7 @@ test('Google reauthorization names the connect tool and every account service', 
   })
   expect(response.status).toBe(403)
   expect(JSON.parse(response.body).next).toContain(
-    'call mcp__kurumi__connect_account with services=["gmail","google-calendar"]',
+    'call mcp__kurumi__connect_account with services=["gmail"]',
   )
 })
 
@@ -209,4 +220,88 @@ test('an unconnected Google service directs the agent to its connect tool', () =
   expect(JSON.parse(body).next).toBe(
     'no account is granted gmail for this agent group; call mcp__kurumi__connect_account with services=["gmail"]',
   )
+})
+
+test.each(['notion', 'github'] as const)(
+  '%s keeps the add-key next step while connect_account is Google-only',
+  (service) => {
+    expect(nextStep({ code: 'account_not_connected', service })).toBe(
+      `no account is granted ${service} for this agent group; ask the owner to add one with kurumi account add-key and grant it`,
+    )
+  },
+)
+
+test('following the reauth next step widens consent without granting another service to the group', async () => {
+  const db = inMemoryDb()
+  const caller = { kind: 'host' } as const
+  insertAgentGroup(db, 'work')
+  const ledger = createAccountLedger({
+    db,
+    vaultKey: randomBytes(32),
+    fetch: Object.assign(
+      async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+        new URLSearchParams(await new Request(_url, init).text()).get('grant_type') ===
+        'refresh_token'
+          ? Response.json({ error: 'invalid_grant' }, { status: 400 })
+          : Response.json({
+              ...tokenGmailOnly,
+              scope: `${tokenGmailOnly.scope} https://www.googleapis.com/auth/calendar`,
+              expires_in: 30,
+            }),
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  const connections = ledger.connections
+  connections.setClient({ clientId: 'fixture', clientSecret: 'fixture' })
+  const authorize = (id: string) => {
+    const opened = connections.openLink(connections.issueLink(id, caller))
+    if (opened.kind !== 'authorize') throw new Error('missing authorize URL')
+    return opened.url
+  }
+  const callback = (opened: URL) =>
+    connections.callback(
+      new URL(
+        `http://127.0.0.1/oauth/callback?state=${opened.searchParams.get('state')}&code=fixture`,
+      ),
+    )
+  try {
+    await callback(
+      authorize(connections.createRequest({ agentGroupId: 'work', services: ['gmail'] }, caller)),
+    )
+    const held = db.select().from(account).get()!
+    expect(held.services).toEqual(['gmail', 'google-calendar'])
+    const decision = await ledger.credentialFor(
+      { agentGroupId: 'work' },
+      {
+        host: 'gmail.googleapis.com',
+        path: '/gmail/v1/users/me/profile',
+        method: 'GET',
+        headers: new Headers(),
+        rawHeaders: [],
+      },
+    )
+    if (decision.kind !== 'refuse') throw new Error('expected a reauth refusal')
+    expect(decision.refusal.code).toBe('account_needs_reauth')
+    const next = nextStep(decision.refusal)
+    const services = ConnectInputSchema.shape.services.parse(
+      JSON.parse(next.split('services=')[1]!),
+    )
+    expect(services).toEqual(['gmail'])
+    const id = connections.createRequest({ services, agentGroupId: 'work' }, caller)
+    expect(
+      db.select().from(connectionRequest).where(eq(connectionRequest.id, id)).get()?.oauthServices,
+    ).toEqual(['gmail', 'google-calendar'])
+    const opened = authorize(id)
+    expect(opened.searchParams.get('scope')).toContain('https://www.googleapis.com/auth/calendar')
+    expect((await callback(opened)).kind).toBe('completed')
+    expect(
+      db
+        .select()
+        .from(accountGrant)
+        .all()
+        .map((row) => row.service),
+    ).toEqual(['gmail'])
+  } finally {
+    db.$client.close()
+  }
 })

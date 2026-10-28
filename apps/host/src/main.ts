@@ -268,6 +268,7 @@ export async function startHost(config: HostConfig) {
       log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
       canApprove: (caller, group) =>
         accessLedger.isApprover(caller, accessLedger.approverChain(group)),
+      canGrant: (caller) => accessLedger.isOwner(caller),
     })
     const agentLedger = createAgentLedger({
       db,
@@ -420,7 +421,15 @@ export async function startHost(config: HostConfig) {
     }
     await started
     accountLedger.connections.expireRequests()
-    connectionExpiry = setInterval(() => accountLedger.connections.expireRequests(), 60_000)
+    connectionExpiry = setInterval(() => {
+      try {
+        accountLedger.connections.expireRequests()
+      } catch (error) {
+        process.stderr.write(
+          `${JSON.stringify({ kind: 'account.connect.expiry_failed', message: error instanceof Error ? error.message : String(error) })}\n`,
+        )
+      }
+    }, 60_000)
     process.stdout.write(
       `${JSON.stringify({ kind: 'host.runtime', install, agentPort: config.agentPort.port, image: environment.KURUMI_AGENT_IMAGE })}\n`,
     )
