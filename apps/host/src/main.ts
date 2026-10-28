@@ -140,9 +140,11 @@ export async function startHost(config: HostConfig) {
   let egressLog: EgressLog | undefined
   let socketOwned = false
   let stopped: Promise<void> | undefined
+  let connectionExpiry: ReturnType<typeof setInterval> | undefined
   const socket = join(config.home, 'kurumi.sock')
   function stop(): Promise<void> {
     stopped ??= (async () => {
+      clearInterval(connectionExpiry)
       chat?.stop()
       const results = await Promise.allSettled([
         sessions?.stop(),
@@ -174,6 +176,7 @@ export async function startHost(config: HostConfig) {
         KURUMI_DOCKER_NETWORK: z.string().min(1).default('bridge'),
         KURUMI_STALE_AFTER_MS: milliseconds.min(30_000).default(1_800_000),
         KURUMI_RECONCILE_INTERVAL_MS: milliseconds.min(100).optional(),
+        KURUMI_CONNECT_REQUEST_TTL_MS: milliseconds.min(60_000).default(1_800_000),
       })
       .parse(process.env)
     const staleAfterMs = environment.KURUMI_STALE_AFTER_MS
@@ -254,6 +257,7 @@ export async function startHost(config: HostConfig) {
       db,
       vaultKey,
       webPort: config.web.port,
+      requestTtlMs: environment.KURUMI_CONNECT_REQUEST_TTL_MS,
       cards: {
         post: (tx, sessionId, card) => sessionLedger.postCard(tx, sessionId, card),
         replace: (tx, id, card) => sessionLedger.replaceCard(tx, id, card),
@@ -264,6 +268,7 @@ export async function startHost(config: HostConfig) {
       log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
       canApprove: (caller, group) =>
         accessLedger.isApprover(caller, accessLedger.approverChain(group)),
+      canGrant: (caller) => accessLedger.isOwner(caller),
     })
     const agentLedger = createAgentLedger({
       db,
@@ -415,6 +420,16 @@ export async function startHost(config: HostConfig) {
       process.umask(umask)
     }
     await started
+    accountLedger.connections.expireRequests()
+    connectionExpiry = setInterval(() => {
+      try {
+        accountLedger.connections.expireRequests()
+      } catch (error) {
+        process.stderr.write(
+          `${JSON.stringify({ kind: 'account.connect.expiry_failed', message: error instanceof Error ? error.message : String(error) })}\n`,
+        )
+      }
+    }, 60_000)
     process.stdout.write(
       `${JSON.stringify({ kind: 'host.runtime', install, agentPort: config.agentPort.port, image: environment.KURUMI_AGENT_IMAGE })}\n`,
     )

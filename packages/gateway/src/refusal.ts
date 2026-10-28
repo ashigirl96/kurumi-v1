@@ -47,7 +47,7 @@ const askToAdd = 'ask the owner to add one with kurumi account add-key and grant
 export function nextStep(refusal: GatewayRefusal): string {
   switch (refusal.code) {
     case 'account_not_connected':
-      return `no account is granted ${refusal.service} for this agent group; ${askToAdd}`
+      return `no account is granted ${refusal.service} for this agent group; ${vendorOf(refusal.service) === 'google' ? `call mcp__kurumi__connect_account with services=${JSON.stringify([refusal.service])}` : askToAdd}`
     case 'account_ambiguous':
       return `name one of ${refusal.granted.join(', ')}: put kurumi:<handle> where the token goes, or ask the owner to set a default`
     case 'account_not_granted':
@@ -56,7 +56,7 @@ export function nextStep(refusal: GatewayRefusal): string {
         : `${refusal.named} is not granted ${refusal.service} for this agent group, and no account is; ${askToAdd}`
     case 'account_needs_reauth':
       return vendorOf(refusal.service) === 'google'
-        ? `ask the owner to reconnect ${refusal.handle}: kurumi account connect --services ${refusal.services.join(' ')} --agent-group-id ${refusal.agentGroupId}`
+        ? `reconnect ${refusal.handle}: call mcp__kurumi__connect_account with services=${JSON.stringify([refusal.service])}`
         : `ask the owner to add ${refusal.handle} again`
     case 'account_refresh_failed':
       return `could not refresh ${refusal.handle}; try again shortly`

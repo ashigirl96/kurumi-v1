@@ -47,7 +47,7 @@ card   [Notion] この agent（work）に Notion アカウントをつなぎま�
          (既に別 group でつないだ Notion があれば) [Workspace X を使う]
 … 承認者（group の admin か owner）がボタンを押す …
 （押した人にだけ）Slack: ephemeral の「Notion の同意画面を開く」リンク / Console: そのまま遷移
-         ← https://kurumi.example.ts.net/connect/<token>（5 分、1 回限り）
+         ← http://127.0.0.1:<port>/connect/<token>（5 分、1 回限り）
 … 承認者でない人が押すと、その人にだけ「この group の承認者だけが接続できます」…
 … OAuth が終わる …
 card   ✅ notion/Workspace X を work につなぎました（notion）
@@ -76,7 +76,7 @@ curl https://gmail.googleapis.com/gmail/v1/users/me/profile
 # → 403 {"error":"account_not_granted","service":"gmail","named":"google/alice@work.example","granted":[…]}
 
 # service 自体の付与が無い。404 でないのは、Claude Code が 404 の本文を捨てて agent に next が届かないため
-# → 403 {"error":"account_not_connected","service":"notion","next":"call connect_account with services=[\"notion\"]"}
+# → 403 {"error":"account_not_connected","service":"gmail","next":"no account is granted gmail for this agent group; call mcp__kurumi__connect_account with services=[\"gmail\"]"}
 
 # credential の場所に kurumi の語はあるが selector として読めない
 # → 400 {"error":"selector_unreadable","service":"gmail","written":"…","accepted":["kurumi:google/alice@work.example",…]}
@@ -159,7 +159,7 @@ pending-connection の状態を持つのは account domain の `connection_reque
 - 使用済みの link や 5 分を過ぎた link は「もう一度ボタンを押して」のページになる。
 - callback を再読込すると、`completed` の行を見て同じ成功ページを返す。OAuth の code は使わない。
 - 2 つのタブで別々に認可した場合は、exchange を transaction の外で行い、transaction の中で行が `authorizing` のままか見直す。後から来た方は token を捨てて現在の状態を表示する。
-- 期限切れ（30 分）は system Job がカードを「期限切れ、もう一度頼んで」に書き換える。
+- 期限切れ（既定 30 分）は host 起動時と 60 秒ごとの sweep がカードを「期限切れです。もう一度頼んでください」に書き換える。`KURUMI_CONNECT_REQUEST_TTL_MS` で 60000 ms 以上の整数を指定できる。定期実行は job package（#28）ができるまで local timer を使う。
 - host が再起動しても、request、state、verifier（vault で暗号化）、link、カードの outbound id は DB にあるので、再起動後の callback はそのまま完了する。
 
 完了の transaction は、account の upsert（`services` の更新を含む）、要求された service のうちアカウントが持つものの grant、request の `completed`、`sessions.replaceCard`（カードを「✅ つなぎました」に）、`sessions.notifySession`（trigger 付きの system message）を 1 つにまとめる。`sessions` は host が session ledger から作って account に渡す関数で、account は session の server entry を import しない（judge の指摘への対処。monica ADR-0013 の形）。notify が container を起こすか、動いている container の pull を即座に返すので、agent はユーザーが頼み直さなくても続きを始める。gateway は grant を毎回 DB から引くので、OneCLI の 60 秒 cache と invalidate の取りこぼしは起きない。
@@ -342,9 +342,9 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 - P02 `catalog.ts`: `identityScopes` は `VendorSpec` でなく `OAuthSpec` に置いた。key で接続する vendor には identity が無いため。`identify` は sketch の `async (accessToken, tokenResponse: unknown)` でなく、解析済みの `TokenResponse` を取る同期関数にした。Google は `id_token` だけで足り、Notion のように応答の別の field で名前が決まる vendor は、その PR で `TokenResponse` を広げる。`TokenResponse`、`Identity`、`IdentifyError` は `OAuthSpec` の型が要るので `catalog.ts` に置く（`oauth.ts` が `catalog.ts` を import するので、逆にすると循環する）。Notion の `identify` は、まだ誰も呼ばないので「未対応」を投げる。
 - P02 `oauth.ts`: `OAuthVendorId` は `'google'` だけにした。token の解析は `expires_in` を必須とし、client の渡し方は form の body 固定で、Notion の応答（`expires_in` が無い）と token endpoint（Basic 認証）に合わない。Notion を足す PR が `OAuthSpec` に client の認証方式を持たせて広げる。
 - P02 `oauth.ts`: `authorizeUrl` は `mergesEarlierGrant: false` で、catalog の `include_granted_scopes` を外せる。製品の接続は常に付ける。script の `--services` が前の同意と混ざらない新しい同意を取り、`--add` が混ぜた同意を取るために使う。
-- P02 `tsconfig.json`: `include` に `packages/*/scripts` を足した。足す前は `bun run check` が `packages/account/scripts/google-consent.ts` の型を見なかった（oxlint は見た）。今は `tsc` がこの script を検査する。script は P14 で消える。
+- P02 `tsconfig.json`: `include` に `packages/*/scripts` を足した。足す前は `bun run check` が `packages/account/scripts/google-consent.ts` の型を見なかった（oxlint は見た）。P3-5 でこの script を削除した。`include` は package 内の script を引き続き検査する。
 - P02 `fixtures/google/`: JSON でなく `.ts` にした。unsigned の JWT を文字列で commit すると、CI の gitleaks の `jwt` rule が検知するため。`id_token` は読み込むときに claims から組み立てる。
-- P02 `google-consent.ts` の `--revoke`: 同じ実行で得た最初の refresh token を 1 本だけ取り消し、その run の refresh token すべてについて、refresh が `invalid_grant` になることを確かめる。Google は 1 本の revoke でそのアカウントと client の grant 全体を終わらせ、同じ grant の別の refresh token の revoke は 400 になるため、2 本目以降は revoke せず refresh で確かめる。token は file にも画面にも出さないので、別の実行へ渡せない。計画の lane 10 の「8 日後の確認に使う 1 本」は、この script では残せない。
+- P02 `google-consent.ts`（P3-5 で削除）の `--revoke` で確かめたこと: 同じ実行で得た最初の refresh token を 1 本だけ取り消し、その run の refresh token すべてについて、refresh が `invalid_grant` になることを確かめる。Google は 1 本の revoke でそのアカウントと client の grant 全体を終わらせ、同じ grant の別の refresh token の revoke は 400 になるため、2 本目以降は revoke せず refresh で確かめる。token は file にも画面にも出さないので、別の実行へ渡せない。計画の lane 10 の「8 日後の確認に使う 1 本」は、この script では残せない。
 - P03 `account/server.ts`: `candidates(agentGroupId, service)` は第 1 引数の `tx` を持たない。1 本の prepared statement は接続に結びつき、`tx` を渡しても使われないため。gateway の `credentialFor` も transaction の外で live に引く。`createAccountLedger` が受けるのは `{ db }` だけで、`vaultKey` などは P11 以降で足す。`createAccountLedger` は作るときに query を prepare するので、`migrateAll` を先に走らせてから ledger を作る。table が無いうちに作ると `no such table: account_grant` で throw する。
 - P03 `account/server.ts`: `grant` は throw せず `{ ok: true }` か `{ ok: false, refusal }`（`agent_group_not_found`、`account_not_found`、`service_not_covered`）を返し、`setDefault` は `grant_not_found` を返す。拒否は caller が RPC の error に写す普通の結果で、throw にすると caller の transaction まで rollback するため。`grant`、`revoke`、`setDefault` はどれも 2 回呼んでも同じ状態になる。`revoke` は、その grant に載っていた default も外す（`default_account` から grant への foreign key の cascade）。`candidates` は label の順に返す。
 - P03 `account/package.json`: `./testing` も export する。`.oxlintrc.json` の entry の一覧に `testing` があり、`scripts/oxlint/entry-boundaries.test.ts` が export の無い `testing.ts` を内側の module と数えるため。使えるのは `testing-entry` の rule が許す test と `testing.ts` だけ。
@@ -383,6 +383,55 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 - P09 `apps/host/src/main.ts`: image and network settings are parsed here because `config.ts` is outside the Files box. `KURUMI_AGENT_IMAGE` selects the agent image, `KURUMI_PROBE_IMAGE` can select a missing tag and later recover when that tag is loaded, and `KURUMI_DOCKER_NETWORK` applies to both. The install label is the first 24 hex digits of SHA-256 of the canonical home path. The host uses the root's existing gateway dependency. The runner bundle is mounted read-only from the home, and the image includes curl for verification.
 - P09 timing: `session.inbound.received` and `session.outbound.delivered` are JSON records with `inboundId` and `monotonicMs`. Delivery means acceptance by the terminal adapter, not arrival at the CLI. The CLI is outside the Files box, so the perf lane must timestamp its observed terminal output to measure the requested end-to-end round trip. EOF retains P08's receipt-only exit behavior; keep stdin open while observing replies.
 - P2-5 `gateway/egress-log.ts`: `egress_log` は intercept する host への request をすべて 1 行ずつ残す。`decision` は `injected`（account と service）、`passed`（path がどの service にも当たらない）、`refused`（`refusal` に code、分かれば service）のどれか。passthrough の CONNECT は、宛先が public でないと拒否したものだけを `method` `CONNECT`、`path` に CONNECT の宛先で残し、通した tunnel は残さない。tunnel の中は TLS のままで method も path も見えないため。行は response が閉じたときに書くので、`status` は client が受け取った status で、応答の前に切れた request は null になる。`path` は query と fragment を除く。selector や query の slot の key がそこを通るため。secret、selector の値、request の body は保存しない。`injected` の行の service は、`credentialFor` が返した `Injection` の service である。書き込みは 1 秒の batch を 1 transaction で入れ、host の停止時に残りを書く。Agent Port の停止は socket を閉じたあと処理中の request の終わりを最大 2 秒待つので、停止の時点で処理中だった request も行に残る。終わらない DNS 解決や injection を待ち続けると host の終了が止まるため、2 秒で待つのをやめ、その request の行は残さない。30 日より古い行は host の起動時と 1 時間ごとに消す（`job` package ができるまでの timer）。
+
+- Implementation reconciliation P3-2: runner の MCP server は sketch の stdio でなく SDK の `createSdkMcpServer` による in-process server。
+- Implementation reconciliation P3-2: tool の `instructions` は MCP description にだけ入り、group の CLAUDE.md には書かない。
+- Implementation reconciliation P3-2: `toolsOf` は sketch の `{name, instructions, path, inputJsonSchema}` でなく SDK tool を返す。
+- Implementation reconciliation P3-2: runner が列挙した contract だけを走査するため、`meta.tool` があっても列挙しなければ tool にならない。
+- Implementation reconciliation P3-2: model に見える名前は `mcp__kurumi__<name>`。P3-8 の refusal もこの名前を使う。
+- Implementation reconciliation P3-2: image の増分 +1.05 MB は `docker image inspect .Size` で測った。node_modules の on-disk 増分は +8.4 MB。
+- Implementation reconciliation P3-2: 重複 tool 名の検査は起動時でなく最初の turn で行う。CI は `toolsOf(runnerContract)` で実際の重複を検査する。
+- Implementation reconciliation P3-3: `oauth_client` は clientId と clientSecret を 1 つの暗号化 `material` に保存する。
+- Implementation reconciliation P3-3: `connect_link.tokenHash` は BLOB でなく hex TEXT。
+- Implementation reconciliation P3-3: `connection_request` は session FK、`lastError`、`updatedAt` を持たず、origin と完了結果の代わりに ID を保存する。request ID は branded type ではない。
+- Implementation reconciliation P3-3: connections subledger は sketch の flat methods、`accessLedger`、`publicBaseUrl` の代わりに `canApprove` と `webPort` を受ける。
+- Implementation reconciliation P3-3: `mintedFor` と `requestedBy` は userId そのものではなく `human:<userId>`（例 `human:terminal:admin`）を保存する。host caller は `host`。
+- Implementation reconciliation P3-3: 不明・使用済み・期限切れ・終了済みの link は同じ 410 page。sketch の case 別 page は持たない。
+- Implementation reconciliation P3-3: 当初の `createRequest` は無条件 insert だった。P3-6 で同じ service の live request を返し、期限切れを遷移させるようにした。P3-8 はその遷移でも verifier を消してカードを置換する。
+- Implementation reconciliation P3-3: web は OAuth を Mac で行うため 127.0.0.1 に bind する。container は host.docker.internal 経由で届くため、全 route を token か OAuth state で守る。
+- Implementation reconciliation P3-4: 成功 page は handle と group を表示せず、coverage は現在の account から読む。past-due request の generic 410 は P3-8 で期限切れ page に変えた。
+- Implementation reconciliation P3-4: `account list` に `--agent-group-id` は無く、group の付与は `account_grant` で読む。
+- Implementation reconciliation P3-4: 狭い再同意は account の services を置き換え、覆わない grant を削除する。P3-6 以降は別 group の grant が消える同意を拒む。sketch の union はしない。
+- Implementation reconciliation P3-4: 完了後の再読込用に `oauthState` を残し、verifier だけを消す。sketch は両方を消す。
+- Implementation reconciliation P3-4: OAuth material は access token、nullable refresh token、granted scopes を持ち、期限は `accessExpiresAt`。
+- Implementation reconciliation P3-5: 旧 `google-consent.ts` とその tsc 検査の記述を修正した。script は P3-5 で削除済み。
+- Implementation reconciliation P3-5: P3-5 の perf 条件 2 は「refresh による増分が Google の refresh 時間 +100 ms 以内」とした。同時実行数を揃えて fresh と refreshed を比べる。Gmail 自体の約 300 ms を含める元の条件は成立しないため、root が了承した。
+- Implementation reconciliation P3-5: `credentialFor` は async で、`credentialInject` が await する。
+- Implementation reconciliation P3-5: `account_needs_reauth` は `agentGroupId` と account 全 services を持つ。P3-5 の CLI command の案内は P3-8 で `mcp__kurumi__connect_account` の案内に変えた。
+- Implementation reconciliation P3-5: network、timeout、5xx の refresh 失敗は retryable な 503 `account_refresh_failed`。`unexpected_response` 以外の OAuth 4xx と Google client 不在は `needs_reauth`。
+- Implementation reconciliation P3-5: refresh は使った refresh token と client を比較して書き戻す。暗号文は比較しない。別の refresh や再接続が先に完了した場合は現在の fresh token を注入する。
+- Implementation reconciliation P3-5: 注入した OAuth token の upstream 401 は material が変わっていない場合だけ `accessExpiresAt=0` にする。最初の 401 は返し、次の request が refresh する。
+- Implementation reconciliation P3-5: `account.refresh` log に `outcome` と `durationMs` を残す。
+- Implementation reconciliation P3-5: refresh は services と grants を変えない。Google は元の grant の scopes を返す。
+- Implementation reconciliation P3-5: file boundary は `packages/gateway/src/forward.ts` と CLI の account status 表示に広げ、fix-forward 1 では `packages/account/**` と `packages/gateway/src/**` に広げた。
+- Implementation reconciliation P3-6: Card owner は `account.connect` のみ、button は `{ action, label }`、返答は `private-link | notice`。sketch の approval/account/session owner、link button、`none` は無い。
+- Implementation reconciliation P3-6: terminal adapter は card を普通の `reply` の text block に描く。専用の terminal event は無い。
+- Implementation reconciliation P3-6: `sessions.postCard` は caller の transaction で insert し、commit 後に共通の `deliverStored` で配達する。`session.outbound.delivered` は `messageKind` を持つ。停止中の card は `queued` に残る。
+- Implementation reconciliation P3-6: `account.connect` は `own-group` の `connect_account` tool。group と session は agent caller から取り、入力の `agentGroupId` は optional。出力は `{ url } | { kind: card_posted, requestId, reused }`。Google 専用の検査は zod refine から `createRequest` に移し、日本語で対応 service を示す。
+- Implementation reconciliation P3-6: live request を再利用するのは service が等しいときだけ。違う service なら同意中でもキャンセルし、past-due の live row は create transaction で expired にする。
+- Implementation reconciliation P3-6: migration 0004 は同意対象の superset `oauth_services` と承認者 `authorized_by` を足す。`grantedBy` はこの承認者で、再接続時は group の grant の `grantedBy` と `grantedAt` を更新する。
+- Implementation reconciliation P3-6: 別の承認者が link を開くと state と verifier を作り直して `authorizedBy` を変える。同じ承認者は state を再利用する。
+- Implementation reconciliation P3-6: 別 group の grant が消える同意は 409 `shared-services-missing`。不足分を `oauthServices` だけに足し request を open に戻す。要求 group の grant は広げない。P3-4 の削除は要求 group 自身の grant にだけ適用する。
+- Implementation reconciliation P3-6: `kurumi chat press` は notice で exit 1。press は posted card のある live request だけを解決し、card title は `<group> に Google を接続`。
+- Implementation reconciliation P3-7: 共通の完了処理は `connections.complete(tx, requestId, accountId, caller)`。callback は link を開いた承認者を渡す。
+- Implementation reconciliation P3-7: 置換は JSON に `replaces` を持つ outbound card 行。terminal は同じ ref に press 行なしで描き、未配達 card の置換は新規 card として配達する。
+- Implementation reconciliation P3-7: `sessions.notify` は `queueNotice(tx)` と `deliverNotice` に分かれ、wrapper も残す。system inbound `ntf-<key>` と visible outbound `ntf-visible-<key>` を caller の transaction で保存する。`session.notify` を log に残し、system 行の `session.inbound.received` は container が claim した時点。
+- Implementation reconciliation P3-7: host の outbound は起動、routed inbound、post ごとに seq 順で再配達する。置換済み card は飛ばす。
+- Implementation reconciliation P3-7: `access_denied` は card を「接続をキャンセルしました」に変え、agent に承認者がキャンセルしたので依頼なしに再試行しないよう通知する。他の失敗は card を残す。
+- Implementation reconciliation P3-8: 期限切れは connections の 1 transaction で open/authorizing を expired にし、verifier を消して card を置換する。commit 後に配達し、agent への通知はしない。host 起動時と 60 秒ごとの local timer で実行し、件数と所要時間を log に残す。timer の失敗は log に残して次回を待ち、起動時の失敗は起動を拒む。
+- Implementation reconciliation P3-8: 既存 account の button は `use:<accountId>`。active な Google account が要求 service 全部を覆い、group にその全てが付与済みでない場合に表示する。press は ref、承認者、owner の付与権限、coverage を再確認し、共通の complete を transaction 内、配達を commit 後に行う。返答は link を含まない notice。
+- Implementation reconciliation P3-8: 期限切れの callback は期限切れと再依頼を案内し、何も書き込まない。不明な state は従来の generic page。card の無い CLI request の shared-services-missing は、要求分と不足分を含む `kurumi account connect --services <services> --agent-group-id <group>` と、不足分もこの group に付与されることを案内する。完了・キャンセル済みの callback は期限後も元の結果を表示する。
+- Implementation reconciliation P3-8: account_not_connected と account_needs_reauth は model に見える tool 名 `mcp__kurumi__connect_account` と service 配列を案内する。この案内は catalog 上の Google service に限り、key vendor は add-key または同じ handle の再追加を案内する。再認可は拒否された service だけを要求し、既存 account の同意範囲は oauthServices で広げる。
 
 ## ユーザーが決めたこと（2026-10-22）
 
@@ -424,4 +473,4 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 
 ## Next implementation step
 
-unit 5 の approval と Egress Rule の approve を作る。unit 4 は終わり、`kurumi chat` は Agent Port 経由で本物の Claude と話し、proxy した request は account 付きで `egress_log` に残る（`kurumi gateway log`）。次は owner と approval の核に CLI の決定面（`kurumi approval decide`）を足し、approve rule に当たった request を承認まで hold して、承認後の再送を 1 回だけ通す。Console Inbox はまだ無いので、承認は CLI で行う。
+unit 5 の approval と Egress Rule、Google 接続の terminal 経路（P3-1〜P3-8）は実装済み。agent の `mcp__kurumi__connect_account` がカードを出し、承認者の同意か既存 account の利用で grant を保存して session を再開する。期限切れはカードに表示する。次は Slack（#29）で接続ボタンと承認者の操作を確かめ、Console の画面へ進む。定期 sweep は job package（#28）へ移す。

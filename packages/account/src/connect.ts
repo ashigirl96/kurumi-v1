@@ -4,7 +4,7 @@ import { agentGroup } from '@kurumi/agent/schema'
 import type { Caller } from '@kurumi/rpc/contract'
 import { transaction, type Db, type Tx } from '@kurumi/rpc/server'
 import { ORPCError } from '@orpc/server'
-import { and, eq, gt, inArray, lte, ne, notInArray } from 'drizzle-orm'
+import { and, eq, gt, inArray, lte, ne, notInArray, type SQL } from 'drizzle-orm'
 import { z } from 'zod'
 
 import { catalog, IdentifyError, servicesCovered, vendorOf, type ServiceId } from './catalog.ts'
@@ -92,7 +92,9 @@ const approvingCaller = z.union([
 
 export type ConnectionOptions = {
   webPort?: number
+  requestTtlMs?: number
   canApprove?: (caller: Caller, agentGroupId: string) => boolean
+  canGrant?: (caller: Caller) => boolean
   cards?: {
     post(tx: Tx, sessionId: string, card: ConnectionCard): string
     replace(tx: Tx, messageId: string, card: ConnectionCard): string
@@ -110,14 +112,18 @@ export type ConnectionOptions = {
           durationMs: number
         }
       | { kind: 'account.connect.completed'; requestId: string; transactionMs: number }
+      | { kind: 'account.connect.expired'; count: number; durationMs: number }
       | { kind: 'account.connect.failed'; requestId: string; reason: string },
   ) => void
 }
 
+type PressReply = { kind: 'private-link'; url: string } | { kind: 'notice'; text: string }
+
 type OpenLink = { kind: 'authorize'; url: URL } | { kind: 'unavailable' }
 type CallbackPage =
   | { kind: 'completed'; granted: ServiceId[]; missing: ServiceId[] }
-  | { kind: 'shared-services-missing'; services: ServiceId[] }
+  | { kind: 'shared-services-missing'; services: ServiceId[]; retry: string }
+  | { kind: 'expired'; retry: string }
   | { kind: 'cancelled' | 'unavailable' | 'failed' | 'nothing-granted' }
 
 type CallbackResult = { page: CallbackPage; committed: boolean; delivery: ConnectionDelivery }
@@ -131,7 +137,9 @@ export function createConnections({
   db,
   vaultKey,
   webPort = 4001,
+  requestTtlMs = requestTtl,
   canApprove = (caller) => caller.kind === 'host',
+  canGrant = (caller) => caller.kind === 'host',
   cards,
   fetch: fetchImpl = fetch,
   log = () => {},
@@ -164,9 +172,17 @@ export function createConnections({
     return row ? parseConnectionRequest(row) : undefined
   }
   const pageFor = (request: ConnectionRequest | undefined): CallbackPage => {
-    if (!request || request.expiresAt <= new Date()) return { kind: 'unavailable' }
+    if (!request) return { kind: 'unavailable' }
     if (request.state === 'cancelled') return { kind: 'cancelled' }
-    if (request.state !== 'completed') return { kind: 'unavailable' }
+    if (request.state !== 'completed')
+      return request.state === 'expired' || request.expiresAt <= new Date()
+        ? {
+            kind: 'expired',
+            retry: request.cardMessageId
+              ? 'Ask again to connect.'
+              : 'Run kurumi account connect again.',
+          }
+        : { kind: 'unavailable' }
     const held =
       request.accountId === null
         ? undefined
@@ -200,7 +216,50 @@ export function createConnections({
     return { cardMessageId, notice, noticeReceipt }
   }
 
+  function expire(tx: Tx, where: SQL | undefined) {
+    const rows = tx
+      .update(connectionRequest)
+      .set({ state: 'expired', pkceVerifier: null })
+      .where(where)
+      .returning()
+      .all()
+    const replacements = rows.flatMap((request) =>
+      request.cardMessageId && cards
+        ? [
+            cards.replace(tx, request.cardMessageId, {
+              owner: 'account.connect',
+              ref: request.id,
+              title: '期限切れです。もう一度頼んでください',
+              body: '',
+              buttons: [],
+            }),
+          ]
+        : [],
+    )
+    return { count: rows.length, replacements }
+  }
+
+  function deliverExpired(replacements: string[]) {
+    for (const id of replacements) void cards?.deliver(id).catch(() => {})
+  }
+
   const connections = {
+    expireRequests() {
+      const started = performance.now()
+      const result = transaction(db, (tx) =>
+        expire(
+          tx,
+          and(
+            inArray(connectionRequest.state, ['open', 'authorizing']),
+            lte(connectionRequest.expiresAt, new Date()),
+          ),
+        ),
+      )
+      const durationMs = performance.now() - started
+      log({ kind: 'account.connect.expired', count: result.count, durationMs })
+      deliverExpired(result.replacements)
+      return { count: result.count, durationMs }
+    },
     setClient(client: z.infer<typeof GoogleClientSchema>) {
       transaction(db, (tx) => {
         const material = seal(vaultKey, clientAad, JSON.stringify(client))
@@ -239,7 +298,8 @@ export function createConnections({
       const services = [...new Set(parsed.services)].toSorted()
       if (caller.kind === 'agent' && !cards)
         throw new ORPCError('SERVICE_UNAVAILABLE', { message: 'Connect Cards are unavailable' })
-      return transaction(db, (tx) => {
+      const replacements: string[] = []
+      const requestId = transaction(db, (tx) => {
         const group = tx.select().from(agentGroup).where(eq(agentGroup.id, groupId)).get()
         if (!group) throw new ORPCError('NOT_FOUND', { message: 'agent group not found' })
         clientOf()
@@ -251,10 +311,9 @@ export function createConnections({
             eq(connectionRequest.sessionId, caller.sessionId),
             inArray(connectionRequest.state, ['open', 'authorizing']),
           )
-          tx.update(connectionRequest)
-            .set({ state: 'expired' })
-            .where(and(live, lte(connectionRequest.expiresAt, now)))
-            .run()
+          replacements.push(
+            ...expire(tx, and(live, lte(connectionRequest.expiresAt, now))).replacements,
+          )
           const existing = tx.select().from(connectionRequest).where(live).get()
           if (existing) {
             if (JSON.stringify(existing.services.toSorted()) === JSON.stringify(services))
@@ -292,16 +351,39 @@ export function createConnections({
             state: 'open',
             requestedBy,
             createdAt: now,
-            expiresAt: new Date(now.getTime() + requestTtl),
+            expiresAt: new Date(now.getTime() + requestTtlMs),
           })
           .run()
         if (caller.kind === 'agent' && cards) {
+          const granted = tx
+            .select()
+            .from(accountGrant)
+            .where(eq(accountGrant.agentGroupId, groupId))
+            .all()
+          const reusable = tx
+            .select()
+            .from(account)
+            .where(and(eq(account.vendor, 'google'), eq(account.status, 'active')))
+            .all()
+            .filter(
+              (held) =>
+                services.every((service) => held.services.includes(service)) &&
+                !services.every((service) =>
+                  granted.some((row) => row.accountId === held.id && row.service === service),
+                ),
+            )
           const cardMessageId = cards.post(tx, caller.sessionId, {
             owner: 'account.connect',
             ref: id,
             title: `${group.name} に Google を接続`,
             body: `接続するサービス: ${services.join(', ')}`,
-            buttons: [{ action: 'connect', label: '接続する' }],
+            buttons: [
+              { action: 'connect', label: '接続する' },
+              ...reusable.map((held) => ({
+                action: `use:${held.id}`,
+                label: `${held.vendor}/${held.label} を使う`,
+              })),
+            ],
           })
           tx.update(connectionRequest)
             .set({ cardMessageId })
@@ -310,6 +392,8 @@ export function createConnections({
         }
         return id
       })
+      deliverExpired(replacements)
+      return requestId
     },
     async connectAgent(
       input: z.infer<typeof ConnectInputSchema>,
@@ -336,22 +420,64 @@ export function createConnections({
       if (row?.cardMessageId) await cards?.deliver(row.cardMessageId)
       return { kind: 'card_posted' as const, requestId, reused: requestId === existing?.id }
     },
-    press(
-      { ref, action }: { ref: string; action: string },
-      caller: Caller,
-    ): { kind: 'private-link'; url: string } | { kind: 'notice'; text: string } {
-      const row = db.select().from(connectionRequest).where(eq(connectionRequest.id, ref)).get()
-      if (
-        action !== 'connect' ||
-        !row?.cardMessageId ||
-        !['open', 'authorizing'].includes(row.state) ||
-        row.expiresAt <= new Date()
+    press({ ref, action }: { ref: string; action: string }, caller: Caller): PressReply {
+      const started = performance.now()
+      const result = transaction(
+        db,
+        (tx): PressReply | Extract<CompletionResult, { kind: 'completed' }> => {
+          const row = tx.select().from(connectionRequest).where(eq(connectionRequest.id, ref)).get()
+          if (
+            (action !== 'connect' && !action.startsWith('use:')) ||
+            !row?.cardMessageId ||
+            !['open', 'authorizing'].includes(row.state) ||
+            row.expiresAt <= new Date()
+          )
+            return {
+              kind: 'notice',
+              text: 'このカードは利用できません。もう一度接続を頼んでください',
+            }
+          if (caller.kind === 'agent' || !canApprove(caller, row.agentGroupId))
+            return { kind: 'notice', text: 'この group の承認者だけが接続できます' }
+          if (action.startsWith('use:')) {
+            if (!canGrant(caller))
+              return { kind: 'notice', text: 'owner だけが既存のアカウントを付与できます' }
+            const held = tx
+              .select()
+              .from(account)
+              .where(eq(account.id, action.slice(4)))
+              .get()
+            if (
+              !held ||
+              held.vendor !== row.vendor ||
+              held.status !== 'active' ||
+              !row.services.every((service) => held.services.includes(service))
+            )
+              return {
+                kind: 'notice',
+                text: 'このアカウントは利用できません。もう一度接続を頼んでください',
+              }
+            const completion = connections.complete(tx, row.id, held.id, caller)
+            if (completion.kind !== 'completed')
+              return {
+                kind: 'notice',
+                text: 'このカードは利用できません。もう一度接続を頼んでください',
+              }
+            return completion
+          }
+          const token = connections.issueLink(row.id, caller)
+          return { kind: 'private-link', url: `http://127.0.0.1:${webPort}/connect/${token}` }
+        },
       )
-        return { kind: 'notice', text: 'このカードは利用できません。もう一度接続を頼んでください' }
-      if (caller.kind === 'agent' || !canApprove(caller, row.agentGroupId))
-        return { kind: 'notice', text: 'この group の承認者だけが接続できます' }
-      const token = connections.issueLink(row.id, caller)
-      return { kind: 'private-link', url: `http://127.0.0.1:${webPort}/connect/${token}` }
+      if (result.kind === 'completed') {
+        log({
+          kind: 'account.connect.completed',
+          requestId: ref,
+          transactionMs: performance.now() - started,
+        })
+        connections.deliverCompletion(result.delivery)
+        return { kind: 'notice', text: '接続しました' }
+      }
+      return result
     },
     issueLink(requestId: string, caller: Caller): ConnectToken {
       return transaction(db, (tx) => {
@@ -507,8 +633,9 @@ export function createConnections({
       const state = url.searchParams.get('state')
       if (!state || url.searchParams.getAll('state').length !== 1) return { kind: 'unavailable' }
       const request = requestForState(state)
-      if (!request || request.expiresAt <= new Date()) return { kind: 'unavailable' }
-      if (request.state !== 'authorizing') return pageFor(request)
+      if (!request) return { kind: 'unavailable' }
+      if (request.state !== 'authorizing' || request.expiresAt <= new Date())
+        return pageFor(request)
       const callback = readCallback(url, request.oauthState)
       if (callback.kind === 'invalid') return { kind: 'unavailable' }
       if (callback.kind === 'denied' && callback.error === 'access_denied') {
@@ -608,7 +735,13 @@ export function createConnections({
               .where(eq(connectionRequest.id, current.id))
               .run()
             return {
-              page: { kind: 'shared-services-missing', services: missing },
+              page: {
+                kind: 'shared-services-missing',
+                services: missing,
+                retry: current.cardMessageId
+                  ? 'The next consent will ask for these services; they stay granted only to the groups that already hold them. Press the card again to retry.'
+                  : `Run kurumi account connect --services ${[...new Set([...current.services, ...missing])].join(' ')} --agent-group-id ${current.agentGroupId} to retry. This also grants ${missing.join(', ')} to ${current.agentGroupId}.`,
+              },
               committed: false,
               delivery: null,
             }

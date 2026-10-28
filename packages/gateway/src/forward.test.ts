@@ -568,6 +568,20 @@ test('a group with no account is refused with a JSON 403 and nothing goes upstre
   expect(upstream.requests).toEqual([])
 })
 
+test('an unconnected Google service names the connect tool before any upstream request', async () => {
+  const { upstream, tunnel } = await setupCredentials({
+    target: { host: 'gmail.googleapis.com', port: 443 },
+  })
+  const response = await sendTestRequest(tunnel, { path: '/gmail/v1/users/me/profile' })
+  expect(response.status).toBe(403)
+  expect(JSON.parse(response.body)).toEqual({
+    error: 'account_not_connected',
+    service: 'gmail',
+    next: 'no account is granted gmail for this agent group; call mcp__kurumi__connect_account with services=["gmail"]',
+  })
+  expect(upstream.requests).toEqual([])
+})
+
 test('a credential refusal is decided before the upstream host is resolved', async () => {
   let resolved = 0
   const { tunnel } = await setupCredentials({
