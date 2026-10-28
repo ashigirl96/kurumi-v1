@@ -918,6 +918,85 @@ test.each([0, 2])(
   },
 )
 
+test.each([0, 2])(
+  'clean host stop after a startup claim releases it without exhausting %i prior attempts',
+  async (tries) => {
+    await ledger.stop()
+    const docker = fakeDaemon()
+    const cli = docker.daemon
+    const started = Promise.withResolvers<void>()
+    docker.daemon = {
+      start(args, options) {
+        const proc = cli.start(args, options)
+        if (args[0] !== 'start') return proc
+        return {
+          kill: () => proc.kill(),
+          result: proc.result.then(async (result) => {
+            await started.promise
+            return result
+          }),
+        }
+      },
+    }
+    let open = false
+    configured.egress.admission = () =>
+      open
+        ? { open: true }
+        : { open: false, reason: 'probing', detail: 'test gate', since: new Date() }
+    const host = supervisedHost(docker)
+    const input = event('runner claimed before startup returned')
+    try {
+      await host.sessions.start()
+      await host.sessions.routeInbound(input)
+      db.update(inboundMessage).set({ tries }).run()
+      open = true
+      const routed = host.sessions.routeInbound(input)
+      await until(() => docker.commands('start').length === 1)
+      const who = host.sessions.authenticate(tokens(docker)[0] ?? '')
+      if (!who) throw new Error('the starting container token was refused')
+      await host.sessions.channel.pull(who, { waitMs: 0 })
+      expect(db.select().from(container).get()?.status).toBe('starting')
+      expect(db.select().from(inboundMessage).get()).toMatchObject({
+        status: 'processing',
+        tries: tries + 1,
+        claimedBy: who.containerId,
+      })
+      const stopping = host.stop()
+      started.resolve()
+      await Promise.all([routed, stopping])
+      expect(docker.containers.size).toBe(0)
+      expect(db.select().from(container).all()).toEqual([])
+      expect(db.select().from(inboundMessage).get()).toMatchObject({
+        status: 'pending',
+        tries: tries + 1,
+        claimedBy: null,
+      })
+      expect(logs.filter((entry) => entry.kind === 'session.inbound.exhausted')).toEqual([])
+    } finally {
+      started.resolve()
+      await host.stop()
+    }
+    const restarted = supervisedHost(docker)
+    try {
+      await restarted.sessions.start()
+      await until(() => docker.commands('start').length === 2)
+      const healthy = await restarted.sessions.routeInbound(event('healthy queued after restart'))
+      expect((await servedOnce(restarted, tokens(docker)[1] ?? '')).messages[0]?.id).toBe(
+        input.messageId,
+      )
+      expect((await servedOnce(restarted, tokens(docker)[1] ?? '')).messages[0]?.id).toBe(
+        healthy.inboundId,
+      )
+      expect(db.select().from(inboundMessage).orderBy(inboundMessage.seq).all()).toMatchObject([
+        { id: input.messageId, status: 'completed', tries: tries + 2, claimedBy: null },
+        { id: healthy.inboundId, status: 'completed', tries: 1, claimedBy: null },
+      ])
+    } finally {
+      await restarted.stop()
+    }
+  },
+)
+
 test('a removal that gets no answer is killed after the driver timeout instead of hanging', async () => {
   const docker = fakeDaemon()
   docker.add('kurumi-agent-stuck', {
