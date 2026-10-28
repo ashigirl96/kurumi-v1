@@ -139,18 +139,20 @@ test('a line completes and the next one runs while Claude Code is still exiting'
   }
 })
 
-test('a turn that started background work posts the follow-up reply before the next line runs', async () => {
+test('a turn with a background subagent posts only main-agent replies before the next line runs', async () => {
   const host = await startHost()
   sdk.respond = (call) =>
     (async function* () {
       yield { type: 'system', subtype: 'init', session_id: 'ses-bg' }
       if (call.prompt === 'hello') {
         yield { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'bg1' }] }
-        yield sdk.assistant('started')
+        yield { ...sdk.assistant('subagent started'), parent_tool_use_id: 'toolu_bg1' }
+        yield { ...sdk.assistant('started'), parent_tool_use_id: null }
         yield sdk.success('ses-bg')
+        yield { ...sdk.assistant('subagent finished'), parent_tool_use_id: 'toolu_bg1' }
         yield { type: 'system', subtype: 'task_notification', task_id: 'bg1' }
         yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] }
-        yield sdk.assistant('the background command finished')
+        yield { ...sdk.assistant('the background command finished'), parent_tool_use_id: null }
       } else yield sdk.assistant(`answer to ${call.prompt}`)
       yield sdk.success('ses-bg')
     })()
