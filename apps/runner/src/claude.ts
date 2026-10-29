@@ -64,6 +64,7 @@ function options(
       snapshot: false,
     },
     settingSources: [],
+    skills: [],
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
     env: claudeCodeEnv(workspace),
