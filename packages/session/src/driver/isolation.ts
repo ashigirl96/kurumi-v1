@@ -96,7 +96,8 @@ export function createIsolation(options: {
       throw error(`isolation inspect failed: ${exit.stderr}`)
     }
     const data: unknown = JSON.parse(exit.stdout)
-    if (!Array.isArray(data) || data.length !== 1) throw error('invalid isolation inspection')
+    if (!Array.isArray(data) || data.length !== 1 || data[0] === null)
+      throw error('invalid isolation inspection')
     return data[0]
   }
 
@@ -288,7 +289,9 @@ export function createIsolation(options: {
       listed.filter((c) => c.role === 'relay').map((c) => c.name.replace(/-relay$/, '')),
     )
     for (const name of networks.trim().split('\n').filter(Boolean)) {
-      const network = networkSchema.parse(await inspect('network', name))
+      const inspected = await inspect('network', name)
+      if (inspected === null) continue
+      const network = networkSchema.parse(inspected)
       const owner = network.Labels?.['kurumi.owner']
       if (owner && name === networkName(owner) && owned(network.Labels, owner, 'isolation'))
         owners.add(owner)

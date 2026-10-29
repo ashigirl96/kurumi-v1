@@ -312,7 +312,9 @@ test.each([
     }
     const next = createDockerDriver({ ...options, cli })
     try {
-      await expect(next.sweep()).rejects.toThrow(reason)
+      const failure = await next.sweep().then(() => null, String)
+      expect(failure).not.toBeNull()
+      if (reason) expect(failure).toContain(reason)
     } finally {
       await next.stop()
     }
