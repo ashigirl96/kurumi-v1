@@ -389,7 +389,7 @@ opus の runner は、runner に見せない採点基準（rubric）を誤って
 - K01: agent ledger の `prepareWorkspace` は名前、`instructions.prepend.md`、host が渡す `container/CLAUDE.md` の順に本文を合成する。host は自身の module を基点に base doc を読む。base doc に tool の説明は置かない。
 - K01: runner は毎 turn、認証済みの `session.channel.instructions` から現在の本文を読み、SDK の `systemPrompt.append` に渡す。`snapshot: false` で resume 時にも更新し、`settingSources: []` を保つ。workspace の CLAUDE.md や設定を読み込ませる方法は使わない。
 - K01: `kurumi agent update --agent-group-id <id> --persona <text>` は persona file を排他的な一時 file から置換する。名前、session、continuation、account の auto-grant は変えない。persona は Unicode code point で 16000 文字まで。読み取りは最大 64004 byte、`O_NOFOLLOW` と `O_NONBLOCK` を使い、通常 file だけを受け入れる。symlink や読めない persona は省略し、超過分は切り詰める。診断は path と理由、または切り捨てた byte 数 `droppedBytes` だけを記録し、本文は記録しない。
-- K01 の built-in skill filtering は未検証。`skills: []` と `syncClaudeAiSkills: false` の効果は live の fresh session で確かめる必要がある。
+- K01: SDK 0.3.309 では `skills: []` を渡し、model 向けの skill 一覧を空にする。実 SDK の fake upstream と live の fresh session で、`loop` と `schedule` の非表示と `Skill` 呼び出しの allowlist 拒否を確認した。`settings: { syncClaudeAiSkills: false }` だけでは、この 2 つは表示され、呼び出しも受理されたため採用しない。SDK の init metadata の `skills` と `slash_commands` には `skills: []` でも名前が残る。skill の非表示は sandbox ではなく、Cron などの tool を禁止する K03 とは別である。`claude-skills.test.ts` は実 SDK の fresh と resume の両方で model 向け一覧と呼び出し拒否を確かめる。
 - Implementation reconciliation P3-2: `toolsOf` は sketch の `{name, instructions, path, inputJsonSchema}` でなく SDK tool を返す。
 - Implementation reconciliation P3-2: runner が列挙した contract だけを走査するため、`meta.tool` があっても列挙しなければ tool にならない。
 - Implementation reconciliation P3-2: model に見える名前は `mcp__kurumi__<name>`。P3-8 の refusal もこの名前を使う。
