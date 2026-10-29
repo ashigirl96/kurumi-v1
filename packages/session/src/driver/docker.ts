@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs'
 import { nativeCli, outputLimit, type Cli, type CliProcess, type CliResult } from './cli.ts'
 import { createCreation, type Creation } from './create.ts'
 import { createEvents, type InventoryChange } from './events.ts'
+import { createIsolation } from './isolation.ts'
 import { endForeignWaits, listingFormat, parseListing, type ListedContainer } from './listing.ts'
 import { createProbe } from './probe.ts'
 
@@ -13,7 +14,6 @@ export type ContainerSpec = {
   image: string
   env: Record<string, string>
   mounts: { hostPath: string; containerPath: string; readonly: boolean }[]
-  network: { kind: 'default' } | { kind: 'lockdown'; dockerNetwork: string }
   limits: { cpus: number; memoryMb: number; pids: number }
 }
 export type ContainerDriver = {
@@ -24,7 +24,7 @@ export type ContainerDriver = {
 
 export type ContainerInventory = {
   sweep(): Promise<ListedContainer[]>
-  adopt(container: ListedContainer): RunResult
+  adopt(container: ListedContainer): Promise<RunResult>
   remove(container: ListedContainer): Promise<void>
   nameOf(containerId: string): string
   watch(listener: (change: InventoryChange) => void): () => void
@@ -39,6 +39,7 @@ type AgentContainer = {
   address: Address
   ownership: 'uncertain' | 'confirmed' | 'absent'
   phase: 'starting' | 'running' | 'stopping' | 'failed'
+  preparation: Promise<string> | undefined
   create: Creation | undefined
   processes: Set<CliProcess>
   removal: Promise<void> | undefined
@@ -54,7 +55,7 @@ export function createDockerDriver(options: {
   install: string
   revision?: string
   image: string
-  network?: string
+  agentPort: number
   timeoutMs?: number
   cli?: Cli
 }): ContainerDriver &
@@ -64,13 +65,16 @@ export function createDockerDriver(options: {
     detach(): Promise<void>
   } {
   const cli = options.cli ?? nativeCli
-  const revision = options.revision ?? null
   const timeoutMs = options.timeoutMs ?? 10_000
   const { error, settleCreate } = createCreation(options, timeoutMs)
   if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647) {
     throw error('timeoutMs must be a positive integer no greater than 2147483647')
   }
-  const probeDriver = createProbe({ cli, options, timeoutMs, error, settleCreate })
+  if (!Number.isInteger(options.agentPort) || options.agentPort < 1 || options.agentPort > 65535)
+    throw error('agentPort must be an integer between 1 and 65535')
+  const isolation = createIsolation({ ...options, cli, timeoutMs })
+  const revision = isolation.revision(options.revision)
+  const probeDriver = createProbe({ cli, options, timeoutMs, error, settleCreate, isolation })
 
   const agents = new Map<string, AgentOperation>()
   const replacements = new Map<string, AgentOperation>()
@@ -91,6 +95,7 @@ export function createDockerDriver(options: {
     return {
       ...identity,
       address,
+      preparation: undefined,
       create: undefined,
       processes: new Set(),
       removal: undefined,
@@ -151,13 +156,17 @@ export function createDockerDriver(options: {
     const joining = [...agent.processes].map((proc) => proc.result.catch(() => {}))
     agent.removal = Promise.resolve()
       .then(async () => {
+        await agent.preparation?.catch(() => {})
         await Promise.all(joining)
         await agent.create?.result.catch(() => {})
         if (agent.create?.state === 'unconfirmed') throw error('agent create cleanup unconfirmed')
-        let removed = false
+        let removed = agent.ownership === 'absent'
         let removing = false
         try {
-          const exit = await agentCommand(['rm', '--force', agent.address.value], agent)
+          const exit =
+            agent.ownership === 'absent'
+              ? { code: 0, stdout: '', stderr: '' }
+              : await agentCommand(['rm', '--force', agent.address.value], agent)
           removing =
             exit.code !== 0 &&
             /^(?:Error response from daemon: )?removal (?:of container [^\r\n]+ is )?already in progress\s*$/.test(
@@ -190,6 +199,7 @@ export function createDockerDriver(options: {
           }
         }
         agent.ownership = 'absent'
+        await isolation.remove(agent.name)
         if (agents.get(agent.sessionId) === agent) agents.delete(agent.sessionId)
         if (agent.address.by === 'id') residue.delete(agent.address.value)
       })
@@ -235,6 +245,10 @@ export function createDockerDriver(options: {
     try {
       if (agent.cancelled || shutdown.signal.aborted)
         return { ok: false, reason: error('run cancelled').message }
+      agent.preparation = isolation.prepare(agent.name)
+      const network = await agent.preparation
+      if (agent.cancelled || shutdown.signal.aborted) throw error('run cancelled')
+      agent.ownership = 'uncertain'
       const exit = await agentCommand(
         [
           'create',
@@ -248,7 +262,8 @@ export function createDockerDriver(options: {
           'kurumi.role=agent',
           '--label',
           `kurumi.container=${spec.containerId}`,
-          ...(revision === null ? [] : ['--label', `kurumi.revision=${revision}`]),
+          '--label',
+          `kurumi.revision=${revision}`,
           '--init',
           '--cap-drop=ALL',
           '--security-opt',
@@ -260,14 +275,9 @@ export function createDockerDriver(options: {
           '--pids-limit',
           String(spec.limits.pids),
           '--network',
-          spec.network.kind === 'lockdown'
-            ? spec.network.dockerNetwork
-            : (options.network ?? 'bridge'),
+          network,
           '--pull',
           'never',
-          ...(process.platform === 'linux'
-            ? ['--add-host', 'host.docker.internal:host-gateway']
-            : []),
           ...Object.entries(spec.env).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
           ...spec.mounts.flatMap((mount) => [
             '--volume',
@@ -280,6 +290,7 @@ export function createDockerDriver(options: {
         agent,
       )
       if (exit.code === 0) agent.ownership = 'confirmed'
+      else if (/Conflict.*container name/is.test(exit.stderr)) agent.ownership = 'absent'
       requireSuccess(exit, 'create')
       if (agent.cancelled || shutdown.signal.aborted) throw error('run cancelled')
       requireSuccess(await agentCommand(['start', agent.name], agent), 'start')
@@ -399,7 +410,7 @@ export function createDockerDriver(options: {
         sessionId: spec.sessionId,
         containerId: spec.containerId,
         name: agentName(spec.containerId),
-        ownership: 'uncertain',
+        ownership: 'absent',
         phase: 'starting',
       })
       if (existing) {
@@ -478,41 +489,65 @@ export function createDockerDriver(options: {
           const listed = await listContainers([`label=kurumi.install=${options.install}`])
           const tracked = [...agents.values(), ...replacements.values(), ...residue.values()]
           probeDriver.settleListedCreate(listedAt)
+          isolation.settleListedCreate(listedAt)
+          await isolation.sweep(listed)
           for (const create of tracked.map((agent) => agent.create))
             if (create?.state === 'unconfirmed' && (create.endedAt ?? Infinity) <= listedAt)
               create.state = 'settled'
           return listed.filter(
-            ({ name, dockerId }) =>
-              !probeDriver.owns(name) && residue.get(dockerId)?.removal === undefined,
+            ({ name, dockerId, role }) =>
+              role !== 'relay' &&
+              !probeDriver.owns(name) &&
+              residue.get(dockerId)?.removal === undefined,
           )
         })(),
       )
     },
     adopt(container) {
-      const { name, sessionId, containerId } = container
-      if (shutdown.signal.aborted) return { ok: false, reason: error('driver stopped').message }
-      if (sessionId === null || containerId === null || name !== agentName(containerId))
-        return { ok: false, reason: error('container name does not match its labels').message }
-      if (container.revision !== revision)
-        return { ok: false, reason: error('container was created for another runtime').message }
-      if (agents.has(sessionId))
-        return { ok: false, reason: error('session already has a container').message }
-      const agent = {
-        ...record({ sessionId, containerId, name, ownership: 'confirmed', phase: 'running' }),
-        pending: Promise.resolve<RunResult>({ ok: true }),
-      }
-      agents.set(sessionId, agent)
-      agent.watch = watchAgent(agent)
-      adoptedWaits.add(name)
-      waitScan ??= track(
-        Promise.resolve().then(() => {
-          const names = new Set(adoptedWaits)
-          adoptedWaits.clear()
-          waitScan = undefined
-          return endForeignWaits(names)
-        }),
-      ).catch(() => {})
-      return { ok: true }
+      return track(
+        (async (): Promise<RunResult> => {
+          const { name, sessionId, containerId } = container
+          if (shutdown.signal.aborted) return { ok: false, reason: error('driver stopped').message }
+          if (sessionId === null || containerId === null || name !== agentName(containerId))
+            return { ok: false, reason: error('container name does not match its labels').message }
+          if (container.revision !== revision)
+            return { ok: false, reason: error('container was created for another runtime').message }
+          try {
+            await isolation.validate(name, container.dockerId)
+          } catch {
+            return { ok: false, reason: error('unsafe Agent Port isolation topology').message }
+          }
+          if (shutdown.signal.aborted) return { ok: false, reason: error('driver stopped').message }
+          const existing = agents.get(sessionId)
+          if (
+            existing?.address.by === 'id' &&
+            existing.address.value === container.dockerId &&
+            existing.phase === 'running'
+          )
+            return { ok: true }
+          if (existing)
+            return { ok: false, reason: error('session already has a container').message }
+          const agent = {
+            ...record(
+              { sessionId, containerId, name, ownership: 'confirmed', phase: 'running' },
+              { by: 'id', value: container.dockerId },
+            ),
+            pending: Promise.resolve<RunResult>({ ok: true }),
+          }
+          agents.set(sessionId, agent)
+          agent.watch = watchAgent(agent)
+          adoptedWaits.add(name)
+          waitScan ??= track(
+            Promise.resolve().then(() => {
+              const names = new Set(adoptedWaits)
+              adoptedWaits.clear()
+              waitScan = undefined
+              return endForeignWaits(names)
+            }),
+          ).catch(() => {})
+          return { ok: true }
+        })(),
+      )
     },
     remove(container) {
       if (shutdown.signal.aborted) return Promise.reject(error('driver stopped'))

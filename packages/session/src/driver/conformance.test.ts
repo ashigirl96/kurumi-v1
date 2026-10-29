@@ -17,7 +17,7 @@ import { eq } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/bun-sqlite'
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator'
 
-import { container, inboundMessage, outboundMessage } from '../schema.ts'
+import { container, inboundMessage, outboundMessage, session } from '../schema.ts'
 import {
   createSessionLedger,
   migrations,
@@ -30,7 +30,7 @@ import type { Cli, CliResult } from './cli.ts'
 import { createDockerDriver, type ContainerSpec } from './docker.ts'
 import type { InventoryChange } from './events.ts'
 import { FakeCli, type FakeProcess } from './fake-cli.ts'
-import type { ListedContainer } from './listing.ts'
+import { endForeignWaits, type ListedContainer } from './listing.ts'
 
 let sqlite: Database
 let db: Db
@@ -64,7 +64,7 @@ beforeEach(() => {
     image: 'test',
     egress: {
       admission: () => ({ open: true }),
-      contribution: () => ({ env: {}, mounts: [], network: { kind: 'default' } }),
+      contribution: () => ({ env: {}, mounts: [] }),
     },
   }
   logs = []
@@ -87,14 +87,18 @@ afterEach(async () => {
 test('Docker realizes labels, declared env and mount modes once for a session', async () => {
   const cli = new FakeCli()
   cli.responses.push({ match: /^(create|start|rm) /, result: {} })
-  const docker = createDockerDriver({ install: 'conformance', image: 'agent-test', cli })
+  const docker = createDockerDriver({
+    agentPort: 1234,
+    install: 'conformance',
+    image: 'agent-test',
+    cli,
+  })
   const spec = {
     sessionId: 'ses-conformance',
     containerId: 'ctr-conformance',
     image: 'agent-test',
     env: { KURUMI_TOKEN: 'session-only', KURUMI_URL: 'http://host.docker.internal:4000' },
     mounts: [{ hostPath: import.meta.path, containerPath: '/app/runner.js', readonly: true }],
-    network: { kind: 'default' } as const,
     limits: { cpus: 1, memoryMb: 1024, pids: 256 },
   }
   try {
@@ -110,6 +114,7 @@ test('Docker realizes labels, declared env and mount modes once for a session', 
       'kurumi.session=ses-conformance',
       'kurumi.role=agent',
       'kurumi.container=ctr-conformance',
+      expect.stringMatching(/^kurumi.revision=[a-f0-9]+$/),
     ])
     expect(values('--env')).toEqual([
       'KURUMI_TOKEN=session-only',
@@ -479,7 +484,12 @@ test('Docker exit revokes channel authority before removal completes', async () 
   await ledger.stop()
   const cli = new FakeCli()
   cli.responses.push({ match: /^(create|start) /, result: {} }, { match: /^ps /, result: {} })
-  const docker = createDockerDriver({ install: 'channel-conformance', image: 'probe', cli })
+  const docker = createDockerDriver({
+    agentPort: 1234,
+    install: 'channel-conformance',
+    image: 'probe',
+    cli,
+  })
   configured.driver = docker
   ledger = createSessionLedger({ db, agentLedger: agents, chatLedger: chat, runtime: configured })
   await ledger.routeInbound(event('work'))
@@ -519,7 +529,12 @@ test('host shutdown keeps a running container and its row even when Docker canno
     { match: /^(create|start) /, result: {} },
     { match: /^(rm|ps) /, result: { code: 1, stderr: 'daemon unavailable' } },
   )
-  const docker = createDockerDriver({ install: 'shutdown-conformance', image: 'probe', cli })
+  const docker = createDockerDriver({
+    agentPort: 1234,
+    install: 'shutdown-conformance',
+    image: 'probe',
+    cli,
+  })
   const active = createSessionLedger({
     db,
     agentLedger: agents,
@@ -627,6 +642,7 @@ function fakeDaemon() {
       waits: new Set(),
       links: [],
     })
+    cli.isolation.setId(name, containers.get(name)?.id ?? '')
     emit('create', name)
   }
   function resolve(reference: string): string {
@@ -722,6 +738,7 @@ function fakeDaemon() {
   const daemon: Cli = {
     start(args, options) {
       const proc = cli.start(args)
+      if (proc.isolation) return proc
       const [command = ''] = args
       const queue = held.get(command)
       if (failing.has(command))
@@ -778,18 +795,23 @@ function agentSpec(overrides: Partial<ContainerSpec> = {}): ContainerSpec {
     image: 'agent-test',
     env: { KURUMI_TOKEN: 'secret' },
     mounts: [{ hostPath: import.meta.path, containerPath: '/app/runner.js', readonly: true }],
-    network: { kind: 'default' },
     limits: { cpus: 1, memoryMb: 1024, pids: 256 },
     ...overrides,
   }
 }
 
-test('a new driver adopts a running agent from its labels alone and a repeated run creates nothing', async () => {
+test('a new driver validates and adopts a running agent and a repeated run creates nothing', async () => {
   const docker = fakeDaemon()
-  const previous = createDockerDriver({ install: 'adopt', image: 'agent-test', cli: docker.daemon })
+  const previous = createDockerDriver({
+    agentPort: 1234,
+    install: 'adopt',
+    image: 'agent-test',
+    cli: docker.daemon,
+  })
   expect(await previous.run(agentSpec())).toEqual({ ok: true })
   await previous.detach()
   const restarted = createDockerDriver({
+    agentPort: 1234,
     install: 'adopt',
     image: 'agent-test',
     cli: docker.daemon,
@@ -806,12 +828,12 @@ test('a new driver adopts a running agent from its labels alone and a repeated r
         role: 'agent',
         sessionId: 'ses-adopt',
         containerId: 'ctr-adopt',
-        revision: null,
+        revision: expect.any(String),
         state: 'running',
       },
     ])
     const before = docker.cli.started.length
-    expect(listed.map((entry) => restarted.adopt(entry))).toEqual([{ ok: true }])
+    expect(await Promise.all(listed.map((entry) => restarted.adopt(entry)))).toEqual([{ ok: true }])
     expect(await restarted.run(agentSpec())).toEqual({ ok: true })
     expect(docker.cli.joined().slice(before)).toEqual([`wait ${name}`])
     docker.exit(name, 7)
@@ -826,6 +848,7 @@ test('a new driver adopts a running agent from its labels alone and a repeated r
 test('adoption refuses a container whose name does not follow from its labels', async () => {
   const docker = fakeDaemon()
   const dockerDriver = createDockerDriver({
+    agentPort: 1234,
     install: 'adopt',
     image: 'agent-test',
     cli: docker.daemon,
@@ -839,7 +862,7 @@ test('adoption refuses a container whose name does not follow from its labels', 
     revision: null,
     state: 'running',
   }
-  expect(dockerDriver.adopt(forged).ok).toBe(false)
+  expect((await dockerDriver.adopt(forged)).ok).toBe(false)
   expect(docker.commands('wait')).toHaveLength(0)
   await dockerDriver.stop()
 })
@@ -847,6 +870,7 @@ test('adoption refuses a container whose name does not follow from its labels', 
 test('detach leaves running agents and removes only an agent that is still starting', async () => {
   const docker = fakeDaemon()
   const dockerDriver = createDockerDriver({
+    agentPort: 1234,
     install: 'detach',
     image: 'agent-test',
     cli: docker.daemon,
@@ -928,7 +952,7 @@ test.each([0, 2])(
     docker.daemon = {
       start(args, options) {
         const proc = cli.start(args, options)
-        if (args[0] !== 'start') return proc
+        if (args[0] !== 'start' || args.at(-1)?.endsWith('-relay')) return proc
         return {
           kill: () => proc.kill(),
           result: proc.result.then(async (result) => {
@@ -1007,6 +1031,7 @@ test('a removal that gets no answer is killed after the driver timeout instead o
   })
   docker.hold('rm')
   const dockerDriver = createDockerDriver({
+    agentPort: 1234,
     install: 'stuck',
     image: 'agent-test',
     cli: docker.daemon,
@@ -1035,6 +1060,7 @@ test('a sweep lists and removes only containers that carry this install label', 
   docker.add('other-probe', { 'kurumi.install': 'other', 'kurumi.role': 'probe' })
   docker.add('own-probe', { 'kurumi.install': 'mine', 'kurumi.role': 'probe' }, 'exited')
   const dockerDriver = createDockerDriver({
+    agentPort: 1234,
     install: 'mine',
     image: 'agent-test',
     cli: docker.daemon,
@@ -1069,6 +1095,7 @@ test.each([143, 2, null])(
   async (code) => {
     const docker = fakeDaemon()
     const dockerDriver = createDockerDriver({
+      agentPort: 1234,
       install: 'late',
       image: 'agent-test',
       cli: docker.daemon,
@@ -1093,6 +1120,7 @@ test.each([143, 2, null])(
 test('a probe whose create CLI exits 2 blocks the next probe until a sweep settles its name', async () => {
   const docker = fakeDaemon()
   const dockerDriver = createDockerDriver({
+    agentPort: 1234,
     install: 'probe',
     image: 'agent-test',
     cli: docker.daemon,
@@ -1115,6 +1143,7 @@ test('a probe whose create CLI exits 2 blocks the next probe until a sweep settl
 test('a driver has one events subscription that follows this install, reports it only after a second alive, and replays from the last one that ran', async () => {
   const docker = fakeDaemon()
   const dockerDriver = createDockerDriver({
+    agentPort: 1234,
     install: 'events',
     image: 'agent-test',
     cli: docker.daemon,
@@ -1156,6 +1185,7 @@ test('a driver has one events subscription that follows this install, reports it
 test('a subscription that reaches the end of its window resubscribes at once and replays the previous window', async () => {
   const docker = fakeDaemon()
   const dockerDriver = createDockerDriver({
+    agentPort: 1234,
     install: 'events',
     image: 'agent-test',
     cli: docker.daemon,
@@ -1198,6 +1228,7 @@ function supervisedHost(
   }: { staleAfterMs?: number; intervalMs?: number; revision?: string } = {},
 ) {
   const dockerDriver = createDockerDriver({
+    agentPort: 1234,
     install: 'restart',
     revision,
     image: 'agent-test',
@@ -1355,10 +1386,10 @@ test('a restarted host stops containers without a live row and never touches ano
     await until(() => decisions(0).length === 4)
     expect([...docker.containers.keys()]).toEqual(['kurumi-agent-other'])
     expect(decisions(0)).toMatchObject([
-      { kind: 'session.adoption.done', adopted: 0, reaped: 0, stopped: 3 },
       { kind: 'session.container.stopped', name: 'kurumi-agent-ghost', reason: 'no live row' },
       { kind: 'session.container.stopped', name: 'kurumi-probe-left', reason: 'leftover probe' },
       { kind: 'session.container.stopped', name: 'hand-made', reason: 'unknown role' },
+      { kind: 'session.adoption.done', adopted: 0, reaped: 0, stopped: 3 },
     ])
     expect(docker.cli.joined().join('\n')).not.toMatch(/kurumi-agent-other|kurumi\.install=other/)
   } finally {
@@ -1499,6 +1530,7 @@ test('kill() without a record removes the containers its label listing names by 
   })
   const id = docker.containers.get('injector')?.id
   const dockerDriver = createDockerDriver({
+    agentPort: 1234,
     install: 'stuck',
     image: 'agent-test',
     cli: docker.daemon,
@@ -1602,6 +1634,145 @@ test('a container silent past the stale limit is reaped and the next line starts
   }
 })
 
+test.each(['rejected', 'stopping', 'closed', 'leftover'] as const)(
+  'startup admission waits for failed %s runner cleanup and recovers without blocking session startup',
+  async (state) => {
+    await ledger.stop()
+    const docker = fakeDaemon()
+    const { token, who, first } = await restartedHost(docker)
+    const name = first.dockerDriver.nameOf(who.containerId)
+    if (state === 'leftover') db.delete(container).where(eq(container.id, who.containerId)).run()
+    else if (state !== 'rejected') {
+      db.update(container)
+        .set({ status: 'stopping' })
+        .where(eq(container.id, who.containerId))
+        .run()
+      if (state === 'closed')
+        db.update(session).set({ status: 'closed' }).where(eq(session.id, who.sessionId)).run()
+    }
+    docker.fail('rm')
+    const restarted = supervisedHost(docker, { revision: 'rev-2', intervalMs: 50 })
+    let adopted = false
+    const pending = restarted.sessions.adopted().then(
+      () => {
+        adopted = true
+      },
+      () => {},
+    )
+    try {
+      await restarted.sessions.start()
+      await Bun.sleep(150)
+      expect(docker.containers.get(name)?.state).toBe('running')
+      expect(restarted.sessions.authenticate(token)).toBeNull()
+      expect(adopted).toBe(false)
+      expect(
+        logs.some(
+          (entry) =>
+            entry.kind === 'session.cleanup.failed' || entry.kind === 'session.reconcile.failed',
+        ),
+      ).toBe(true)
+      docker.recover('rm')
+      await until(() => adopted)
+      await pending
+      expect(docker.containers.has(name)).toBe(false)
+      expect(
+        db.select().from(container).where(eq(container.id, who.containerId)).get(),
+      ).toBeUndefined()
+    } finally {
+      docker.recover('rm')
+      await restarted.stop()
+    }
+  },
+)
+
+test.each(['rejected', 'stopping', 'leftover'] as const)(
+  'startup admission waits for a delayed %s runner removal to finish',
+  async (state) => {
+    await ledger.stop()
+    const docker = fakeDaemon()
+    const { who, first } = await restartedHost(docker)
+    const name = first.dockerDriver.nameOf(who.containerId)
+    if (state === 'leftover') db.delete(container).where(eq(container.id, who.containerId)).run()
+    else if (state === 'stopping')
+      db.update(container)
+        .set({ status: 'stopping' })
+        .where(eq(container.id, who.containerId))
+        .run()
+    docker.hold('rm')
+    const host = supervisedHost(docker, { revision: 'rev-2', intervalMs: 50 })
+    let adopted = false
+    void host.sessions.adopted().then(
+      () => {
+        adopted = true
+      },
+      () => {},
+    )
+    const starting = host.sessions.start()
+    try {
+      await until(() => docker.commands('rm').length > 0)
+      await Bun.sleep(50)
+      expect(docker.containers.get(name)?.state).toBe('running')
+      expect(adopted).toBe(false)
+      docker.release('rm')
+      await starting
+      await host.sessions.adopted()
+      expect(docker.containers.has(name)).toBe(false)
+    } finally {
+      docker.release('rm')
+      await starting
+      await host.stop()
+    }
+  },
+)
+
+test('stop rejects admission while startup is still awaiting runner removal', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const { who, first } = await restartedHost(docker)
+  const name = first.dockerDriver.nameOf(who.containerId)
+  docker.hold('rm')
+  const host = supervisedHost(docker, { revision: 'rev-2', intervalMs: 50 })
+  const pending = host.sessions.adopted().then(
+    () => 'adopted',
+    (error: unknown) => String(error),
+  )
+  const starting = host.sessions.start()
+  try {
+    await until(() => docker.commands('rm').length > 0)
+    const stopping = host.sessions.stop()
+    expect(await pending).toContain('stopped')
+    expect(docker.containers.has(name)).toBe(true)
+    docker.release('rm')
+    await Promise.all([starting, stopping])
+    expect(docker.containers.has(name)).toBe(false)
+  } finally {
+    docker.release('rm')
+    await starting
+    await host.stop()
+  }
+})
+
+test('stopping while rejected runner cleanup fails rejects pending startup admission', async () => {
+  await ledger.stop()
+  const docker = fakeDaemon()
+  const { who, first } = await restartedHost(docker)
+  docker.fail('rm')
+  const host = supervisedHost(docker, { revision: 'rev-2', intervalMs: 50 })
+  const pending = host.sessions.adopted().then(
+    () => 'adopted',
+    (error: unknown) => String(error),
+  )
+  try {
+    await host.sessions.start()
+    await host.sessions.stop()
+    expect(await pending).toContain('stopped')
+    expect(docker.containers.has(first.dockerDriver.nameOf(who.containerId))).toBe(true)
+  } finally {
+    docker.recover('rm')
+    await host.dockerDriver.stop()
+  }
+})
+
 test('a restart with another image, port or network replaces the container instead of adopting it', async () => {
   await ledger.stop()
   const docker = fakeDaemon()
@@ -1626,7 +1797,7 @@ test('a restart with another image, port or network replaces the container inste
       flagValues(docker.commands('create')[1]?.args ?? [], '--label').filter((label) =>
         label.startsWith('kurumi.revision='),
       ),
-    ).toEqual(['kurumi.revision=rev-2'])
+    ).toEqual([expect.stringMatching(/^kurumi.revision=[a-f0-9]+$/)])
   } finally {
     await restarted.stop()
   }
@@ -1783,6 +1954,7 @@ test('a listing that gets no answer within the driver timeout fails the sweep in
   const docker = fakeDaemon()
   docker.hold('ps')
   const dockerDriver = createDockerDriver({
+    agentPort: 1234,
     install: 'restart',
     image: 'agent-test',
     cli: docker.daemon,
@@ -1808,7 +1980,7 @@ test('a listing that gets no answer within the driver timeout fails the sweep in
   }
 })
 
-test('adopting a container ends the docker wait a dead host left for it and keeps its own', async () => {
+test('foreign wait cleanup ends a dead host wait and keeps waits owned by this process', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'kurumi-orphan-wait-'))
   writeFileSync(
     join(dir, 'docker'),
@@ -1817,7 +1989,11 @@ test('adopting a container ends the docker wait a dead host left for it and keep
   )
   const path = process.env.PATH
   process.env.PATH = `${dir}:${path}`
-  const dockerDriver = createDockerDriver({ install: 'orphan', image: 'agent-test' })
+  const dockerDriver = createDockerDriver({
+    agentPort: 1234,
+    install: 'orphan',
+    image: 'agent-test',
+  })
   const name = dockerDriver.nameOf('ctr-adopt')
   const unrelated = dockerDriver.nameOf('ctr-unrelated')
   const pids = (waited: string) =>
@@ -1834,17 +2010,9 @@ test('adopting a container ends the docker wait a dead host left for it and keep
       `"${dir}/docker" wait ${name} >/dev/null 2>&1 & "${dir}/docker" wait ${unrelated} >/dev/null 2>&1 &`,
     ]).exited
     await until(() => pids(name).length === 1 && pids(unrelated).length === 1)
-    expect(
-      dockerDriver.adopt({
-        dockerId: 'a'.repeat(64),
-        name,
-        role: 'agent',
-        sessionId: 'ses-adopt',
-        containerId: 'ctr-adopt',
-        revision: null,
-        state: 'running',
-      }),
-    ).toEqual({ ok: true })
+    const ownWait = Bun.spawn([join(dir, 'docker'), 'wait', name])
+    void ownWait.exited.catch(() => {})
+    await endForeignWaits(new Set([name]))
     await until(() => pids(name).length === 2)
     const own = pids(name).find((entry) => entry.own)
     const orphan = pids(name).find((entry) => !entry.own)

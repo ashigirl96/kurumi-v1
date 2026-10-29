@@ -175,7 +175,12 @@ export async function startHost(config: HostConfig) {
       .object({
         KURUMI_AGENT_IMAGE: z.string().min(1).default('kurumi-agent:latest'),
         KURUMI_PROBE_IMAGE: z.string().min(1).optional(),
-        KURUMI_DOCKER_NETWORK: z.string().min(1).default('bridge'),
+        KURUMI_DOCKER_NETWORK: z
+          .never({
+            error:
+              'KURUMI_DOCKER_NETWORK is no longer supported. Unset it; Kurumi creates private Agent Port networks.',
+          })
+          .optional(),
         KURUMI_STALE_AFTER_MS: milliseconds.min(30_000).default(1_800_000),
         KURUMI_RECONCILE_INTERVAL_MS: milliseconds.min(100).optional(),
         KURUMI_CONNECT_REQUEST_TTL_MS: milliseconds.min(60_000).default(1_800_000),
@@ -237,7 +242,6 @@ export async function startHost(config: HostConfig) {
         { hostPath: runner, containerPath: '/app/runner.js', readonly: true },
         ...gateway.mounts,
       ],
-      network: { kind: 'lockdown', dockerNetwork: environment.KURUMI_DOCKER_NETWORK },
     }
     const revisionedEgress = ({ sessionToken }: { sessionToken: string }): ContainerEgress => ({
       ...egress,
@@ -251,7 +255,7 @@ export async function startHost(config: HostConfig) {
         runner: readRunner(runner),
       }),
       image: environment.KURUMI_PROBE_IMAGE ?? environment.KURUMI_AGENT_IMAGE,
-      network: environment.KURUMI_DOCKER_NETWORK,
+      agentPort: config.agentPort.port,
     })
     driver = docker
     const accessLedger = createAccessLedger({ db })

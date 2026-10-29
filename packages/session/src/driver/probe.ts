@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 import { outputLimit, diagnosticLimit, type Cli, type CliProcess, type CliResult } from './cli.ts'
 import { CleanupError, type Creation } from './create.ts'
+import type { createIsolation } from './isolation.ts'
 
 function fetchProgram(timeoutMs: number): string {
   return `
@@ -24,15 +25,21 @@ export function createProbe({
   timeoutMs,
   error,
   settleCreate,
+  isolation,
 }: {
   cli: Cli
-  options: { install: string; image: string; network?: string }
+  options: { install: string; image: string }
   timeoutMs: number
   error: (message: string, cause?: unknown) => Error
   settleCreate: (proc: CliProcess) => Creation
+  isolation: ReturnType<typeof createIsolation>
 }) {
   let owned:
-    | { name: string; kind: 'uncertain' | 'confirmed' | 'absent'; create: Creation | undefined }
+    | {
+        name: string
+        kind: 'uncertain' | 'confirmed' | 'absent' | 'foreign'
+        create: Creation | undefined
+      }
     | undefined
   let active = false
 
@@ -66,9 +73,13 @@ export function createProbe({
     try {
       const proc = cli.start(args)
       if (container) container.create = settleCreate(proc)
-      const exit = await (container?.create?.result ?? proc.result)
+      const timer = container ? undefined : setTimeout(() => proc.kill(), timeoutMs)
+      const exit = await (container?.create?.result ?? proc.result).finally(() =>
+        clearTimeout(timer),
+      )
       if (container) {
         if (exit.code === 0) container.kind = 'confirmed'
+        else if (/Conflict.*container name/is.test(exit.stderr)) container.kind = 'foreign'
         else if (/^(?:Error response from daemon: )?No such image: [^\r\n]+\s*$/.test(exit.stderr))
           container.kind = 'absent'
       }
@@ -96,28 +107,31 @@ export function createProbe({
         `Docker (${options.image}): cleanup of ${owned.name} unconfirmed: create ended without a daemon answer`,
       )
     const { name, kind } = owned
-    let removed = false
+    let removed = kind === 'foreign' || (kind === 'absent' && !owned.create)
     let removing = false
     let removalError = 'removal unconfirmed'
-    try {
-      const exit = await cli.start(['rm', '--force', name]).result
-      removing =
-        exit.code !== 0 &&
-        /^(?:Error response from daemon: )?removal (?:of container [^\r\n]+ is )?already in progress\s*$/.test(
-          exit.stderr,
-        )
-      if (
-        exit.code !== 0 &&
-        /^(?:Error response from daemon: )?No such container(?:: [^\r\n]+)?\s*$/.test(exit.stderr)
-      ) {
-        removed = true
-      } else {
-        const stdout = output(exit, 'rm')
-        removed = kind !== 'uncertain' || stdout.trim() === name
+    if (!removed)
+      try {
+        const proc = cli.start(['rm', '--force', name])
+        const timer = setTimeout(() => proc.kill(), timeoutMs)
+        const exit = await proc.result.finally(() => clearTimeout(timer))
+        removing =
+          exit.code !== 0 &&
+          /^(?:Error response from daemon: )?removal (?:of container [^\r\n]+ is )?already in progress\s*$/.test(
+            exit.stderr,
+          )
+        if (
+          exit.code !== 0 &&
+          /^(?:Error response from daemon: )?No such container(?:: [^\r\n]+)?\s*$/.test(exit.stderr)
+        ) {
+          removed = true
+        } else {
+          const stdout = output(exit, 'rm')
+          removed = kind !== 'uncertain' || stdout.trim() === name
+        }
+      } catch (cause) {
+        removalError = String(cause)
       }
-    } catch (cause) {
-      removalError = String(cause)
-    }
     if (!removed) {
       try {
         const deadline = performance.now() + timeoutMs
@@ -142,6 +156,14 @@ export function createProbe({
         )
       }
     }
+    try {
+      await isolation.remove(name)
+    } catch (cause) {
+      throw new CleanupError(
+        `Docker (${options.image}): isolation cleanup of ${name} unconfirmed`,
+        { cause },
+      )
+    }
     owned = undefined
   }
 
@@ -162,8 +184,11 @@ export function createProbe({
       await cleanup()
       if (signal?.aborted) throw error('probe aborted')
       name = `kurumi-probe-${randomUUID()}`
-      owned = { name, kind: 'uncertain', create: undefined }
+      owned = { name, kind: 'absent', create: undefined }
       signal?.addEventListener('abort', abort, { once: true })
+      const network = await isolation.prepare(name)
+      if (signal?.aborted) throw error('probe aborted')
+      owned.kind = 'uncertain'
       await run([
         'create',
         '--rm',
@@ -175,12 +200,12 @@ export function createProbe({
         '--label',
         'kurumi.role=probe',
         '--network',
-        options.network ?? 'bridge',
+        network,
+        '--cap-drop=ALL',
+        '--security-opt',
+        'no-new-privileges',
         '--pull',
         'never',
-        ...(process.platform === 'linux'
-          ? ['--add-host', 'host.docker.internal:host-gateway']
-          : []),
         options.image,
         'bun',
         '-e',
@@ -193,7 +218,9 @@ export function createProbe({
       } catch (cause) {
         throw normalize('start', cause)
       }
-      const attached = result(attach, 'start')
+      const attaching = attach
+      const timer = setTimeout(() => attaching.kill(), timeoutMs + 1000)
+      const attached = result(attach, 'start').finally(() => clearTimeout(timer))
       aborted = Promise.withResolvers<never>()
       const raced = Promise.race([attached, aborted.promise])
       if (signal?.aborted) abort()
