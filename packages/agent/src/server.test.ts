@@ -118,3 +118,13 @@ test.each(['../escape', '/absolute', '.', '..', 'nested/folder', 'back\\slash', 
     expect(existsSync(join(home, 'groups', 'work'))).toBe(false)
   },
 )
+
+test('workspace instructions contain the agent name, persona, and trusted base in order', () => {
+  const composed = createAgentLedger({ db, home, baseInstructions: 'Trusted base' })
+  const agent = composed.create({ name: 'work' })
+  writeFileSync(join(agent.folder, 'instructions.prepend.md'), 'Owner persona')
+  const text = composed.prepareWorkspace(agent.id)
+  expect(text.indexOf('work')).toBeGreaterThanOrEqual(0)
+  expect(text.indexOf('Owner persona')).toBeGreaterThan(text.indexOf('work'))
+  expect(text.indexOf('Trusted base')).toBeGreaterThan(text.indexOf('Owner persona'))
+})
