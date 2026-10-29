@@ -9,6 +9,7 @@ import {
 
 export type Turn = {
   prompt: string
+  instructions: string
   continuation: string | null
   mcpServers?(): Options['mcpServers']
   signal: AbortSignal
@@ -56,7 +57,12 @@ function options(
     mcpServers: turn.mcpServers?.(),
     abortController,
     ...(continuation === null ? {} : { resume: continuation }),
-    systemPrompt: { type: 'preset', preset: 'claude_code' },
+    systemPrompt: {
+      type: 'preset',
+      preset: 'claude_code',
+      append: turn.instructions,
+      snapshot: false,
+    },
     settingSources: [],
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,

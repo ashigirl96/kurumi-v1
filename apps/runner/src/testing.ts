@@ -23,6 +23,8 @@ export type FakeCall = {
   prompt: string
   resume: string | null
   signal: AbortSignal
+  systemPrompt: Options['systemPrompt']
+  settingSources: Options['settingSources']
   mcpServers: Options['mcpServers']
 }
 
@@ -82,6 +84,8 @@ await mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   }: {
     prompt: string
     options: {
+      systemPrompt?: Options['systemPrompt']
+      settingSources?: Options['settingSources']
       resume?: string
       abortController: AbortController
       mcpServers?: Options['mcpServers']
@@ -89,6 +93,8 @@ await mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   }) {
     const call = {
       prompt,
+      systemPrompt: options.systemPrompt,
+      settingSources: options.settingSources,
       resume: options.resume ?? null,
       signal: options.abortController.signal,
       mcpServers: options.mcpServers,
@@ -106,7 +112,7 @@ export async function startHost() {
   for (const entry of [agentMigrations, chatMigrations, migrations]) {
     migrate(db, { migrationsFolder: entry.folder, migrationsTable: entry.table })
   }
-  const agentLedger = createAgentLedger({ db, home })
+  const agentLedger = createAgentLedger({ db, home, baseInstructions: 'Trusted base' })
   const agent = agentLedger.create({ name: 'work' })
   const driver = createFakeDriver()
   const chatLedger = createChatLedger({
@@ -189,6 +195,7 @@ export async function startHost() {
   if (!token) throw new Error('missing runner token')
   return {
     db,
+    updatePersona: (persona: string) => agentLedger.update({ agentGroupId: agent.id, persona }),
     url: server.url.href.replace(/\/$/, ''),
     token,
     latestToken: () => driver.runs.at(-1)?.env.KURUMI_TOKEN ?? '',

@@ -138,6 +138,7 @@ export type SessionLedger = {
   notify(notice: SessionNotice): NoticeReceipt
   authenticate(token: string): AgentPrincipal | null
   channel: {
+    instructions(principal: AgentPrincipal): { instructions: string }
     pull(
       principal: AgentPrincipal,
       input: PullInput,
@@ -958,6 +959,12 @@ export function createSessionLedger({
       return receipt
     },
     channel: {
+      instructions(principal) {
+        return transaction(db, (tx) => {
+          authorize(tx, principal)
+          return { instructions: agentLedger.prepareWorkspace(principal.agentGroupId) }
+        })
+      },
       pull(principal, input, signal) {
         const task = pull(principal, input, signal)
         pulls.add(task)
@@ -1069,6 +1076,9 @@ const agentOnly = os.middleware(({ context, next }) => {
 })
 export const router = os.router({
   channel: {
+    instructions: os.channel.instructions
+      .use(agentOnly)
+      .handler(({ context }) => context.sessionLedger.channel.instructions(context.agentPrincipal)),
     pull: os.channel.pull
       .use(agentOnly)
       .handler(({ context, input }) =>

@@ -25,6 +25,19 @@ export const createAgentInput = z
     }
   })
 
+export const personaLimit = 16000
+
+export const updateAgentInput = z.object({
+  agentGroupId: z.string().min(1),
+  persona: z
+    .string()
+    .max(personaLimit * 2)
+    .refine(
+      (value) => Array.from(value).length <= personaLimit,
+      'persona must be at most 16000 Unicode characters',
+    ),
+})
+
 const agentGroup = z.object({
   id: z.string(),
   name: z.string(),
@@ -36,6 +49,10 @@ export const contract = {
   list: kc
     .meta({ cli: true, agent: 'scoped', description: 'List agent groups' })
     .output(z.array(agentGroup)),
+  update: kc
+    .meta({ cli: true, description: 'Update an agent group persona' })
+    .input(updateAgentInput)
+    .output(agentGroup),
   create: kc
     .meta({
       cli: true,

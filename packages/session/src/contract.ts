@@ -47,6 +47,10 @@ export type StatePutInput = z.infer<typeof statePutInput>
 
 export const contract = {
   channel: {
+    instructions: kc
+      .meta({ agent: 'channel' })
+      .input(z.strictObject({}))
+      .output(z.object({ instructions: z.string() })),
     pull: kc
       .meta({ agent: 'channel' })
       .input(pullInput)

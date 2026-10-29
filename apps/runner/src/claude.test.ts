@@ -353,3 +353,36 @@ test('a turn lost after the model started resumes that conversation when it re-r
     await host.stop()
   }
 })
+
+test('fresh and resumed turns receive current instructions without loading workspace settings', async () => {
+  const host = await startHost()
+  host.updatePersona('First persona')
+  const controller = new AbortController()
+  const running = runRunner({ url: host.url, token: host.token, signal: controller.signal })
+  try {
+    expect(await host.reply()).toBe('model heard: hello')
+    expect(sdk.calls[0]?.resume).toBeNull()
+    expect(sdk.calls[0]?.systemPrompt).toEqual({
+      type: 'preset',
+      preset: 'claude_code',
+      append: 'Your name is work.\n\nFirst persona\n\nTrusted base',
+      snapshot: false,
+    })
+    expect(sdk.calls[0]?.settingSources).toEqual([])
+    host.updatePersona('Changed persona')
+    await host.send('next warm turn')
+    expect(await host.reply()).toBe('model heard: hello | next warm turn')
+    expect(sdk.calls[1]?.resume).not.toBeNull()
+    expect(sdk.calls[1]?.systemPrompt).toEqual({
+      type: 'preset',
+      preset: 'claude_code',
+      append: 'Your name is work.\n\nChanged persona\n\nTrusted base',
+      snapshot: false,
+    })
+    expect(sdk.calls[1]?.settingSources).toEqual([])
+  } finally {
+    controller.abort()
+    await running
+    await host.stop()
+  }
+})

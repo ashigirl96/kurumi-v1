@@ -90,6 +90,7 @@ export async function runRunner(options: {
     }
   }
   async function answer(message: { id: string; content: string }): Promise<void> {
+    const { instructions } = await retry(() => host.session.channel.instructions({}, { signal }))
     const saved = await retry(() =>
       host.session.channel.state.get({ key: CONTINUATION }, { signal }),
     )
@@ -103,6 +104,7 @@ export async function runRunner(options: {
     try {
       await runTurn({
         prompt: message.content,
+        instructions,
         mcpServers: () => ({ kurumi: createKurumiServer(link, signal) }),
         continuation: saved.value,
         signal,

@@ -10,6 +10,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -44,11 +45,13 @@ async function spawnHost(
   home: string,
   preload?: string,
   env: Record<string, string> = {},
+  cwd?: string,
 ): Promise<Bun.Subprocess<'ignore', 'pipe', 'pipe'>> {
   const unused = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response() })
   const webPort = String(unused.port)
   await unused.stop(true)
   const child = Bun.spawn([process.execPath, ...(preload ? ['--preload', preload] : []), main], {
+    cwd,
     env: { ...process.env, KURUMI_HOME: home, KURUMI_WEB_PORT: webPort, ...env },
     stdin: 'ignore',
     stdout: 'pipe',
@@ -1346,3 +1349,102 @@ test.each(['bridge', 'none', ''])(
     expect(error).toContain('Unset it')
   },
 )
+
+test('a host outside the repo supplies trusted instructions and preserves persona and continuation across restart', async () => {
+  const home = homeForTest()
+  const tokenPath = join(home, 'test-token')
+  writeFileSync(
+    join(home, 'docker'),
+    inventoryDocker.replace(
+      'const [command] = args;',
+      `const [command] = args;
+if (command === 'create') {
+  const token = args.find(value => value.startsWith('KURUMI_TOKEN='));
+  if (token) writeFileSync(${JSON.stringify(tokenPath)}, token.slice('KURUMI_TOKEN='.length));
+}`,
+    ),
+    { mode: 0o755 },
+  )
+  mkdirSync(join(home, 'runner'))
+  writeFileSync(join(home, 'runner/runner.js'), '')
+  const unused = Bun.serve({ port: 0, fetch: () => new Response() })
+  const port = unused.port
+  await unused.stop(true)
+  const env = { PATH: `${home}:${process.env.PATH}`, KURUMI_AGENT_PORT: String(port) }
+  const first = await spawnHost(home, undefined, env, home)
+  await waitForHost(home, first)
+  await cli(home, ['agent', 'create', '--name', 'work'])
+  const [agent] = z
+    .array(z.object({ id: z.string() }))
+    .parse(JSON.parse(await cli(home, ['agent', 'list'])))
+  if (!agent) throw new Error('missing agent')
+  await cli(home, ['chat', 'work'], 'hello\n')
+  for (let attempt = 0; !existsSync(tokenPath); attempt++) {
+    if (attempt > 250) throw new Error('fake docker never received the token')
+    await Bun.sleep(20)
+  }
+  const token = readFileSync(tokenPath, 'utf8')
+  const channel = async (path: string, input = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}/rpc/session/channel/${path}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ json: input }),
+    })
+    expect(response.status).toBe(200)
+    return response.json()
+  }
+  const instructions = async () =>
+    z.object({ json: z.object({ instructions: z.string() }) }).parse(await channel('instructions'))
+      .json.instructions
+  expect(await instructions()).toContain('Never ask the user for API keys')
+  expect(await instructions()).toContain('Your name is work.')
+  await channel('state/put', { key: 'continuation', value: 'saved-conversation' })
+  await cli(home, [
+    'agent',
+    'update',
+    '--agent-group-id',
+    agent.id,
+    '--persona',
+    'End replies with K01.',
+  ])
+  expect(await instructions()).toContain('End replies with K01.')
+  expect(await channel('state/get', { key: 'continuation' })).toEqual({
+    json: { value: 'saved-conversation' },
+  })
+  first.kill('SIGTERM')
+  expect(await first.exited).toBe(0)
+  const second = await spawnHost(home, undefined, env, home)
+  await waitForHost(home, second)
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/rpc/session/channel/instructions`)
+      await response.body?.cancel()
+      break
+    } catch (error) {
+      if (attempt === 100) throw error
+      await Bun.sleep(20)
+    }
+  }
+  expect(await instructions()).toContain('End replies with K01.')
+  expect(await instructions()).toContain('Your name is work.')
+  expect(await channel('state/get', { key: 'continuation' })).toEqual({
+    json: { value: 'saved-conversation' },
+  })
+  const persona = join(home, 'groups/work/instructions.prepend.md')
+  rmSync(persona)
+  const outside = join(home, 'private')
+  writeFileSync(outside, 'PRIVATE PERSONA CONTENT')
+  symlinkSync(outside, persona)
+  expect(await instructions()).not.toContain('PRIVATE PERSONA CONTENT')
+  rmSync(persona)
+  writeFileSync(persona, 'p'.repeat(16004))
+  expect(await instructions()).toContain('p'.repeat(16000))
+  second.kill('SIGTERM')
+  expect(await second.exited).toBe(0)
+  const log = await new Response(second.stdout).text()
+  expect(log).toContain('agent.instructions.omitted')
+  expect(log).toContain('agent.instructions.truncated')
+  expect(log).toContain(persona)
+  expect(log).not.toContain('PRIVATE PERSONA CONTENT')
+  expect(log).not.toContain('p'.repeat(100))
+}, 20000)

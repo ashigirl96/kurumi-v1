@@ -279,6 +279,11 @@ export async function startHost(config: HostConfig) {
     const agentLedger = createAgentLedger({
       db,
       home: config.home,
+      baseInstructions: readFileSync(
+        new URL('../../../container/CLAUDE.md', import.meta.url),
+        'utf8',
+      ),
+      log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
       onCreate: (tx, agentGroupId) => accountLedger.grantAutoGrants(tx, agentGroupId),
     })
     const approvalLedger = createApprovalLedger({

@@ -139,6 +139,7 @@ async function channelServer() {
   })
   return {
     driver,
+    port: port.port,
     stop: () => port.stop(),
     pull: (token: string, input: unknown = { waitMs: 0 }) =>
       fetch(`http://127.0.0.1:${port.port}/rpc/session/channel/pull`, {
@@ -776,3 +777,56 @@ test.each(['completed', 'failed'] as const)(
     )
   },
 )
+
+test('channel instructions stay fresh and scoped to the authenticated container incarnation', async () => {
+  const driver = createFakeDriver()
+  ledger = createSessionLedger({
+    db,
+    agentLedger: agents,
+    chatLedger: chat,
+    runtime: runtime(driver),
+  })
+  await ledger.routeInbound(event('hello'))
+  const principal = ledger.authenticate(driver.runs[0]?.env.KURUMI_TOKEN ?? '')
+  if (!principal) throw new Error('missing live container')
+  const other = agents.create({ name: 'other' })
+  agents.update({ agentGroupId: other.id, persona: 'Other private persona' })
+  expect(ledger.channel.instructions(principal)).toEqual({ instructions: 'Your name is work.' })
+  agents.update({ agentGroupId: agentId, persona: 'Current persona' })
+  expect(ledger.channel.instructions(principal)).toEqual({
+    instructions: 'Your name is work.\n\nCurrent persona',
+  })
+  expect(() => ledger.channel.instructions({ ...principal, agentGroupId: other.id })).toThrow(
+    /incarnation/,
+  )
+  await driver.kill(principal.containerId, 0)
+  expect(() => ledger.channel.instructions(principal)).toThrow(/incarnation/)
+})
+
+test('the instructions RPC rejects a supplied group and a reaped token', async () => {
+  const host = await channelServer()
+  try {
+    await ledger.routeInbound(event('hello'))
+    const spec = host.driver.runs[0]
+    const token = spec?.env.KURUMI_TOKEN
+    if (!spec || !token) throw new Error('missing container')
+    const request = (input: unknown) =>
+      fetch(`http://127.0.0.1:${host.port}/rpc/session/channel/instructions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ json: input }),
+      })
+    const valid = await request({})
+    expect(valid.status).toBe(200)
+    expect(await valid.json()).toEqual({ json: { instructions: 'Your name is work.' } })
+    const forged = await request({ agentGroupId: 'ag-other' })
+    expect(forged.status).toBe(400)
+    await forged.body?.cancel()
+    await host.driver.kill(spec.containerId, 0)
+    const revoked = await request({})
+    expect(revoked.status).toBe(401)
+    await revoked.body?.cancel()
+  } finally {
+    await host.stop()
+  }
+})

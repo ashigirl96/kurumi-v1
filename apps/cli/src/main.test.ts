@@ -674,3 +674,16 @@ test.each([
   expect(calls).toEqual([{ path: ['chat', 'press'], input: { ref: 'cr-test', action: 'connect' } }])
   expect(stdout).toBe(`${reply.kind === 'private-link' ? reply.url : reply.text}\n`)
 })
+
+test('agent update uses the generic CLI contract and forwards persona text with its identifier', async () => {
+  expect(
+    await run(
+      ['agent', 'update', '--agent-group-id', 'ag-work', '--persona', 'Be concise.'],
+      piped(''),
+    ),
+  ).toBe(0)
+  expect(calls).toEqual([
+    { path: ['agent', 'update'], input: { agentGroupId: 'ag-work', persona: 'Be concise.' } },
+  ])
+  expect(stderr).toBe('')
+})

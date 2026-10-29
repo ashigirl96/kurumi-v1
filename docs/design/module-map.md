@@ -158,7 +158,7 @@ flowchart LR
 | 26 | session resume | runner + session（`channel.state`） |
 | 27 | PreCompact で transcript 保存 | runner（`conversations/` は Workspace） |
 | 28 | memory tree 注入 | runner + agent（scaffold） |
-| 29 | Standing Instructions + 合成 CLAUDE.md | agent（`prepareWorkspace`）。tool の説明は contract の `meta.tool` から導出 |
+| 29 | Standing Instructions + 合成 CLAUDE.md | agent（`prepareWorkspace` が名前・persona・base を合成）。runner が毎 turn `session.channel.instructions` で読み、`systemPrompt.append` に渡す。tool の説明は MCP description にだけ置く |
 | 30 | cross-session context | session |
 | 31 | agent 間 message | session（a2a routing、`agent_message_policy`、approval kind `a2a.message`） |
 | 32 | chat からの create_agent | agent（`agent.create`、agent:'scoped' + humanHold） |
@@ -174,7 +174,7 @@ flowchart LR
 | 42 | group ごとの timezone | agent（container_config） |
 | 43 | welcome message | container skill + `chat.messagingGroups.send` |
 | 44–46 | container skills | `container/skills/`、選択は agent |
-| 47 | onecli-gateway / connect-apps skill | **置き換え**: 指示は `account.mine` / `account.connect` の `meta.tool.instructions` から CLAUDE.md に入る。skill は持たない |
+| 47 | onecli-gateway / connect-apps skill | **置き換え**: 指示は `account.mine` / `account.connect` の `meta.tool.instructions` から MCP description に入る。合成本文には入れず、skill は持たない |
 | 48 | credential gateway 一式 | account + gateway |
 
 ### A'. 運用面
