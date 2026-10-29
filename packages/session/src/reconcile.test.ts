@@ -2,8 +2,10 @@ import { expect, test } from 'bun:test'
 
 import { gatewayContribution, proxyEnv } from '@kurumi/gateway/server'
 
-import type { ContainerInventory } from './driver/docker.ts'
+import type { Cli } from './driver/cli.ts'
+import { createDockerDriver, type ContainerInventory } from './driver/docker.ts'
 import type { InventoryChange } from './driver/events.ts'
+import { FakeCli, FakeProcess } from './driver/fake-cli.ts'
 import type { ListedContainer } from './driver/listing.ts'
 import {
   createLiveness,
@@ -355,6 +357,97 @@ test('an event or a resubscription wakes the supervisor before its interval', as
   await eventually(() => fake.sweeps.length === 3)
   await supervisor.stop()
 })
+
+test.each(['cleanup before inspect', 'inspect before cleanup'])(
+  'admission probe cleanup does not fail event-woken reconciliation (%s)',
+  async (order) => {
+    const fake = new FakeCli()
+    fake.responses.push({ match: /^(ps|create|rm) /, result: {} })
+    const attached = Promise.withResolvers<void>()
+    const attach = new FakeProcess()
+    const inspecting = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const reconciled = Promise.withResolvers<void>()
+    let holdNextInspection = false
+    let emitEvent: ((line: string) => void) | undefined
+    const cli: Cli = {
+      start(args, options) {
+        if (args[0] === 'events') {
+          emitEvent = options?.onLine
+          const proc = new FakeProcess()
+          return { result: proc.result, kill: () => proc.complete() }
+        }
+        if (args[0] === 'start' && args[1] === '--attach') {
+          attached.resolve()
+          return { result: attach.result, kill: () => attach.complete({ code: 1 }) }
+        }
+        if (holdNextInspection && args[0] === 'network' && args[1] === 'inspect') {
+          holdNextInspection = false
+          inspecting.resolve()
+          return {
+            result: release.promise.then(() => fake.start(args).result),
+            kill: () => release.resolve(),
+          }
+        }
+        return fake.start(args)
+      },
+    }
+    const driver = createDockerDriver({
+      install: 'probe-race',
+      image: 'test',
+      agentPort: 1234,
+      cli,
+    })
+    const logs: SupervisionLog[] = []
+    let passes = 0
+    const supervisor = createSupervisor({
+      inventory: driver,
+      intervalMs: 60_000,
+      staleAfterMs,
+      rows: () => {
+        if (++passes === 2) reconciled.resolve()
+        return []
+      },
+      accept: () => {},
+      reap: async () => {},
+      log: (entry) => logs.push(entry),
+    })
+    try {
+      await supervisor.start()
+      await supervisor.adopted
+      const probing = driver.probe('http://host.docker.internal:1234/probe/nonce')
+      await attached.promise
+      expect(fake.isolation.networks.size).toBe(1)
+      holdNextInspection = true
+      if (!emitEvent) throw new Error('Docker events not subscribed')
+      emitEvent('create')
+      await inspecting.promise
+      if (order === 'cleanup before inspect') {
+        attach.complete({ stdout: 'nonce' })
+        expect(await probing).toBe('nonce')
+        expect(fake.isolation.networks.size).toBe(0)
+        release.resolve()
+        await reconciled.promise
+      } else {
+        release.resolve()
+        await reconciled.promise
+        attach.complete({ stdout: 'nonce' })
+        expect(await probing).toBe('nonce')
+      }
+      expect(logs.filter((entry) => entry.kind === 'session.reconcile.failed')).toEqual([])
+      expect(fake.isolation.networks.size).toBe(0)
+      expect(
+        [...fake.isolation.containers.keys()].filter((name) => name.endsWith('-relay')),
+      ).toEqual([])
+      expect(await driver.sweep()).toEqual([])
+    } finally {
+      release.resolve()
+      attach.complete({ stdout: 'nonce' })
+      await supervisor.stop()
+      await driver.detach()
+    }
+  },
+)
 
 test('stopping before any listing answered rejects adoption, ends the loop and logs no late failure', async () => {
   const fake = fakeInventory()

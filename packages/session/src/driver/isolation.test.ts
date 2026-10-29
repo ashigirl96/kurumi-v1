@@ -149,6 +149,7 @@ test('detach preserves the whole group, fresh adoption validates it, and kill re
 
 test.each([
   'missing relay',
+  'missing network',
   'uplink runner',
   'forwarding relay',
   'extra peer',
@@ -165,6 +166,7 @@ test.each([
   const relay = fake.isolation.containers.get(`${name}-relay`)!
   const network = fake.isolation.networks.get(`${name}-net`)!
   if (defect === 'missing relay') fake.isolation.containers.delete(`${name}-relay`)
+  if (defect === 'missing network') fake.isolation.networks.delete(`${name}-net`)
   if (defect === 'uplink runner')
     runner.NetworkSettings.Networks.bridge = { IPAddress: '1.2.3.4', Aliases: [] }
   if (defect === 'forwarding relay') relay.HostConfig.Sysctls['net.ipv4.ip_forward'] = '1'
@@ -227,6 +229,95 @@ test('sweep removes orphan relay and network-only partial creates, not active re
   expect(fake.isolation.containers.has(`${name}-relay`)).toBe(false)
   await next.stop()
 })
+
+test.each([
+  'No such network: vanished-net',
+  'Error response from daemon: network vanished-net not found',
+])('sweep skips a vanished network and preserves an active runner (%s)', async (stderr) => {
+  const { driver, fake, options, listed, name } = setup()
+  expect(await driver.run(spec)).toEqual({ ok: true })
+  await driver.detach()
+  const runner = listed()
+  fake.responses.unshift({
+    match: /^ps /,
+    result: {
+      stdout:
+        JSON.stringify([
+          runner.dockerId,
+          name,
+          'running',
+          'agent',
+          spec.sessionId,
+          spec.containerId,
+          runner.revision,
+        ]) + '\n',
+    },
+  })
+  const cli: Cli = {
+    start(args) {
+      if (args[0] === 'network' && args[1] === 'ls') {
+        const proc = new FakeProcess()
+        proc.complete({ stdout: `vanished-net\n${name}-net\n` })
+        return proc
+      }
+      if (args[0] === 'network' && args[1] === 'inspect' && args[2] === 'vanished-net') {
+        const proc = new FakeProcess()
+        proc.complete({ code: 1, stdout: '[]', stderr })
+        return proc
+      }
+      return options.cli.start(args)
+    },
+  }
+  const next = createDockerDriver({ ...options, cli })
+  try {
+    expect(await next.sweep()).toEqual([runner])
+    expect(fake.isolation.networks.has(`${name}-net`)).toBe(true)
+    expect(fake.isolation.containers.has(`${name}-relay`)).toBe(true)
+    expect(fake.isolation.containers.has(name)).toBe(true)
+    expect(await next.adopt(runner)).toEqual({ ok: true })
+  } finally {
+    await next.stop()
+  }
+})
+
+test.each([
+  { code: 0, stdout: '[null]', stderr: '', reason: undefined },
+  { code: 0, stdout: '[{}]', stderr: '', reason: 'Invalid input' },
+  { code: 0, stdout: '[]', stderr: '', reason: 'invalid isolation inspection' },
+  { code: 0, stdout: '[{},{}]', stderr: '', reason: 'invalid isolation inspection' },
+  { code: 0, stdout: 'not JSON', stderr: '', reason: 'JSON' },
+  { code: 1, stdout: '', stderr: 'permission denied', reason: 'permission denied' },
+  { code: 1, stdout: '', stderr: 'daemon unavailable', reason: 'daemon unavailable' },
+  {
+    code: 1,
+    stdout: '',
+    stderr: 'No such network: vanished-net\npermission denied',
+    reason: 'permission denied',
+  },
+])(
+  'sweep rejects inspection failures instead of treating them as absence (%j)',
+  async ({ reason, ...result }) => {
+    const { driver, options } = setup()
+    expect(await driver.run(spec)).toEqual({ ok: true })
+    await driver.detach()
+    const cli: Cli = {
+      start(args) {
+        if (args[0] === 'network' && args[1] === 'inspect') {
+          const proc = new FakeProcess()
+          proc.complete(result)
+          return proc
+        }
+        return options.cli.start(args)
+      },
+    }
+    const next = createDockerDriver({ ...options, cli })
+    try {
+      await expect(next.sweep()).rejects.toThrow(reason)
+    } finally {
+      await next.stop()
+    }
+  },
+)
 
 test('foreign relay name collision is never removed', async () => {
   const { driver, fake, options, name } = setup()
