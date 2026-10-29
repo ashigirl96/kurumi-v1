@@ -130,6 +130,7 @@ function startUpstream(command: string, toolName = 'Bash') {
 }
 
 const sessionProxy = 'http://s:kurumi-session-token-probe@127.0.0.1:9'
+const instructions = 'You are Kurumi, a helpful daily assistant. Answer concisely.'
 
 async function runTurnInContainerEnv(
   workspace: string,
@@ -142,6 +143,7 @@ async function runTurnInContainerEnv(
     const replies = []
     await runTurn({
       prompt: 'run the probe',
+      instructions: ${JSON.stringify(instructions)},
       mcpServers: () => ({ kurumi: createKurumiServer(new RPCLink({ url: ${JSON.stringify(upstream.url)} + '/rpc', headers: { authorization: 'Bearer ' + process.env.KURUMI_TOKEN } }), AbortSignal.timeout(45_000)) }),
       continuation: null,
       signal: AbortSignal.timeout(45_000),
@@ -176,6 +178,10 @@ async function runTurnInContainerEnv(
     child.exited,
   ])
   if (code !== 0) throw new Error(`turn exited ${code}: ${stderr}`)
+  expect(upstream.modelRequests.length).toBeGreaterThan(0)
+  for (const request of upstream.modelRequests) {
+    expect(JSON.stringify(JSON.parse(request).system)).toContain(instructions)
+  }
   return JSON.parse(stdout)
 }
 
