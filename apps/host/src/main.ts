@@ -283,6 +283,16 @@ export async function startHost(config: HostConfig) {
         new URL('../../../container/CLAUDE.md', import.meta.url),
         'utf8',
       ),
+      memoryTemplates: {
+        memory: readFileSync(
+          new URL('../../../container/memory/index.md', import.meta.url),
+          'utf8',
+        ),
+        system: readFileSync(
+          new URL('../../../container/memory/system/index.md', import.meta.url),
+          'utf8',
+        ),
+      },
       log: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
       onCreate: (tx, agentGroupId) => accountLedger.grantAutoGrants(tx, agentGroupId),
     })

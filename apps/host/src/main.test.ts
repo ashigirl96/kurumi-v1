@@ -1350,7 +1350,7 @@ test.each(['bridge', 'none', ''])(
   },
 )
 
-test('a host outside the repo supplies trusted instructions and preserves persona and continuation across restart', async () => {
+test('a host outside the repo supplies trusted instructions and preserves persona, memory, and continuation across restart', async () => {
   const home = homeForTest()
   const tokenPath = join(home, 'test-token')
   writeFileSync(
@@ -1384,6 +1384,22 @@ if (command === 'create') {
     await Bun.sleep(20)
   }
   const token = readFileSync(tokenPath, 'utf8')
+  const waitForChannel = async () => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/rpc/session/channel/instructions`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ json: {} }),
+        })
+        await response.body?.cancel()
+        if (response.status === 200) return
+      } catch {}
+      if (attempt === 100) throw new Error('authenticated channel did not become ready')
+      await Bun.sleep(20)
+    }
+  }
+  await waitForChannel()
   const channel = async (path: string, input = {}) => {
     const response = await fetch(`http://127.0.0.1:${port}/rpc/session/channel/${path}`, {
       method: 'POST',
@@ -1398,6 +1414,16 @@ if (command === 'create') {
       .json.instructions
   expect(await instructions()).toContain('Never ask the user for API keys')
   expect(await instructions()).toContain('Your name is work.')
+  expect(await instructions()).toContain('# Core memory')
+  expect(await instructions()).toContain('# Memory system')
+  const memory = join(home, 'groups/work/memory/index.md')
+  const system = join(home, 'groups/work/system/index.md')
+  expect(readFileSync(memory, 'utf8')).toContain('[Memory system](../system/index.md)')
+  expect(readFileSync(system, 'utf8')).toContain('16000')
+  writeFileSync(memory, 'The owner prefers tea.')
+  writeFileSync(system, 'Read linked facts before answering.')
+  expect(await instructions()).toContain('The owner prefers tea.')
+  expect(await instructions()).toContain('Read linked facts before answering.')
   await channel('state/put', { key: 'continuation', value: 'saved-conversation' })
   await cli(home, [
     'agent',
@@ -1415,21 +1441,22 @@ if (command === 'create') {
   expect(await first.exited).toBe(0)
   const second = await spawnHost(home, undefined, env, home)
   await waitForHost(home, second)
-  for (let attempt = 0; ; attempt++) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/rpc/session/channel/instructions`)
-      await response.body?.cancel()
-      break
-    } catch (error) {
-      if (attempt === 100) throw error
-      await Bun.sleep(20)
-    }
-  }
+  await waitForChannel()
   expect(await instructions()).toContain('End replies with K01.')
   expect(await instructions()).toContain('Your name is work.')
   expect(await channel('state/get', { key: 'continuation' })).toEqual({
     json: { value: 'saved-conversation' },
   })
+  expect(await instructions()).toContain('The owner prefers tea.')
+  expect(await instructions()).toContain('Read linked facts before answering.')
+  expect(readFileSync(memory, 'utf8')).toBe('The owner prefers tea.')
+  expect(readFileSync(system, 'utf8')).toBe('Read linked facts before answering.')
+  rmSync(join(home, 'groups/work/memory'), { recursive: true })
+  expect(await instructions()).toContain('# Core memory')
+  expect(readFileSync(system, 'utf8')).toBe('Read linked facts before answering.')
+  writeFileSync(memory, 'm'.repeat(16000) + 'PRIVATE DROPPED MEMORY')
+  expect(await instructions()).toContain('m'.repeat(16000))
+  expect(await instructions()).not.toContain('PRIVATE DROPPED MEMORY')
   const persona = join(home, 'groups/work/instructions.prepend.md')
   rmSync(persona)
   const outside = join(home, 'private')
@@ -1445,6 +1472,9 @@ if (command === 'create') {
   expect(log).toContain('agent.instructions.omitted')
   expect(log).toContain('agent.instructions.truncated')
   expect(log).toContain(persona)
+  expect(log).toContain(memory)
+  expect(log).not.toContain('PRIVATE DROPPED MEMORY')
+  expect(log).not.toContain('m'.repeat(100))
   expect(log).not.toContain('PRIVATE PERSONA CONTENT')
   expect(log).not.toContain('p'.repeat(100))
 }, 20000)
