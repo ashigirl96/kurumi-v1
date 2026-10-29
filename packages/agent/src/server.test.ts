@@ -318,7 +318,11 @@ test('persona writes replace hard links rather than overwriting another file', (
   expect(readFileSync(outside, 'utf8')).toBe('keep')
   expect(ledger.prepareWorkspace(agent.id)).toContain('new persona')
   expect(statSync(persona).mode & 0o777).toBe(0o600)
-  expect(readdirSync(agent.folder).toSorted()).toEqual(['instructions.prepend.md', 'memory', 'system'])
+  expect(readdirSync(agent.folder).toSorted()).toEqual([
+    'instructions.prepend.md',
+    'memory',
+    'system',
+  ])
 })
 
 test('a FIFO persona does not block composition', () => {
@@ -351,4 +355,141 @@ test('memory is scaffolded per group and keeps edits across preparations and led
   rmSync(join(work.folder, 'memory'), { recursive: true })
   expect(reopened.prepareWorkspace(work.id)).toContain('# Core memory')
   expect(readFileSync(system, 'utf8')).toBe('Keep dates with facts.')
+})
+
+test('each memory index has its own bounded Unicode budget and content-free truncation diagnostic', () => {
+  const logs: unknown[] = []
+  const composed = createAgentLedger({
+    db,
+    home,
+    baseInstructions: 'Trusted base',
+    log: (entry) => logs.push(entry),
+  })
+  const agent = composed.create({ name: 'work' })
+  composed.prepareWorkspace(agent.id)
+  const memory = join(agent.folder, 'memory/index.md')
+  const system = join(agent.folder, 'system/index.md')
+  writeFileSync(memory, '😀'.repeat(16000) + 'PRIVATE DROPPED MEMORY')
+  writeFileSync(system, 's'.repeat(64004))
+  truncateSync(system, 1024 * 1024 * 1024)
+  expect(composed.prepareWorkspace(agent.id)).toBe(
+    'Your name is work.\n\nTrusted base\n\n### memory/index.md\n\n' +
+      '😀'.repeat(16000) +
+      '\n\n### system/index.md\n\n' +
+      's'.repeat(16000),
+  )
+  expect(logs).toEqual([
+    { kind: 'agent.instructions.truncated', path: memory, droppedBytes: 22 },
+    { kind: 'agent.instructions.truncated', path: system, droppedBytes: 1073725824 },
+  ])
+  expect(readFileSync(memory, 'utf8')).toEndWith('PRIVATE DROPPED MEMORY')
+})
+
+test.each(['memory', 'system'])(
+  '%s directories and indexes never follow links or overwrite their targets',
+  (directory) => {
+    const logs: unknown[] = []
+    const composed = createAgentLedger({
+      db,
+      home,
+      baseInstructions: 'Trusted base',
+      log: (entry) => logs.push(entry),
+    })
+    const agent = composed.create({ name: 'work' })
+    const other = composed.create({ name: 'other' })
+    composed.prepareWorkspace(other.id)
+    const target = join(other.folder, directory)
+    const privateIndex = join(target, 'index.md')
+    writeFileSync(privateIndex, 'PRIVATE OTHER GROUP')
+    const dir = join(agent.folder, directory)
+    const path = join(dir, 'index.md')
+    symlinkSync(target, dir)
+    expect(composed.prepareWorkspace(agent.id)).not.toContain('PRIVATE OTHER GROUP')
+    expect(readFileSync(privateIndex, 'utf8')).toBe('PRIVATE OTHER GROUP')
+    rmSync(dir)
+    mkdirSync(dir)
+    symlinkSync(privateIndex, path)
+    expect(composed.prepareWorkspace(agent.id)).not.toContain('PRIVATE OTHER GROUP')
+    expect(readFileSync(privateIndex, 'utf8')).toBe('PRIVATE OTHER GROUP')
+    rmSync(path)
+    const absent = join(home, 'must-not-create')
+    symlinkSync(absent, path)
+    composed.prepareWorkspace(agent.id)
+    expect(existsSync(absent)).toBe(false)
+    expect(logs).toEqual(
+      Array.from({ length: 3 }, () => ({
+        kind: 'agent.instructions.omitted',
+        path,
+        reason: 'unreadable',
+      })),
+    )
+    expect(readdirSync(join(home, 'groups')).toSorted()).toEqual(['other', 'work'])
+  },
+)
+
+test.each(['directory', 'fifo', 'invalid_utf8', 'unreadable'])(
+  'an unusable memory index (%s) is omitted without blocking other instructions',
+  (kind) => {
+    const logs: unknown[] = []
+    const composed = createAgentLedger({
+      db,
+      home,
+      baseInstructions: 'Trusted base',
+      log: (entry) => logs.push(entry),
+    })
+    const agent = composed.create({ name: 'work' })
+    composed.prepareWorkspace(agent.id)
+    const path = join(agent.folder, 'memory/index.md')
+    const system = join(agent.folder, 'system/index.md')
+    writeFileSync(system, 'Keep this memory guidance.')
+    rmSync(path)
+    if (kind === 'directory') mkdirSync(path)
+    if (kind === 'fifo') expect(Bun.spawnSync(['mkfifo', path]).exitCode).toBe(0)
+    if (kind === 'invalid_utf8') writeFileSync(path, Buffer.from([0xff]))
+    if (kind === 'unreadable') {
+      writeFileSync(path, 'PRIVATE UNREADABLE MEMORY')
+      chmodSync(path, 0)
+    }
+    try {
+      expect(composed.prepareWorkspace(agent.id)).toBe(
+        'Your name is work.\n\nTrusted base\n\n### system/index.md\n\nKeep this memory guidance.',
+      )
+      expect(logs).toEqual([
+        {
+          kind: 'agent.instructions.omitted',
+          path,
+          reason:
+            kind === 'directory' || kind === 'fifo'
+              ? 'not_regular'
+              : kind === 'invalid_utf8'
+                ? 'ERR_ENCODING_INVALID_ENCODED_DATA'
+                : 'unreadable',
+        },
+      ])
+    } finally {
+      if (kind === 'unreadable') chmodSync(path, 0o600)
+    }
+  },
+)
+
+test('scaffolding leaves hard-linked memory files and missing system directories independent', () => {
+  const composed = createAgentLedger({
+    db,
+    home,
+    memoryTemplates: { memory: 'Seed facts', system: 'Seed guidance' },
+  })
+  const agent = composed.create({ name: 'work' })
+  composed.prepareWorkspace(agent.id)
+  const index = join(agent.folder, 'memory/index.md')
+  rmSync(index)
+  const target = join(home, 'host-file')
+  writeFileSync(target, 'Keep this file')
+  linkSync(target, index)
+  rmSync(join(agent.folder, 'system'), { recursive: true })
+  const text = composed.prepareWorkspace(agent.id)
+  expect(text).toContain('Keep this file')
+  expect(text).toContain('Seed guidance')
+  expect(readFileSync(target, 'utf8')).toBe('Keep this file')
+  expect(statSync(join(agent.folder, 'system/index.md')).mode & 0o777).toBe(0o600)
+  expect(statSync(join(agent.folder, 'system')).mode & 0o777).toBe(0o700)
 })
