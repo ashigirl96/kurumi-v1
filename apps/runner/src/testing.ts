@@ -25,6 +25,8 @@ export type FakeCall = {
   signal: AbortSignal
   systemPrompt: Options['systemPrompt']
   settingSources: Options['settingSources']
+  skills: Options['skills']
+  env: Options['env']
   mcpServers: Options['mcpServers']
 }
 
@@ -86,6 +88,8 @@ await mock.module('@anthropic-ai/claude-agent-sdk', () => ({
     options: {
       systemPrompt?: Options['systemPrompt']
       settingSources?: Options['settingSources']
+      skills?: Options['skills']
+      env?: Options['env']
       resume?: string
       abortController: AbortController
       mcpServers?: Options['mcpServers']
@@ -95,6 +99,8 @@ await mock.module('@anthropic-ai/claude-agent-sdk', () => ({
       prompt,
       systemPrompt: options.systemPrompt,
       settingSources: options.settingSources,
+      skills: options.skills,
+      env: options.env,
       resume: options.resume ?? null,
       signal: options.abortController.signal,
       mcpServers: options.mcpServers,
@@ -195,6 +201,7 @@ export async function startHost() {
   if (!token) throw new Error('missing runner token')
   return {
     db,
+    folder: agent.folder,
     updatePersona: (persona: string) => agentLedger.update({ agentGroupId: agent.id, persona }),
     url: server.url.href.replace(/\/$/, ''),
     token,

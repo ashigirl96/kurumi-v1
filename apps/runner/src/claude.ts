@@ -43,6 +43,7 @@ function claudeCodeEnv(workspace: string): Record<string, string> {
     ...Object.fromEntries(inherited),
     CLAUDE_CONFIG_DIR: join(workspace, '.claude'),
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
   }
 }
 

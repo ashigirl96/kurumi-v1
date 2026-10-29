@@ -1,4 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import { inboundMessage, outboundMessage } from '@kurumi/session/schema'
 
@@ -380,6 +382,71 @@ test('fresh and resumed turns receive current instructions without loading works
       snapshot: false,
     })
     expect(sdk.calls[1]?.settingSources).toEqual([])
+  } finally {
+    controller.abort()
+    await running
+    await host.stop()
+  }
+})
+
+test('auto-memory stays disabled even when the inherited SDK environment enables it', async () => {
+  const previous = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+  process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '0'
+  const host = await startHost()
+  const controller = new AbortController()
+  const running = runRunner({ url: host.url, token: host.token, signal: controller.signal })
+  try {
+    expect(await host.reply()).toBe('model heard: hello')
+    expect(sdk.calls[0]?.env?.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1')
+    expect(sdk.calls[0]?.skills).toEqual([])
+    expect(sdk.calls[0]?.settingSources).toEqual([])
+  } finally {
+    controller.abort()
+    await running
+    await host.stop()
+    if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+    else process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = previous
+  }
+})
+
+test('fresh and resumed SDK turns receive both current memory indexes with separate caps', async () => {
+  const host = await startHost()
+  const memory = join(host.folder, 'memory/index.md')
+  const system = join(host.folder, 'system/index.md')
+  mkdirSync(join(host.folder, 'memory'))
+  mkdirSync(join(host.folder, 'system'))
+  writeFileSync(memory, '😀'.repeat(16000) + 'PRIVATE OVERFLOW')
+  writeFileSync(system, 's'.repeat(16000) + 'PRIVATE SYSTEM OVERFLOW')
+  const controller = new AbortController()
+  const running = runRunner({ url: host.url, token: host.token, signal: controller.signal })
+  try {
+    expect(await host.reply()).toBe('model heard: hello')
+    expect(sdk.calls[0]?.resume).toBeNull()
+    expect(sdk.calls[0]?.systemPrompt).toEqual({
+      type: 'preset',
+      preset: 'claude_code',
+      append:
+        'Your name is work.\n\nTrusted base\n\n### memory/index.md\n\n' +
+        '😀'.repeat(16000) +
+        '\n\n### system/index.md\n\n' +
+        's'.repeat(16000),
+      snapshot: false,
+    })
+    writeFileSync(memory, 'The owner prefers tea.')
+    writeFileSync(system, 'Read linked facts before answering.')
+    await host.send('next warm turn')
+    expect(await host.reply()).toBe('model heard: hello | next warm turn')
+    expect(sdk.calls[1]?.resume).not.toBeNull()
+    expect(sdk.calls[1]?.systemPrompt).toEqual({
+      type: 'preset',
+      preset: 'claude_code',
+      append:
+        'Your name is work.\n\nTrusted base\n\n### memory/index.md\n\nThe owner prefers tea.\n\n### system/index.md\n\nRead linked facts before answering.',
+      snapshot: false,
+    })
+    expect(sdk.calls[1]?.skills).toEqual([])
+    expect(sdk.calls[1]?.settingSources).toEqual([])
+    expect(sdk.calls[1]?.env?.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1')
   } finally {
     controller.abort()
     await running
