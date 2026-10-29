@@ -1,3 +1,4 @@
+import { dlopen } from 'bun:ffi'
 import {
   closeSync,
   constants,
@@ -11,7 +12,7 @@ import {
   rmdirSync,
   writeFileSync,
 } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 
 import { transaction, type Db, type KurumiContext, type Tx } from '@kurumi/rpc/server'
 import { implement, ORPCError } from '@orpc/server'
@@ -36,19 +37,82 @@ function checkWorkspace(folder: string): void {
   }
 }
 
-function personaAt(folder: string, log: (entry: InstructionLog) => void): string {
-  const path = join(folder, 'instructions.prepend.md')
+const libc = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {
+  openat: { args: ['int', 'ptr', 'int'], returns: 'int' },
+  linkat: { args: ['int', 'ptr', 'int', 'ptr', 'int'], returns: 'int' },
+  mkdirat: { args: ['int', 'ptr', 'int'], returns: 'int' },
+})
+const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+const readFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+const memoryLimit = 16000
+
+type MemoryTemplates = Record<'memory' | 'system', string>
+
+function openAt(parent: number, name: string, flags: number): number {
+  const fd = libc.symbols.openat(parent, Buffer.from(`${name}\0`), flags)
+  if (fd < 0) throw new Error('unsafe_or_unreadable')
+  return fd
+}
+
+function openMemoryIndex(
+  folder: string,
+  directory: keyof MemoryTemplates,
+  template: string,
+): number {
+  const groups = openSync(resolve(folder, '..'), directoryFlags)
+  let workspace: number | undefined
+  let memory: number | undefined
+  try {
+    // Descriptor-relative operations keep concurrent renames from redirecting host reads or writes.
+    workspace = openAt(groups, basename(folder), directoryFlags)
+    libc.symbols.mkdirat(workspace, Buffer.from(`${directory}\0`), 0o700)
+    memory = openAt(workspace, directory, directoryFlags)
+    const existing = libc.symbols.openat(memory, Buffer.from('index.md\0'), readFlags)
+    if (existing >= 0) return existing
+    const temporary = join(resolve(folder, '..'), `.memory-${crypto.randomUUID()}`)
+    const created = openSync(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    )
+    try {
+      writeFileSync(created, template, 'utf8')
+      // linkat creates only an absent index, without following its entry or re-resolving its directory.
+      libc.symbols.linkat(
+        groups,
+        Buffer.from(`${basename(temporary)}\0`),
+        memory,
+        Buffer.from('index.md\0'),
+        0,
+      )
+    } finally {
+      closeSync(created)
+      rmSync(temporary)
+    }
+    return openAt(memory, 'index.md', readFlags)
+  } finally {
+    if (memory !== undefined) closeSync(memory)
+    if (workspace !== undefined) closeSync(workspace)
+    closeSync(groups)
+  }
+}
+
+function instructionAt(
+  path: string,
+  open: () => number,
+  limit: number,
+  log: (entry: InstructionLog) => void,
+): string {
   let fd: number | undefined
   try {
-    checkWorkspace(folder)
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    fd = open()
     const stat = fstatSync(fd)
     if (!stat.isFile()) {
       log({ kind: 'agent.instructions.omitted', path, reason: 'not_regular' })
       return ''
     }
     // Four UTF-8 bytes per code point, plus one code point to detect truncation.
-    const buffer = Buffer.alloc((personaLimit + 1) * 4)
+    const buffer = Buffer.alloc((limit + 1) * 4)
     let length = 0
     while (length < buffer.length) {
       const read = readSync(fd, buffer, length, buffer.length - length, null)
@@ -58,10 +122,10 @@ function personaAt(folder: string, log: (entry: InstructionLog) => void): string
     const decoded = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, length), {
       stream: length < stat.size,
     })
-    const persona = Array.from(decoded).slice(0, personaLimit).join('')
-    const droppedBytes = Math.max(0, stat.size - Buffer.byteLength(persona))
+    const text = Array.from(decoded).slice(0, limit).join('')
+    const droppedBytes = Math.max(0, stat.size - Buffer.byteLength(text))
     if (droppedBytes > 0) log({ kind: 'agent.instructions.truncated', path, droppedBytes })
-    return persona
+    return text
   } catch (error) {
     const reason = error instanceof Error && 'code' in error ? String(error.code) : 'unreadable'
     if (reason !== 'ENOENT') log({ kind: 'agent.instructions.omitted', path, reason })
@@ -85,11 +149,13 @@ export function createAgentLedger({
   home,
   onCreate,
   baseInstructions = '',
+  memoryTemplates = { memory: '', system: '' },
   log = () => {},
 }: {
   db: Db
   home: string
   baseInstructions?: string
+  memoryTemplates?: MemoryTemplates
   log?: (entry: InstructionLog) => void
   /** Runs in the create transaction, so a throw rolls the new group back. */
   onCreate?: (tx: Tx, agentGroupId: string) => void
@@ -162,10 +228,30 @@ export function createAgentLedger({
     prepareWorkspace(id) {
       const group = db.select().from(agentGroup).where(eq(agentGroup.id, id)).get()
       if (!group) throw new ORPCError('NOT_FOUND', { message: 'agent group not found' })
+      const folder = join(groups, group.folder)
+      const memory = (['memory', 'system'] satisfies (keyof MemoryTemplates)[]).map((directory) => {
+        const text = instructionAt(
+          join(folder, directory, 'index.md'),
+          () => openMemoryIndex(folder, directory, memoryTemplates[directory]),
+          memoryLimit,
+          log,
+        )
+        return text ? `### ${directory}/index.md\n\n${text}` : ''
+      })
+      const persona = join(folder, 'instructions.prepend.md')
       return [
         `Your name is ${group.name}.`,
-        personaAt(join(groups, group.folder), log),
+        instructionAt(
+          persona,
+          () => {
+            checkWorkspace(folder)
+            return openSync(persona, readFlags)
+          },
+          personaLimit,
+          log,
+        ),
         baseInstructions,
+        ...memory,
       ]
         .filter(Boolean)
         .join('\n\n')

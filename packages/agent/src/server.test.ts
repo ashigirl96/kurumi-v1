@@ -269,7 +269,21 @@ test('a replaced workspace directory cannot redirect persona reads or writes', (
   rmSync(agent.folder, { recursive: true })
   symlinkSync(outside, agent.folder)
   expect(composed.prepareWorkspace(agent.id)).toBe('Your name is work.\n\nTrusted base')
-  expect(logs).toHaveLength(1)
+  expect(logs).toEqual([
+    expect.objectContaining({
+      kind: 'agent.instructions.omitted',
+      path: join(agent.folder, 'memory/index.md'),
+    }),
+    expect.objectContaining({
+      kind: 'agent.instructions.omitted',
+      path: join(agent.folder, 'system/index.md'),
+    }),
+    expect.objectContaining({
+      kind: 'agent.instructions.omitted',
+      path: join(agent.folder, 'instructions.prepend.md'),
+    }),
+  ])
+  expect(readdirSync(outside)).toEqual(['instructions.prepend.md'])
   expect(() => composed.update({ agentGroupId: agent.id, persona: 'replace' })).toThrow()
   expect(readFileSync(join(outside, 'instructions.prepend.md'), 'utf8')).toBe('private')
 })
@@ -304,7 +318,7 @@ test('persona writes replace hard links rather than overwriting another file', (
   expect(readFileSync(outside, 'utf8')).toBe('keep')
   expect(ledger.prepareWorkspace(agent.id)).toContain('new persona')
   expect(statSync(persona).mode & 0o777).toBe(0o600)
-  expect(readdirSync(agent.folder)).toEqual(['instructions.prepend.md'])
+  expect(readdirSync(agent.folder).toSorted()).toEqual(['instructions.prepend.md', 'memory', 'system'])
 })
 
 test('a FIFO persona does not block composition', () => {
